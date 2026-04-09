@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sciwrite-lint"
+version = "0.2.0"
+description = "A linter for scientific manuscripts — reference verification, consistency checking, and structural validation."
+requires-python = ">=3.13,<3.14"
+license = "MIT"
+authors = [{ name = "Sergey Samsonau" }]
+readme = "README.md"
+keywords = ["linter", "scientific-writing", "citation-verification", "latex"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Text Processing :: Markup :: LaTeX",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "httpx>=0.27",
+    "tenacity>=8.0",
+    "trafilatura>=1.8",
+    "aiosqlite>=0.20",
+    "loguru>=0.7",
+    "anyascii>=0.3",
+    "rich>=13.0",
+    "defusedxml>=0.7",
+    "pydantic>=2.0",
+    "rapidfuzz>=3.0",
+    "bibtexparser>=1.4",
+    "pdfplumber>=0.10",
+    "openai>=1.0",
+    "grobid-tei-xml>=0.1",
+    "sentence-transformers>=3.0",
+    "numpy>=1.24",
+    "sqlite-vec>=0.1.6",
+    "torch>=2.0",
+    "transformers>=4.45",
+    "Pillow>=10.0",
+    "pypdf>=4.0",
+    "pypdfium2>=4.0",
+    "pdf2image>=1.16",
+]
+
+[project.urls]
+Homepage = "https://github.com/authentic-research-partners/sciwrite-lint"
+Repository = "https://github.com/authentic-research-partners/sciwrite-lint"
+Issues = "https://github.com/authentic-research-partners/sciwrite-lint/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.0",
+]
+
+[project.scripts]
+sciwrite-lint = "sciwrite_lint.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sciwrite_lint*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: tests that read actual paper files",
+    "network: tests that make real network connections (slow)",
+]
+# PID-unique basetemp set in conftest.py — prevents FileExistsError
+# when multiple pytest processes run concurrently.
+addopts = "-n auto -p no:cacheprovider"
+
+[tool.bandit]
+skips = [
+    "B101",  # assert — used for type narrowing and internal invariants
+    "B104",  # bind 0.0.0.0 — container start commands for GROBID/vLLM
+    "B314",  # xml.etree.fromstring — parsing trusted GROBID TEI output
+    "B404",  # subprocess import — CLI tool, subprocess is core functionality
+    "B405",  # xml.etree import — parsing trusted GROBID TEI output
+    "B603",  # subprocess call — CLI invokes grobid/vllm/claude by design
+    "B607",  # partial path — CLI tools resolved via PATH
+    "B608",  # SQL string — internal usage.db, no user input in queries
+    "B615",  # HF from_pretrained without revision pin — trusted publisher (Qwen), research tool
+]
+
+[tool.deptry]
+optional_dependencies_dev_groups = ["dev"]
+
+[tool.deptry.per_rule_ignores]
+# Self-imports of shipped non-package directories
+DEP001 = ["evals", "eval_real_world", "bench"]
+# Lazy/conditional imports in optional groups — deptry can't detect these
+DEP002 = ["bibtexparser", "pdfplumber", "sentence-transformers", "numpy", "sqlite-vec", "grobid-tei-xml", "torch", "transformers", "Pillow", "pypdf", "pdf2image"]
+# Intra-package imports
+DEP003 = ["sciwrite_lint", "evals", "eval_real_world"]
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+[[tool.mypy.overrides]]
+# No py.typed marker or typeshed stubs available
+module = ["bibtexparser", "sqlite_vec", "pypdf", "pypdfium2", "pypdfium2.raw", "transformers", "pdf2image"]
+ignore_missing_imports = true
