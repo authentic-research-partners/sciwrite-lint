@@ -78,7 +78,7 @@ sciwrite-lint contributions paper.pdf --format json
 
 ### Optimizations
 
-Three models — a vision model (Qwen3-VL-2B), an embedding model (Arctic Embed), and an 8B reasoning LLM (Qwen3 via vLLM) — share a single consumer GPU. Models run in separate pipeline stages; on WSL2, CUDA memory virtualization pages idle allocations to system RAM, letting all three share physical VRAM. FP8 weights and KV cache (Ada Lovelace+) and per-paper SQLite caching with hash-based invalidation are baseline. On top of that:
+Three models — a vision model (Qwen3-VL-2B default, or 8B FP8 via `--vision-backend vllm` for +15% accuracy), an embedding model (Arctic Embed), and an 8B reasoning LLM (Qwen3 via vLLM) — share a single consumer GPU. Models run in separate pipeline stages; on WSL2, CUDA memory virtualization pages idle allocations to system RAM, letting all three share physical VRAM. FP8 weights and KV cache (Ada Lovelace+) and per-paper SQLite caching with hash-based invalidation are baseline. On top of that:
 
 - **Semantic section filtering** — embedding-based KNN retrieval sends only the ~5 most relevant sections per claim to the LLM, reducing LLM calls ~4x
 - **Prefix-first prompt structure** — shared context placed before variable content in all prompts, maximizing vLLM's automatic prefix caching
@@ -89,11 +89,11 @@ Three models — a vision model (Qwen3-VL-2B), an embedding model (Arctic Embed)
 - **8-source full-text cascade** — early exit on first successful download across arXiv, Semantic Scholar, OpenAlex, PubMed Central, Europe PMC, Unpaywall, bioRxiv, CORE
 - **Live monitoring** *(advanced)* — `sciwrite-lint containers monitor` shows service health, VRAM usage, and KV cache utilization in a terminal dashboard
 
-Full pipeline on a 50-reference paper: ~30 minutes initial (dominated by downloads and claim verification), minutes on cached reruns. On native Linux, embedding and vision default to CPU (tens of times slower) due to limited VRAM on consumer GPUs and no transparent paging of inactive vLLM container allocations; force GPU via config if VRAM permits.
+Full pipeline on a 50-reference paper: ~30 minutes initial (dominated by downloads and claim verification), minutes on cached reruns. On native Linux, the pipeline automatically swaps vLLM containers to free GPU for embedding and vision stages (~50x faster than CPU). *(Native Linux GPU swap is preliminary — tested on WSL2 only; expected to work, may need minor fixes.)*
 
 ## Install
 
-**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM). Developed and tested on Windows (WSL2). Native Linux is likely to work with GPU memory allocation tuning (see [docs/services.md](docs/services.md#embedding-device)). Not tested on macOS.
+**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM). Developed and tested on Windows (WSL2). Native Linux is likely to work with GPU memory allocation tuning (see [docs/services.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/services.md#embedding-device)). Not tested on macOS.
 
 Requires [uv](https://docs.astral.sh/uv/getting-started/installation/), a container runtime (podman or docker), CUDA drivers, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
@@ -112,7 +112,7 @@ sciwrite-lint containers start         # start GROBID + vLLM (needs GPU for vLLM
 sciwrite-lint containers monitor       # live dashboard: service health, VRAM, KV cache
 ```
 
-![Monitor dashboard](docs/monitor.png)
+![Monitor dashboard](https://github.com/authentic-research-partners/sciwrite-lint/raw/main/docs/monitor.png)
 
 `init` detects `.tex` files and their `.bib` references and generates a `.sciwrite-lint.toml` config. Review to confirm the right files were detected.
 
@@ -125,7 +125,7 @@ sciwrite-lint config show              # see what's configured
 sciwrite-lint config set-key semantic-scholar YOUR_KEY  # dedicated rate limit
 ```
 
-See [docs/services.md](docs/services.md) for GPU requirements, all external APIs, and API key details.
+See [docs/services.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/services.md) for GPU requirements, all external APIs, and API key details.
 
 ## Usage
 
@@ -211,12 +211,12 @@ Output formats: terminal (default) or `--format json`.
 
 - `sciwrite-lint checks` — list all checks
 - `sciwrite-lint <command> --help` — detailed usage for any command
-- [docs/services.md](docs/services.md) — GROBID, vLLM, external APIs, configuration
+- [docs/services.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/services.md) — GROBID, vLLM, external APIs, configuration
 
 For contributors and advanced users:
 
-- [docs/evals.md](docs/evals.md) — detection evaluation framework, adding test cases
-- [docs/calibration.md](docs/calibration.md) — SciLint Score calibration against ground-truth papers
+- [docs/evals.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/evals.md) — detection evaluation framework, adding test cases
+- [docs/calibration.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/calibration.md) — SciLint Score calibration against ground-truth papers
 
 ## License
 

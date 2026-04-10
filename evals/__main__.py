@@ -53,7 +53,11 @@ def main(argv: list[str] | None = None) -> int:
         "eval-calibration",
         help="Run SciLint Score calibration against ground-truth papers",
     )
-    p_cal.add_argument("--rerun", action="store_true", help="Force re-scoring")
+    p_cal.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Re-run pipeline from scratch (ignore all caches)",
+    )
     p_cal.add_argument("--papers", help="Comma-separated short names")
     p_cal.add_argument("--output-dir", default=None, help="Output directory")
     p_cal.add_argument("--model", default="", help="vLLM model preset")

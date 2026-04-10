@@ -1,29 +1,43 @@
-"""Describe figure images using Qwen3-VL-2B-Instruct.
+"""Describe figure images using a vision-language model.
 
-Loads the vision-language model, runs batched inference on extracted images,
-and returns structured text descriptions suitable for injection into the
-full-paper consistency check system prompt.
-
-On WSL2, CUDA memory overcommit lets the VL model (~4 GB float16) share
-VRAM with vLLM transparently — idle KV-cache pages swap to system RAM.
-No container stop needed; same pattern as the embedding model.
+Two backends:
+- **transformers** (default): Qwen3-VL-2B-Instruct loaded in-process via
+  transformers. On WSL2, CUDA memory overcommit lets the VL model (~4 GB
+  float16) share VRAM with vLLM — no container stop needed.
+- **vllm**: Qwen3-VL-8B-Instruct-FP8 served via a dedicated vLLM container
+  on port 5002. Higher accuracy (+15% on real-world caption mismatches),
+  but requires GPU time-sharing with text vLLM.
 
 """
 
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 from typing import Any
 
 import torch
 from loguru import logger
 
+from sciwrite_lint.llm_utils import _VLLM_RETRIES
+from sciwrite_lint.vision.cache import VisionResult
 from sciwrite_lint.vision.image_extraction import ExtractedImage
 
 _MODEL_NAME = "Qwen/Qwen3-VL-2B-Instruct"
-_MAX_NEW_TOKENS = 512  # Structured description, not free-form
-_MAX_IMAGE_DIM = 1024  # Resize longest side (benchmarked: no accuracy gain above this)
-_BATCH_SIZE = 16  # Benchmarked sweet spot: 2.8s/img, 6.8 GB VRAM
+_MAX_NEW_TOKENS_TRANSFORMERS = (
+    # 2B free text: budget ~750 words at 1.3 tok/word; prompt caps at
+    # 500 words, leaving ~330 tokens of headroom. VRAM-safe at batch=16.
+    1024
+)
+_MAX_NEW_TOKENS_VLLM = (
+    # 8B JSON: safety net above the per-field maxLength bounds in
+    # VisionResult (figure_type=80, description=4000, readability_issues=600
+    # chars ≈ 1170 tokens worst case); 2048 leaves headroom for JSON chrome.
+    2048
+)
+_MAX_IMAGE_DIM = 1024
+_BATCH_SIZE = 16
 
 
 def _resolve_vision_device(device_cfg: str) -> str:
@@ -57,12 +71,15 @@ illegible values. For anything you cannot read clearly, say so explicitly \
 (e.g., "y-axis label partially obscured, cannot determine units")\
 """
 
+# --- Free-text prompts (transformers 2B backend) ---
+
 _DESCRIBE_PROMPT_BASE = f"""\
 You are analyzing a figure from a scientific paper. Describe precisely:
 {_DESCRIBE_ITEMS}
 
 Be factual and precise. Report only what is visible in the image. \
-Never guess values you cannot read — say they are unreadable.\
+Never guess values you cannot read — say they are unreadable. \
+Stay under 500 words — focus on what matters for verifying the paper's claims.\
 """
 
 _DESCRIBE_PROMPT_WITH_CAPTION = (
@@ -79,16 +96,114 @@ Describe precisely what the figure ACTUALLY shows:
 Be factual and precise. Report only what is visible in the image. \
 Never guess values you cannot read — say they are unreadable. \
 If the caption misrepresents the content, describe what you see, not what \
-the caption claims.\
+the caption claims. \
+Stay under 500 words — focus on what matters for verifying the paper's claims.\
 """
 )
 
+# --- Structured JSON prompts (vLLM 8B backend) ---
+# Uses json_schema + strict (see ``_vision_response_format``) so the
+# constrained decoder enforces the per-field bounds on ``VisionResult``.
+#
+# The guidance below mirrors the decoder-enforced caps:
+# - ``description``: 4000 chars ≈ 1000 words max → prompt says "under
+#   500 words, most important details first" (same length/priority
+#   pattern used in cross_section_consistency).
+# - ``readability_issues``: list with maxItems=5 and per-item maxLength=150
+#   → prompt says "empty list if none, otherwise at most 5 short items,
+#   most important first" (same count/priority pattern used in
+#   FullPaperIssueList and ConsistencyResult).
 
-def _build_prompt(caption: str) -> str:
-    """Build the VL prompt, including the caption if available."""
+_JSON_PROMPT_BASE = """\
+You are analyzing a figure from a scientific paper. Your description will \
+be used to verify that the paper's caption and text accurately describe \
+this figure.
+
+Respond with a JSON object:
+{
+  "figure_type": "bar chart | line plot | scatter plot | table | diagram | photo | other",
+  "description": "Detailed description: axes with units, all data series/curves \
+with their labels, key numeric values you can read, trends and patterns. \
+Include enough detail to compare against what the paper claims about this figure.",
+  "readability_issues": ["short note about one thing you cannot read clearly", "..."]
+}
+
+Be factual. Report only what is visible. Never guess unreadable values. \
+Keep ``description`` under 500 words — lead with the most important details \
+(axes, key values, trends) first. For ``readability_issues``, return an \
+empty list ``[]`` if there are no issues; otherwise list at most 5 short \
+items (most important first), each a single concrete problem like \
+"y-axis label partially obscured" or "legend cut off on the right".\
+"""
+
+_JSON_PROMPT_WITH_CAPTION = """\
+You are analyzing a figure from a scientific paper. Your description will \
+be used to verify that the paper's caption and text accurately describe \
+this figure.
+
+The figure's caption reads: "{caption}"
+
+Respond with a JSON object:
+{{
+  "figure_type": "bar chart | line plot | scatter plot | table | diagram | photo | other",
+  "description": "Detailed description: axes with units, all data series/curves \
+with their labels, key numeric values you can read, trends and patterns. \
+Include enough detail to compare against what the paper claims about this figure.",
+  "readability_issues": ["short note about one thing you cannot read clearly", "..."]
+}}
+
+Be factual. Report only what is visible. Never guess unreadable values. \
+If the caption misrepresents the content, describe what you see, not what \
+the caption claims. \
+Keep ``description`` under 500 words — lead with the most important details \
+(axes, key values, trends) first. For ``readability_issues``, return an \
+empty list ``[]`` if there are no issues; otherwise list at most 5 short \
+items (most important first), each a single concrete problem like \
+"y-axis label partially obscured" or "legend cut off on the right".\
+"""
+
+
+def _build_prompt(caption: str, *, json_mode: bool = False) -> str:
+    """Build the VL prompt, including the caption if available.
+
+    Args:
+        caption: Figure caption text (empty string if none).
+        json_mode: If True, use the structured JSON prompt (vLLM backend).
+            If False, use the free-text prompt (transformers backend).
+    """
+    if json_mode:
+        if caption:
+            return _JSON_PROMPT_WITH_CAPTION.format(caption=caption)
+        return _JSON_PROMPT_BASE
     if caption:
         return _DESCRIBE_PROMPT_WITH_CAPTION.format(caption=caption)
     return _DESCRIBE_PROMPT_BASE
+
+
+# ---------------------------------------------------------------------------
+# JSON response parsing (vLLM backend)
+# ---------------------------------------------------------------------------
+
+
+def _parse_json_response(raw: str) -> VisionResult:
+    """Parse structured JSON from the vLLM vision model.
+
+    Expected format: {"figure_type": "...", "description": "...",
+    "readability_issues": "..."}.  If parsing fails, the raw text is stored
+    as the description field — the model may occasionally produce valid but
+    unexpected JSON structures.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Vision model returned invalid JSON, storing as free text")
+        return VisionResult(figure_type="", description=raw, readability_issues=[])
+
+    return VisionResult(
+        figure_type=data.get("figure_type", ""),
+        description=data.get("description", ""),
+        readability_issues=data.get("readability_issues", []),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +294,9 @@ def _describe_images_batch(
     inputs = inputs.to(device)
 
     with torch.no_grad():
-        output_ids = model.generate(**inputs, max_new_tokens=_MAX_NEW_TOKENS)
+        output_ids = model.generate(
+            **inputs, max_new_tokens=_MAX_NEW_TOKENS_TRANSFORMERS
+        )
 
     # Decode each sequence, skipping input tokens
     input_len = inputs["input_ids"].shape[1]
@@ -193,6 +310,152 @@ def _describe_images_batch(
 
 
 # ---------------------------------------------------------------------------
+# vLLM backend inference
+# ---------------------------------------------------------------------------
+
+_VLLM_VISION_PORT = 5002
+_VLLM_VISION_MODEL = "qwen3-vl-8b-fp8"
+
+
+_VLLM_VISION_CONCURRENCY = 64  # concurrent requests to vision vLLM
+
+
+def _vision_response_format() -> dict[str, Any]:
+    """Build the vLLM ``response_format`` that enforces ``VisionResult``.
+
+    Uses ``json_schema`` + ``strict=True`` so the constrained decoder
+    respects per-field ``max_length`` from the Pydantic model. Computed
+    lazily to avoid paying the schema-generation cost when the vLLM
+    backend isn't used.
+    """
+    from sciwrite_lint.schemas import vllm_schema
+
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "VisionResult",
+            "schema": vllm_schema(VisionResult),
+            "strict": True,
+        },
+    }
+
+
+def _describe_images_vllm(
+    image_paths: list[Path],
+    prompts: list[str],
+) -> list[str]:
+    """Describe images via vLLM vision container on port 5002.
+
+    Sends concurrent requests (up to _VLLM_VISION_CONCURRENCY) to maximize
+    GPU utilization. vLLM batches concurrent requests internally.
+
+    Per request: ~2000 tokens (image) + ~300 (prompt) + ~1300 (output) ≈ 3600.
+    max_model_len=8192 per request. vLLM manages KV cache across all concurrent
+    requests.
+    """
+    import asyncio
+
+    async def _run() -> list[str]:
+        import httpx
+        from io import BytesIO
+
+        from PIL import Image
+
+        endpoint = f"http://localhost:{_VLLM_VISION_PORT}/v1"
+        sem = asyncio.Semaphore(_VLLM_VISION_CONCURRENCY)
+        results: list[str | None] = [None] * len(image_paths)
+        response_format = _vision_response_format()
+
+        async def _describe_one(idx: int, path: Path, prompt: str) -> None:
+            img = _resize_image(Image.open(path).convert("RGB"))
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            suffix = path.suffix.lower()
+            mime = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".webp": "image/webp",
+                ".bmp": "image/bmp",
+            }.get(suffix, "image/png")
+
+            payload = {
+                "model": _VLLM_VISION_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime};base64,{b64}",
+                                },
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+                "max_tokens": _MAX_NEW_TOKENS_VLLM,
+                "temperature": 0.1,
+                "response_format": response_format,
+            }
+
+            # Retry on empty or invalid JSON — same pattern as
+            # eval_claims.py and llm_query. Constrained decoding
+            # normally guarantees valid JSON, but transient server-side
+            # glitches have been observed. On final failure we leave
+            # results[idx] as None so the caller can soft-fail the
+            # figure (empty VisionResult) without blocking the pipeline.
+            async with sem:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    for _attempt in range(_VLLM_RETRIES + 1):
+                        resp = await client.post(
+                            f"{endpoint}/chat/completions", json=payload
+                        )
+                        resp.raise_for_status()
+                        content = resp.json()["choices"][0]["message"]["content"] or ""
+                        content = content.strip()
+                        if content:
+                            try:
+                                json.loads(content)
+                            except json.JSONDecodeError:
+                                pass
+                            else:
+                                results[idx] = content
+                                return
+                        if _attempt < _VLLM_RETRIES:
+                            delay = 0.5 * (_attempt + 1)
+                            logger.warning(
+                                "Vision model returned bad response for "
+                                "{} (attempt {}/{}, retrying in {:.1f}s)",
+                                path.name,
+                                _attempt + 1,
+                                _VLLM_RETRIES + 1,
+                                delay,
+                            )
+                            await asyncio.sleep(delay)
+                    logger.warning(
+                        "Vision model returned bad response for {} after "
+                        "{} attempts, leaving empty",
+                        path.name,
+                        _VLLM_RETRIES + 1,
+                    )
+
+        await asyncio.gather(
+            *[
+                _describe_one(i, p, pr)
+                for i, (p, pr) in enumerate(zip(image_paths, prompts))
+            ]
+        )
+        return [r or "" for r in results]
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -203,6 +466,8 @@ def describe_figures(
     device: str = "auto",
     batch_size: int = _BATCH_SIZE,
     fresh: bool = False,
+    backend: str = "transformers",
+    source: str = "manuscript",
 ) -> str:
     """Describe all extracted figures and return formatted text for the LLM.
 
@@ -215,8 +480,12 @@ def describe_figures(
         references_dir: Paper workspace root (``references/{paper}/``) for
             DB caching via ``get_db()``.  If None, no caching.
         device: ``"auto"`` (CUDA on WSL2, CPU elsewhere), ``"cpu"``, or ``"cuda"``.
-        batch_size: Images per batch for VL inference.
+            Only used for the transformers backend.
+        batch_size: Images per batch for VL inference (transformers backend only).
         fresh: Ignore cache and re-describe all images.
+        backend: ``"transformers"`` (2B in-process) or ``"vllm"`` (8B FP8 container).
+        source: ``"manuscript"`` for the paper's own figures, or a ref_key
+            (e.g. ``"tanaka2017"``) for cited paper figures.
 
     Returns:
         Formatted string ready for injection into the full-paper consistency
@@ -238,7 +507,9 @@ def describe_figures(
 
     # Determine which images need inference
     if references_dir and not fresh:
-        new_images = split_cached_and_new(extracted_images, references_dir)
+        new_images = split_cached_and_new(
+            extracted_images, references_dir, source=source
+        )
     else:
         new_images = list(extracted_images)
 
@@ -246,7 +517,11 @@ def describe_figures(
         logger.info(
             "All {} figure(s) cached, skipping VL inference", len(extracted_images)
         )
-        return format_descriptions_from_db(extracted_images, references_dir)  # type: ignore[arg-type]
+        return format_descriptions_from_db(
+            extracted_images,
+            references_dir,  # type: ignore[arg-type]
+            source=source,
+        )
 
     logger.info(
         "{}/{} figure(s) need VL inference",
@@ -254,53 +529,71 @@ def describe_figures(
         len(extracted_images),
     )
 
-    # Resolve device (same pattern as embedding model: CUDA on WSL2, CPU elsewhere)
-    device = _resolve_vision_device(device)
+    paths = [img.path for img in new_images]
+    use_json = backend == "vllm"
+    prompts = [_build_prompt(img.caption, json_mode=use_json) for img in new_images]
 
-    logger.info("Running VL inference on {} (batch_size={})", device, batch_size)
+    if backend == "vllm":
+        logger.info(
+            "Running VL inference via vLLM ({}, {} images)",
+            _VLLM_VISION_MODEL,
+            len(new_images),
+        )
+        raw_outputs = _describe_images_vllm(paths, prompts)
+        all_results = [_parse_json_response(raw) for raw in raw_outputs]
+    else:
+        # Transformers backend: load model in-process (free text only)
+        device = _resolve_vision_device(device)
+        logger.info("Running VL inference on {} (batch_size={})", device, batch_size)
 
-    model, processor = _load_model(device)
+        model, processor = _load_model(device)
 
-    try:
-        # Process in batches — each image gets a prompt with its caption
-        all_descriptions: list[str] = []
-        paths = [img.path for img in new_images]
-        prompts = [_build_prompt(img.caption) for img in new_images]
-        for i in range(0, len(paths), batch_size):
-            batch_paths = paths[i : i + batch_size]
-            batch_prompts = prompts[i : i + batch_size]
-            descs = _describe_images_batch(
-                batch_paths, batch_prompts, model, processor, device
-            )
-            all_descriptions.extend(descs)
-    finally:
-        # Free GPU memory immediately — gc.collect() breaks circular refs
-        # before empty_cache() so CUDA can reclaim all allocations.
-        del model
-        del processor
-        import gc
+        try:
+            text_outputs: list[str] = []
+            for i in range(0, len(paths), batch_size):
+                batch_paths = paths[i : i + batch_size]
+                batch_prompts = prompts[i : i + batch_size]
+                descs = _describe_images_batch(
+                    batch_paths, batch_prompts, model, processor, device
+                )
+                text_outputs.extend(descs)
+        finally:
+            # Free GPU memory immediately — gc.collect() breaks circular refs
+            # before empty_cache() so CUDA can reclaim all allocations.
+            del model
+            del processor
+            import gc
 
-        gc.collect()
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+        all_results = [
+            VisionResult(figure_type="", description=desc, readability_issues=[])
+            for desc in text_outputs
+        ]
 
     # Save to workspace.db
     if references_dir:
-        update_cache(new_images, all_descriptions, references_dir)
+        update_cache(new_images, all_results, references_dir, source=source)
 
     # Format all descriptions (cached + newly inferred)
     if references_dir:
-        result = format_descriptions_from_db(extracted_images, references_dir)
+        result = format_descriptions_from_db(
+            extracted_images, references_dir, source=source
+        )
     else:
         # No DB — format from what we just inferred
+        from sciwrite_lint.vision.cache import _format_entry
+
         parts: list[str] = []
-        for img, desc in zip(new_images, all_descriptions):
-            header = "Figure"
-            if img.label:
-                header += f" ({img.label})"
-            if img.caption:
-                header += f' — Caption: "{img.caption}"'
-            parts.append(f"{header}\nVisual content: {desc}")
+        for img, vr in zip(new_images, all_results):
+            entry = {
+                "description": vr.description,
+                "figure_type": vr.figure_type,
+                "readability_issues": vr.readability_issues,
+            }
+            parts.append(_format_entry(img.label, img.caption, entry))
         result = "\n\n".join(parts)
 
     logger.info(
@@ -309,3 +602,31 @@ def describe_figures(
         len(result),
     )
     return result
+
+
+def describe_figures_by_source(
+    all_images: list[ExtractedImage],
+    ref_image_ranges: dict[str, tuple[int, int]],
+    references_dir: Path,
+    fresh: bool = False,
+    backend: str = "transformers",
+) -> None:
+    """Run VL inference per-ref, tagging each with its source key.
+
+    Clears the vision cache once (when ``fresh=True``), then calls
+    ``describe_figures`` per-ref with ``fresh=False`` so subsequent refs
+    don't destroy earlier results.
+    """
+    from sciwrite_lint.vision.cache import clear_cache
+
+    if fresh:
+        clear_cache(references_dir)
+
+    for key, (start, end) in ref_image_ranges.items():
+        describe_figures(
+            all_images[start:end],
+            references_dir=references_dir,
+            fresh=False,
+            backend=backend,
+            source=key,
+        )

@@ -319,6 +319,14 @@ def _fetch_vllm_metrics_full(endpoint: str) -> dict[str, float | int | str]:
     return fetch_metrics(endpoint)
 
 
+def _fmt_duration(seconds: float | int) -> str:
+    """Format seconds as ``Ns`` or ``Nm Ns`` when >= 60."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m {s % 60}s"
+
+
 def _bar(pct: float, width: int = 30) -> str:
     """Render a compact bar like ``[████████░░░░░░░░]  25%``."""
     filled = int(pct * width)
@@ -445,9 +453,16 @@ def _build_monitor_table(
             blocks_str = f"  ({int(blocks)} GPU blocks)"
         else:
             blocks_str = ""
-        color = _bar_color(kv_pct)
+        # High KV cache usage is normal under load (vLLM pre-allocates).
+        # Only warn at very high levels where preemptions become likely.
+        if kv_pct < 0.85:
+            kv_color = "cyan"
+        elif kv_pct < 0.95:
+            kv_color = "yellow"
+        else:
+            kv_color = "red"
         bar_text = Text()
-        bar_text.append(_bar(kv_pct), style=color)
+        bar_text.append(_bar(kv_pct), style=kv_color)
         bar_text.append(blocks_str, style="dim")
         grid.add_row("KV cache", bar_text)
 
@@ -585,8 +600,61 @@ def _build_grobid_panel(
             grid.add_row("RAM", ram_text)
 
     return Panel(
-        grid, title="GROBID — localhost:8070", border_style="green", padding=(0, 2)
+        grid,
+        title="GROBID (PDF parsing) — localhost:8070",
+        border_style="green",
+        padding=(0, 2),
     )
+
+
+# Stage display names + resource tags (shorter for terminal).
+# Resource suffixes show what hardware each stage uses when running.
+_STAGE_LABELS: dict[str, str] = {
+    "setup": "Setup",
+    "vision": "Vision",
+    "text_checks": "Text rules",
+    "llm_checks": "LLM checks",
+    "verify": "API verify",
+    "fetch": "Fetch PDFs",
+    "parse": "Parse+embed",
+    "cited_vision": "Cited figs",
+    "ref_internal": "Ref internal",
+    "bib_verify": "Bib verify",
+    "claims": "Claims",
+    "unreliable": "Unreliable",
+    "contributions": "Contributions",
+}
+_STAGE_RESOURCES: dict[str, str] = {
+    "setup": "grobid",
+    "vision": "gpu",
+    "text_checks": "cpu",
+    "llm_checks": "vllm",
+    "verify": "net",
+    "fetch": "net",
+    "parse": "gpu",
+    "cited_vision": "gpu",
+    "ref_internal": "vllm",
+    "bib_verify": "net",
+    "claims": "vllm",
+    "unreliable": "cpu",
+    "contributions": "vllm",
+}
+# Short column headers for the batch table (max ~5 chars each).
+_STAGE_SHORT: dict[str, str] = {
+    "setup": "Setup",
+    "vision": "Vis",
+    "text_checks": "Text",
+    "llm_checks": "LLM",
+    "verify": "Vfy",
+    "fetch": "Fetch",
+    "parse": "Parse",
+    "cited_vision": "CFig",
+    "ref_internal": "RInt",
+    "bib_verify": "Bib",
+    "claims": "Claim",
+    "unreliable": "Unrel",
+    "contributions": "Contr",
+}
 
 
 def _build_stages_panel_from_path(paper: str, workspace_root: Path) -> "Panel | None":
@@ -610,6 +678,18 @@ def _build_stages_panel(paper: str, config: LintConfig) -> "Panel | None":
     return _build_stages_panel_impl(paper, ws.root)
 
 
+def _load_stages(workspace_root: Path) -> list[dict[str, str | float | None]] | None:
+    """Load pipeline stages from workspace.db, or None on failure."""
+    from sciwrite_lint.references.workspace_db import get_db, load_pipeline_stages
+
+    try:
+        with get_db(workspace_root) as conn:
+            stages = load_pipeline_stages(conn)
+    except Exception:
+        return None
+    return stages or None
+
+
 def _build_stages_panel_impl(paper: str, workspace_root: Path) -> "Panel | None":
     """Build a rich Panel showing pipeline stage progress for a paper."""
     import time as _time
@@ -617,18 +697,7 @@ def _build_stages_panel_impl(paper: str, workspace_root: Path) -> "Panel | None"
     from rich.panel import Panel
     from rich.text import Text
 
-    from sciwrite_lint.references.workspace_db import (
-        load_pipeline_stages,
-    )
-
-    try:
-        from sciwrite_lint.references.workspace_db import get_db
-
-        with get_db(workspace_root) as conn:
-            stages = load_pipeline_stages(conn)
-    except Exception:
-        return None
-
+    stages = _load_stages(workspace_root)
     if not stages:
         return None
 
@@ -641,39 +710,10 @@ def _build_stages_panel_impl(paper: str, workspace_root: Path) -> "Panel | None"
         """Format epoch timestamp as local HH:MM:SS."""
         return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
-    # Stage display names + resource tags (shorter for terminal)
-    # Resource suffixes show what hardware each stage uses when running
-    _LABELS = {
-        "vision": "Vision",
-        "text_checks": "Text rules",
-        "llm_checks": "LLM checks",
-        "verify": "API verify",
-        "fetch": "Fetch PDFs",
-        "parse": "Parse+embed",
-        "cited_vision": "Cited figs",
-        "ref_internal": "Ref internal",
-        "bib_verify": "Bib verify",
-        "claims": "Claims",
-        "unreliable": "Unreliable",
-    }
-    _RESOURCE = {
-        "vision": "gpu",
-        "text_checks": "cpu",
-        "llm_checks": "vllm",
-        "verify": "net",
-        "fetch": "net",
-        "parse": "gpu",
-        "cited_vision": "gpu",
-        "ref_internal": "vllm",
-        "bib_verify": "net",
-        "claims": "vllm",
-        "unreliable": "cpu",
-    }
-
     for i, s in enumerate(stages):
         name = str(s["stage"])
         status = str(s["status"])
-        label = _LABELS.get(name, name)
+        label = _STAGE_LABELS.get(name, name)
         start_t = s.get("start_time")
         end_t = s.get("end_time")
 
@@ -683,13 +723,13 @@ def _build_stages_panel_impl(paper: str, workspace_root: Path) -> "Panel | None"
         if status == "done":
             elapsed = ""
             if isinstance(start_t, float) and isinstance(end_t, float):
-                elapsed = f" {end_t - start_t:.0f}s"
+                elapsed = f" {_fmt_duration(end_t - start_t)}"
             content.append(f"[{label}{elapsed}]", style="green")
         elif status == "running":
             parts = label
             if isinstance(start_t, float):
-                parts += f" {now - start_t:.0f}s"
-            resource = _RESOURCE.get(name, "")
+                parts += f" {_fmt_duration(now - start_t)}"
+            resource = _STAGE_RESOURCES.get(name, "")
             if resource:
                 parts += f" {resource}"
             if isinstance(start_t, float):
@@ -726,6 +766,103 @@ def _build_stages_panel_impl(paper: str, workspace_root: Path) -> "Panel | None"
     )
 
 
+def _build_batch_stages_panel(
+    papers: list[tuple[str, Path]],
+) -> "Panel | None":
+    """Build a compact panel showing stage progress for a batch of papers.
+
+    Renders a table with one row per paper and one column per pipeline stage.
+    Each cell shows a status icon: green checkmark (done), yellow arrow
+    (running), red X (failed), dash (skipped), or dot (pending).
+    """
+    import time as _time
+
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    from sciwrite_lint.references.workspace_db import PIPELINE_STAGES
+
+    # Load stages for all papers
+    all_stages: list[tuple[str, list[dict[str, str | float | None]]]] = []
+    for paper, ws_root in papers:
+        stages = _load_stages(ws_root)
+        if stages:
+            all_stages.append((paper, stages))
+
+    if not all_stages:
+        return None
+
+    now = _time.time()
+
+    # Build table: Paper | Stage1 | Stage2 | ...
+    table = Table(box=None, padding=(0, 1), show_header=True)
+    table.add_column("Paper", style="bold", min_width=12)
+    for stage_name in PIPELINE_STAGES:
+        table.add_column(
+            _STAGE_SHORT.get(stage_name, stage_name),
+            justify="center",
+            min_width=5,
+        )
+
+    # Count how many are running / done / failed across all papers
+    n_running = 0
+    n_done = 0
+    n_failed = 0
+
+    for paper, stages in all_stages:
+        # Build a lookup: stage_name → stage dict
+        stage_map = {str(s["stage"]): s for s in stages}
+        cells: list[Text] = []
+        for stage_name in PIPELINE_STAGES:
+            s = stage_map.get(stage_name)
+            if not s:
+                cells.append(Text(".", style="dim"))
+                continue
+            status = str(s["status"])
+            start_t = s.get("start_time")
+            end_t = s.get("end_time")
+            if status == "done":
+                n_done += 1
+                elapsed = ""
+                if isinstance(start_t, float) and isinstance(end_t, float):
+                    elapsed = f" {_fmt_duration(end_t - start_t)}"
+                cells.append(Text(f"OK{elapsed}", style="green"))
+            elif status == "running":
+                n_running += 1
+                elapsed = ""
+                if isinstance(start_t, float):
+                    elapsed = f" {_fmt_duration(now - start_t)}"
+                cells.append(Text(f">>{elapsed}", style="bold yellow"))
+            elif status == "failed":
+                n_failed += 1
+                cells.append(Text("FAIL", style="indian_red"))
+            elif status == "skipped":
+                cells.append(Text("--", style="dim"))
+            else:  # pending
+                cells.append(Text(".", style="dim"))
+        table.add_row(paper, *cells)
+
+    # Title with summary counts
+    parts = [f"{len(all_stages)} papers"]
+    if n_running:
+        parts.append(f"{n_running} stages running")
+    if n_done:
+        parts.append(f"{n_done} done")
+    if n_failed:
+        parts.append(f"{n_failed} failed")
+    title = f"Batch Pipeline ({', '.join(parts)})"
+
+    border = "yellow" if n_running > 0 else "green" if n_failed == 0 else "red"
+
+    return Panel(
+        table,
+        title=title,
+        border_style=border,
+        padding=(0, 2),
+    )
+
+
 def _run_containers_monitor(config: LintConfig, interval: float) -> int:
     """Live-refresh terminal monitor for GROBID + vLLM."""
     import time
@@ -752,6 +889,11 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
 
     console = Console()
     endpoint = config.llm_endpoint
+    # Extract port for consistent panel titles (e.g. "localhost:5001")
+    from urllib.parse import urlparse
+
+    _parsed_ep = urlparse(endpoint)
+    vllm_text_port = _parsed_ep.port or 5001
     runtime = _detect_container_runtime()
     vllm_cname = vllm_container_name(config.llm_model)
 
@@ -759,6 +901,8 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
     prev_gen_tokens = 0.0
     prev_preemptions = 0.0
     prev_time = 0.0
+    # Per-vision-model throughput state (keyed by model name)
+    vm_prev: dict[str, dict[str, float]] = {}
     runs_cache: list[dict] | None = None
     runs_cache_time = 0.0
     _RUNS_CACHE_TTL = 30.0  # reload run history every 30s
@@ -807,7 +951,7 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                     panels.append(
                         Panel(
                             msg,
-                            title=f"vLLM — {endpoint}",
+                            title=f"vLLM (text) — localhost:{vllm_text_port}",
                             border_style="red",
                             padding=(0, 2),
                         )
@@ -862,11 +1006,96 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                     panels.append(
                         Panel(
                             table,
-                            title=f"vLLM — {model_name} @ {endpoint}",
+                            title=f"vLLM (text) — localhost:{vllm_text_port}",
                             border_style="blue",
                             padding=(1, 2),
                         )
                     )
+
+                # --- Vision vLLM panel ---
+                from sciwrite_lint.vllm.vllm_server import MODELS, VISION_MODELS
+
+                for vm in VISION_MODELS:
+                    vm_profile = MODELS[vm]
+                    vm_port = vm_profile.get("port", 5002)
+                    vm_endpoint = f"http://localhost:{vm_port}/v1"
+                    vm_health = asyncio.run(_check_api_health(vm_endpoint))
+                    if not vm_health:
+                        msg = Text()
+                        msg.append("not running", style="dim")
+                        panels.append(
+                            Panel(
+                                msg,
+                                title=f"vLLM (vision) — localhost:{vm_port}",
+                                border_style="dim",
+                                padding=(0, 2),
+                            )
+                        )
+                    else:
+                        vm_models = [m["id"] for m in vm_health.get("data", [])]
+                        vm_model_str = vm_models[0] if vm_models else vm
+                        vm_cname = vllm_container_name(vm)
+                        vm_metrics = _fetch_vllm_metrics_full(vm_endpoint)
+
+                        # Per-model throughput deltas
+                        vp = vm_prev.setdefault(
+                            vm,
+                            {
+                                "prompt": 0.0,
+                                "gen": 0.0,
+                                "preempt": 0.0,
+                                "time": 0.0,
+                            },
+                        )
+                        vm_pt = float(vm_metrics.get("prompt_tokens_total", 0.0))
+                        vm_gt = float(vm_metrics.get("generation_tokens_total", 0.0))
+                        vm_pe = float(vm_metrics.get("num_preemptions", 0.0))
+                        vm_pr = vm_gr = vm_per = 0.0
+                        if vp["time"] > 0:
+                            dt = now - vp["time"]
+                            if dt > 0:
+                                vm_pr = (vm_pt - vp["prompt"]) / dt
+                                vm_gr = (vm_gt - vp["gen"]) / dt
+                                vm_per = (vm_pe - vp["preempt"]) / dt
+                        vp["prompt"] = vm_pt
+                        vp["gen"] = vm_gt
+                        vp["preempt"] = vm_pe
+                        vp["time"] = now
+
+                        vm_vram = gpu_memory_status()
+                        vm_gpu_util = gpu_utilization()
+                        vm_ram_used: int | None = None
+                        vm_ram_limit: int | None = None
+                        if runtime:
+                            vm_cgroup = _resolve_cgroup_dir(runtime, vm_cname)
+                            if vm_cgroup:
+                                vm_ram_used, vm_ram_limit = _read_cgroup_memory(
+                                    vm_cgroup
+                                )
+
+                        vm_table = _build_monitor_table(
+                            model_name=vm_model_str,
+                            endpoint=vm_endpoint,
+                            metrics=vm_metrics,
+                            vram=vm_vram,
+                            gpu_util_pct=vm_gpu_util,
+                            ram_used_bytes=vm_ram_used,
+                            ram_limit_bytes=vm_ram_limit,
+                            config_ram_limit=vm_profile.get("memory", "8g"),
+                            prompt_rate=vm_pr,
+                            gen_rate=vm_gr,
+                            prompt_tok=vm_pt,
+                            gen_tok=vm_gt,
+                            preemption_rate=vm_per,
+                        )
+                        panels.append(
+                            Panel(
+                                vm_table,
+                                title=f"vLLM (vision) — localhost:{vm_port}",
+                                border_style="green",
+                                padding=(1, 2),
+                            )
+                        )
 
                 # --- Active runs + pipeline stages (DB-driven) ---
                 # Detect runs with in-progress pipeline stages by scanning
@@ -876,13 +1105,29 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                 from sciwrite_lint.usage import find_active_db_runs
 
                 active_db_runs = find_active_db_runs()
+
+                # Group by PID: single-paper runs get a detailed panel,
+                # multi-paper batch runs get one compact table.
+                by_pid: dict[int, list[dict]] = {}
                 for db_run in active_db_runs:
-                    paper = db_run["paper"]
-                    stages_panel = _build_stages_panel_from_path(
-                        paper, Path(db_run["workspace_root"])
-                    )
-                    if stages_panel:
-                        panels.append(stages_panel)
+                    pid = db_run.get("pid", 0)
+                    by_pid.setdefault(pid, []).append(db_run)
+
+                for pid, runs in by_pid.items():
+                    if len(runs) == 1:
+                        r = runs[0]
+                        p = _build_stages_panel_from_path(
+                            r["paper"], Path(r["workspace_root"])
+                        )
+                        if p:
+                            panels.append(p)
+                    else:
+                        batch_papers = [
+                            (r["paper"], Path(r["workspace_root"])) for r in runs
+                        ]
+                        p = _build_batch_stages_panel(batch_papers)
+                        if p:
+                            panels.append(p)
 
                 # --- Completed runs panel (cached, refreshed every 30s) ---
                 from sciwrite_lint.usage import load_runs
@@ -937,7 +1182,7 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                             ts = ts_raw[:16].replace("T", " ")
                         runs_table.add_row(
                             run.get("paper", "?"),
-                            f"{run.get('total_elapsed_s', 0):.0f}s",
+                            _fmt_duration(run.get("total_elapsed_s", 0)),
                             str(run.get("citations", 0)),
                             *svc_cells,
                             ts,
@@ -981,8 +1226,10 @@ def run_containers(args: argparse.Namespace) -> int:
         stop_grobid,
     )
     from sciwrite_lint.vllm.vllm_server import (
+        VISION_MODELS,
         _check_api_health,
         _container_name as vllm_container_name,
+        _container_running,
         _detect_container_runtime,
         start_container,
         stop_container,
@@ -1011,7 +1258,9 @@ def run_containers(args: argparse.Namespace) -> int:
             vllm_name = vllm_container_name(config.llm_model)
             mem = container_memory_status(runtime, vllm_name) if runtime else None
             mem_str = f"  RAM: {mem}" if mem else ""
-            print(f"vLLM:    running at {endpoint} ({', '.join(models)}){mem_str}")
+            print(
+                f"vLLM (text):   running at {endpoint} ({', '.join(models)}){mem_str}"
+            )
             # Show GPU details on second line
             vram = gpu_memory_status()
             metrics = _fetch_vllm_metrics(endpoint)
@@ -1027,26 +1276,61 @@ def run_containers(args: argparse.Namespace) -> int:
             if metrics:
                 gpu_parts.append(metrics)
             if gpu_parts:
-                print(f"         {', '.join(gpu_parts)}")
+                print(f"               {', '.join(gpu_parts)}")
         else:
-            print("vLLM:    not running")
+            print("vLLM (text):   not running")
+
+        # Vision vLLM status
+        runtime = _detect_container_runtime()
+        vision_up = False
+        for vm in VISION_MODELS:
+            vm_name = vllm_container_name(vm)
+            if runtime and _container_running(runtime, vm_name):
+                from sciwrite_lint.vllm.vllm_server import MODELS
+
+                vm_profile = MODELS[vm]
+                vm_port = vm_profile.get("port", 5002)
+                vm_endpoint = f"http://localhost:{vm_port}/v1"
+                vm_health = asyncio.run(_check_api_health(vm_endpoint))
+                if vm_health:
+                    vm_models = [m["id"] for m in vm_health.get("data", [])]
+                    mem = container_memory_status(runtime, vm_name) if runtime else None
+                    mem_str = f"  RAM: {mem}" if mem else ""
+                    print(
+                        f"vLLM (vision): running at {vm_endpoint}"
+                        f" ({', '.join(vm_models)}){mem_str}"
+                    )
+                else:
+                    print("vLLM (vision): loading (container up, API not ready)")
+                vision_up = True
+            else:
+                print("vLLM (vision): not running")
 
         # --- commands ---
         print()
         print("Commands:")
         if not grobid_up or not health:
-            print("  sciwrite-lint containers start          # start both")
-        print("  sciwrite-lint containers stop           # stop both")
-        print("  sciwrite-lint grobid start|stop|status  # manage GROBID alone")
-        print("  sciwrite-lint vllm start|stop|status    # manage vLLM alone")
-        print("  sciwrite-lint vllm logs [-f]            # follow vLLM logs")
+            print(
+                "  sciwrite-lint containers start            # start GROBID + text vLLM"
+            )
+        if not vision_up:
+            print(
+                "  sciwrite-lint containers start --vision   # also start vision vLLM"
+            )
+        print("  sciwrite-lint containers stop             # stop all")
+        print("  sciwrite-lint grobid start|stop|status    # manage GROBID alone")
+        print("  sciwrite-lint vllm start|stop|status      # manage vLLM alone")
+        print("  sciwrite-lint vllm logs [-f]              # follow vLLM logs")
 
         # --- logs ---
         if runtime:
-            for label, name in [
+            log_containers = [
                 ("GROBID", GROBID_CONTAINER),
-                ("vLLM", vllm_container_name(config.llm_model)),
-            ]:
+                ("vLLM (text)", vllm_container_name(config.llm_model)),
+            ]
+            for vm in VISION_MODELS:
+                log_containers.append(("vLLM (vision)", vllm_container_name(vm)))
+            for label, name in log_containers:
                 result = subprocess.run(
                     [runtime, "container", "inspect", name],
                     capture_output=True,
@@ -1063,6 +1347,7 @@ def run_containers(args: argparse.Namespace) -> int:
     elif action == "start":
         failed = False
         update = getattr(args, "update", False)
+        vision = getattr(args, "vision", False)
 
         if update:
             print(f"Pulling GROBID image: {config.grobid_image}")
@@ -1082,12 +1367,21 @@ def run_containers(args: argparse.Namespace) -> int:
         if ret != 0:
             failed = True
 
+        if vision:
+            for vm in VISION_MODELS:
+                ret = start_container(config, model=vm, pull=update)
+                if ret != 0:
+                    failed = True
+
         return 1 if failed else 0
 
     elif action == "stop":
         stop_grobid()
         print("GROBID: stopped")
         stop_container(config, model=getattr(args, "model", None))
+        # Also stop any running vision containers
+        for vm in VISION_MODELS:
+            stop_container(config, model=vm)
         return 0
 
     elif action == "restart":
@@ -1097,6 +1391,8 @@ def run_containers(args: argparse.Namespace) -> int:
 
         stop_grobid()
         stop_container(config, model=model)
+        for vm in VISION_MODELS:
+            stop_container(config, model=vm)
 
         if recreate and runtime:
             # Remove containers so they get recreated with current config
@@ -1110,6 +1406,11 @@ def run_containers(args: argparse.Namespace) -> int:
                 [runtime, "rm", vllm_name],
                 capture_output=True,
             )
+            for vm in VISION_MODELS:
+                subprocess.run(
+                    [runtime, "rm", vllm_container_name(vm)],
+                    capture_output=True,
+                )
 
         print("Containers stopped. Restarting...")
         args.action = "start"
@@ -1155,20 +1456,29 @@ def run_vllm(args: argparse.Namespace) -> int:
 
 
 def run_vision(args: argparse.Namespace) -> int:
-    """Extract and describe manuscript figures via Qwen3-VL-2B.
+    """Extract and describe manuscript figures.
+
+    Supports two backends:
+    - transformers (default): Qwen3-VL-2B in-process, no container needed
+    - vllm: Qwen3-VL-8B-FP8 via container on port 5002
 
     Populates the vision cache (``vision_cache`` table in workspace.db) so
     that full-paper consistency checks can use figure descriptions.
 
     Normally runs automatically as part of ``sciwrite-lint check``.
     This command is for running vision separately (e.g. to pre-warm cache).
-
-    On WSL2, shares VRAM with vLLM via memory overcommit — no container
-    restart needed.
     """
     from sciwrite_lint.__main__ import _load_config, _resolve_paper
 
     config = _load_config(args)
+
+    # CLI flags override config
+    backend = getattr(args, "backend", None)
+    if backend:
+        config.vision_backend = backend
+    device = getattr(args, "device", None) or config.vision_device
+    fresh = getattr(args, "fresh", False)
+
     pc = _resolve_paper(config, args.paper)
     if not pc:
         return 2
@@ -1176,9 +1486,6 @@ def run_vision(args: argparse.Namespace) -> int:
     if not pc.file_path.exists():
         logger.error(f"File not found: {pc.file_path}")
         return 1
-
-    device = getattr(args, "device", "auto")
-    fresh = getattr(args, "fresh", False)
 
     from sciwrite_lint.vision.pipeline import run_vision_pipeline
 

@@ -328,6 +328,37 @@ def extract_images_from_pdf(pdf_path: Path, output_dir: Path) -> list[ExtractedI
     return images
 
 
+def collect_cited_images(
+    keys: list[str],
+    references_dir: Path,
+) -> tuple[list[ExtractedImage], dict[str, tuple[int, int]]]:
+    """Extract images from cited paper PDFs, grouped by ref_key.
+
+    For each key, finds ``{key}*.pdf`` in ``references_dir``, extracts
+    raster images into ``parsed/ref_figures/{key}/``.
+
+    Returns:
+        ``(all_images, ref_image_ranges)`` where ``ref_image_ranges``
+        maps each ref_key to its ``(start, end)`` slice in ``all_images``.
+    """
+    all_images: list[ExtractedImage] = []
+    ref_image_ranges: dict[str, tuple[int, int]] = {}
+    output_dir = references_dir / "parsed" / "ref_figures"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for key in keys:
+        candidates = sorted(references_dir.glob(f"{key}*.pdf"))
+        if not candidates:
+            continue
+        start = len(all_images)
+        images = extract_images_from_pdf(candidates[0], output_dir / key)
+        all_images.extend(images)
+        if images:
+            ref_image_ranges[key] = (start, len(all_images))
+
+    return all_images, ref_image_ranges
+
+
 # ---------------------------------------------------------------------------
 # Rendered figures: TikZ/pgfplots via compiled PDF page rendering
 # ---------------------------------------------------------------------------

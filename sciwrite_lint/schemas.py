@@ -183,7 +183,7 @@ class Contradiction(BaseModel):
 class ConsistencyResult(BaseModel):
     """Cross-section consistency check result."""
 
-    contradictions: list[Contradiction]
+    contradictions: list[Contradiction] = Field(max_length=4)
 
 
 # ---------------------------------------------------------------------------
@@ -257,4 +257,4 @@ class FullPaperIssue(BaseModel):
 class FullPaperIssueList(BaseModel):
     """Result from a full-paper consistency check."""
 
-    issues: list[FullPaperIssue]
+    issues: list[FullPaperIssue] = Field(max_length=5)

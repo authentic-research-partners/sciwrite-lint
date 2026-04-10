@@ -18,6 +18,10 @@ from loguru import logger
 
 from sciwrite_lint import __version__
 from sciwrite_lint.config import LintConfig, PaperConfig, load_config
+from sciwrite_lint.vllm.vllm_server import MODELS as _VLLM_MODELS
+
+_ALL_MODELS = sorted(_VLLM_MODELS.keys())
+_TEXT_MODELS = [k for k, v in _VLLM_MODELS.items() if v["kind"] == "text"]
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         "limit. Above 4, the live monitor may fail to track progress and "
         "vLLM/API throughput plateaus.",
     )
+    p_check.add_argument(
+        "--vision-backend",
+        choices=["transformers", "vllm"],
+        default=None,
+        help="Vision backend: transformers (2B, default) or vllm (8B FP8 on port 5002)",
+    )
     p_check.set_defaults(func=run_check)
 
     # --- checks ---
@@ -296,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_vc.add_argument(
         "--model",
-        choices=["qwen3", "gemma3"],
+        choices=_TEXT_MODELS,
         default="",
         help="vLLM model preset (default: qwen3)",
     )
@@ -381,14 +391,20 @@ def main(argv: list[str] | None = None) -> int:
     # --- vision ---
     p_vision = sub.add_parser(
         "vision",
-        help="Extract and describe manuscript figures via Qwen3-VL-2B (also runs automatically in check pipeline).",
+        help="Extract and describe manuscript figures (transformers 2B or vLLM 8B FP8).",
     )
     p_vision.add_argument("--paper", required=True, help="Paper name from [[papers]]")
     p_vision.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
-        default="auto",
-        help="Device for VL inference (default: auto — CUDA if available)",
+        default=None,
+        help="Device for VL inference (default: auto — CUDA if available, transformers only)",
+    )
+    p_vision.add_argument(
+        "--backend",
+        choices=["transformers", "vllm"],
+        default=None,
+        help="Vision backend: transformers (2B, default) or vllm (8B FP8 on port 5002)",
     )
     p_vision.add_argument(
         "--fresh",
@@ -407,9 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=["start", "stop", "restart", "status", "monitor"],
         help="start/stop/restart/status/monitor of all containers",
     )
-    p_containers.add_argument(
-        "--model", choices=["qwen3", "gemma3"], help="vLLM model to use"
-    )
+    p_containers.add_argument("--model", choices=_ALL_MODELS, help="vLLM model to use")
     p_containers.add_argument(
         "--update",
         action="store_true",
@@ -426,6 +440,11 @@ def main(argv: list[str] | None = None) -> int:
         "--recreate",
         action="store_true",
         help="Remove and recreate containers (applies config changes like memory limits)",
+    )
+    p_containers.add_argument(
+        "--vision",
+        action="store_true",
+        help="Also start vision vLLM (qwen3-vl-8b-fp8 on port 5002)",
     )
     p_containers.add_argument("--config", help="Path to .sciwrite-lint.toml")
     p_containers.set_defaults(func=run_containers)
@@ -452,9 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     p_vllm_status.set_defaults(func=run_vllm)
 
     p_vllm_start = vllm_sub.add_parser("start", help="Start vLLM server")
-    p_vllm_start.add_argument(
-        "--model", choices=["qwen3", "gemma3"], help="Model to serve"
-    )
+    p_vllm_start.add_argument("--model", choices=_ALL_MODELS, help="Model to serve")
     p_vllm_start.add_argument(
         "--update",
         action="store_true",
@@ -464,13 +481,11 @@ def main(argv: list[str] | None = None) -> int:
     p_vllm_start.set_defaults(func=run_vllm)
 
     p_vllm_stop = vllm_sub.add_parser("stop", help="Stop vLLM server")
-    p_vllm_stop.add_argument(
-        "--model", choices=["qwen3", "gemma3"], help="Model to stop"
-    )
+    p_vllm_stop.add_argument("--model", choices=_ALL_MODELS, help="Model to stop")
     p_vllm_stop.set_defaults(func=run_vllm)
 
     p_vllm_logs = vllm_sub.add_parser("logs", help="Show vLLM container logs")
-    p_vllm_logs.add_argument("--model", choices=["qwen3", "gemma3"])
+    p_vllm_logs.add_argument("--model", choices=_ALL_MODELS)
     p_vllm_logs.add_argument(
         "-f", "--follow", action="store_true", help="Follow log output"
     )
@@ -478,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
     p_vllm_logs.set_defaults(func=run_vllm)
 
     p_vllm_rm = vllm_sub.add_parser("rm", help="Remove vLLM container")
-    p_vllm_rm.add_argument("--model", choices=["qwen3", "gemma3"])
+    p_vllm_rm.add_argument("--model", choices=_ALL_MODELS)
     p_vllm_rm.add_argument(
         "--force", action="store_true", help="Force remove even if running"
     )

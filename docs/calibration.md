@@ -14,7 +14,7 @@ Calibration iteratively adjusts SciLint Score weights, prompts, and taxonomy unt
 1. Diagnose: which axes/constraints are failing and why?
 2. Adjust weights, prompts, or taxonomy in sciwrite_lint/
 
-3. python -m evals eval-calibration --rerun   # score all 20 papers (~30 min)
+3. python -m evals eval-calibration --fresh   # score all 20 papers (~30 min)
 4. Check constraint pass rate — did it improve?
 5. Repeat from 1
 ```
@@ -36,7 +36,7 @@ FAILURES (2):
 ```bash
 python -m evals eval-calibration                         # all 20 papers
 python -m evals eval-calibration --papers Graphene,LK-99 # quick subset
-python -m evals eval-calibration --rerun                 # force re-score
+python -m evals eval-calibration --fresh                 # force re-score
 python -m evals eval-calibration --concurrency 5         # more vLLM parallelism
 ```
 
@@ -49,7 +49,7 @@ Requires GROBID + vLLM running. Missing PDFs are auto-downloaded on first run.
 3. Add ordinal constraints in `MANIFEST.md` using the syntax: `NewPaper > KnownBadPaper` or `PaperA ≈ PaperB` (same quartile)
 4. Constraints can target specific axes: `NewPaper test-severity > OtherPaper test-severity`
 5. If the paper has experiments, add it to `EXPERIMENTAL_PAPERS`
-6. Run `python -m evals eval-calibration --papers NewPaper` to score it, then `--rerun` for the full set
+6. Run `python -m evals eval-calibration --papers NewPaper` to score it, then `--fresh` for the full set
 
 ## Constraint syntax
 

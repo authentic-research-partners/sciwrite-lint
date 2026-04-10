@@ -44,6 +44,9 @@ For each item, set is_genuine to true ONLY if the values or claims \
 CONFLICT. Set is_genuine to false if the passages agree or discuss \
 different topics.
 
+Report at most 4 contradictions. If you find more, return only the 4 \
+most clear-cut cases.
+
 Reply with JSON: {"contradictions": [\
 {"type": "number|claim|framing", "section_a_says": "...", \
 "section_b_says": "...", "explanation": "...", "is_genuine": true/false}]}

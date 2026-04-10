@@ -263,8 +263,6 @@ def retrieve_similar(
     Distance is cosine distance (0 = identical, 2 = opposite).
     Score is cosine similarity (1 - distance).
     """
-    from sciwrite_lint.references.reference_store import _get_embedding_model
-
     db_file = _db_path(references_dir)
     if not db_file.exists():
         return []
@@ -287,29 +285,40 @@ def retrieve_similar(
         conn.close()
         return []
 
-    # Encode query
-    model = _get_embedding_model()
-    query_vec = model.encode(query_text, normalize_embeddings=True)
-    query_blob = _serialize_f32(query_vec.tolist())
+    # Load pre-computed query vector from DB (encoded in Stage 4b subprocess).
+    # Never load the embedding model in the parent process — it competes
+    # with vLLM for VRAM during Stage 5 (claim verification).
+    import hashlib
 
-    # KNN search: vec0 doesn't support WHERE on joined columns,
-    # so fetch top candidates globally and filter by ref_key in Python.
-    # Over-fetch to ensure enough results after filtering.
-    fetch_k = top_k * 10
+    from sciwrite_lint.references.workspace_db import load_query_vector
+
+    text_hash = hashlib.sha256(query_text.encode()).hexdigest()
+    query_blob = load_query_vector(conn, text_hash, current_model)
+    if query_blob is None:
+        logger.warning(
+            "No pre-computed query vector (hash {}) — "
+            "run pipeline again to pre-compute",
+            text_hash[:12],
+        )
+        conn.close()
+        return []
+
+    # KNN search scoped to target ref via rowid pre-filter.
+    # sqlite-vec supports `rowid IN (...)` during MATCH, so we restrict
+    # the search to only the target ref's chunks — no global scan needed.
     rows = conn.execute(
         """
         SELECT c.text, c.section_title, c.granularity, c.start_char,
-               c.text_len, ce.distance, c.ref_key
+               c.text_len, ce.distance
         FROM chunk_embeddings ce
         INNER JOIN chunks c ON c.id = ce.rowid
         WHERE ce.embedding MATCH ?
             AND k = ?
+            AND ce.rowid IN (SELECT id FROM chunks WHERE ref_key = ?)
         ORDER BY ce.distance
         """,
-        (query_blob, fetch_k),
+        (query_blob, top_k, ref_key),
     ).fetchall()
-    # Filter to target reference
-    rows = [r for r in rows if r[6] == ref_key][:top_k]
 
     conn.close()
 

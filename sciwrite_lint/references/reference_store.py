@@ -530,26 +530,18 @@ _embedding_model_name: str = ""
 
 
 def _resolve_embedding_device(device_cfg: str) -> str:
-    """Resolve device string: "auto" picks CUDA on WSL2, else CPU.
+    """Resolve device string: "auto" picks CUDA when available.
 
     On WSL2, CUDA memory overcommit lets the embedding model (~1.2 GB)
-    share VRAM with vLLM transparently — idle KV-cache pages swap to
-    system RAM while embedding runs. On native Linux, cudaMalloc is
-    physical with no overcommit, so GPU embedding is not supported
-    in auto mode (use device="cuda" to force it).
+    share VRAM with vLLM transparently. On native Linux, the pipeline
+    stops vLLM before embedding to free VRAM, so GPU is safe in both cases.
     """
-    from sciwrite_lint.config import is_wsl2
-
     if device_cfg == "auto":
         try:
             import torch
 
-            if not torch.cuda.is_available():
-                return "cpu"
-            if is_wsl2():
+            if torch.cuda.is_available():
                 return "cuda"
-            # Native Linux: no VRAM overcommit, default to CPU.
-            # Users can force GPU via [embeddings] device = "cuda".
             return "cpu"
         except ImportError:
             return "cpu"
@@ -712,18 +704,12 @@ def retrieve_relevant_sections(
 
     model_name, _, _ = _get_embedding_config()
 
-    # has_embeddings checks: exists + complete + model match.
-    # If False (missing, incomplete, or model changed), try to (re-)embed.
+    # If document chunk embeddings are missing, return None immediately.
+    # Do NOT try to embed here — that would load the embedding model in
+    # the parent process, competing with vLLM for VRAM. Embeddings are
+    # pre-computed in Stage 4b subprocess.
     if not has_embeddings(key, references_dir, model_name=model_name):
-        md_path = _parsed_md_path(references_dir, key)
-        if not md_path.exists():
-            return None
-        try:
-            text = md_path.read_text(encoding="utf-8")
-            compute_and_store_embeddings(key, text, references_dir)
-        except Exception as e:
-            logger.debug("Embedding failed for {}: {}", key, e)
-            return None
+        return None
 
     # KNN search via sqlite-vec
     hits = retrieve_similar(claim_text, key, references_dir, top_k=top_k * 3)

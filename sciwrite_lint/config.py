@@ -233,6 +233,12 @@ class LintConfig(BaseModel):
     embedding_dim: int = 768
     embedding_device: str = "auto"  # "auto" (cuda if available), "cpu", "cuda"
 
+    # Vision (figure description)
+    vision_backend: str = (
+        "vllm"  # "vllm" (8B FP8 container, default) or "transformers" (2B subprocess)
+    )
+    vision_device: str = "auto"  # "auto", "cpu", "cuda" (transformers backend only)
+
     # Runtime context — set by pipeline before running checks.
     # Registered checks only receive (tex_path, config), so this is
     # how they know which paper's workspace to use.
@@ -432,6 +438,13 @@ def load_config(path: Path | None = None) -> LintConfig:
     if "device" in emb:
         config.embedding_device = emb["device"]
 
+    # Vision section
+    vision = data.get("vision", {})
+    if "backend" in vision:
+        config.vision_backend = vision["backend"]
+    if "device" in vision:
+        config.vision_device = vision["device"]
+
     # Containers section
     containers = data.get("containers", {})
     if "grobid_version" in containers:
@@ -526,6 +539,10 @@ def generate_default_toml(papers: list[dict[str, str]] | None = None) -> str:
             "",
             "[rules]",
             '# disable = ["style-001"]       # rule IDs to disable',
+            "",
+            "[vision]",
+            '# backend = "vllm"              # "vllm" (8B FP8, default) or "transformers" (2B, no container)',
+            '# device = "auto"              # "auto", "cpu", "cuda" (transformers backend only)',
             "",
             "[output]",
             'format = "terminal"             # "terminal" or "json"',

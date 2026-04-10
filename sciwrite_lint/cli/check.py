@@ -40,12 +40,11 @@ async def run_llm_checks_batched(
     """
     from sciwrite_lint.llm_utils import llm_query_batch
 
-    # Phase 1: collect queries, grouped by (thinking, max_tokens)
-    # max_tokens comes from build_queries._max_tokens (set by full-paper
-    # checks based on paper size); None means use model default.
-    BatchKey = tuple[str, int | None]
-    queries_by_batch: dict[BatchKey, list[tuple[str, str, dict, str]]] = {}
-    check_slices: list[tuple[Any, Any, BatchKey, int, int]] = []
+    # Phase 1: collect queries, grouped by thinking mode. max_tokens is
+    # a fixed per-model constant (see VLLM_MODELS); output length is
+    # bounded by Pydantic schema constraints, not per-query overrides.
+    queries_by_mode: dict[str, list[tuple[str, str, dict, str]]] = {}
+    check_slices: list[tuple[Any, Any, str, int, int]] = []
     build_failures: list[Finding] = []
 
     for meta, fn in checks:
@@ -55,13 +54,11 @@ async def run_llm_checks_batched(
         try:
             queries = build(tex_path, config)
             thinking = getattr(fn, "thinking", "off")
-            mt: int | None = getattr(build, "_max_tokens", None)
-            batch_key: BatchKey = (thinking, mt)
-            if batch_key not in queries_by_batch:
-                queries_by_batch[batch_key] = []
-            start = len(queries_by_batch[batch_key])
-            queries_by_batch[batch_key].extend(queries)
-            check_slices.append((meta, fn, batch_key, start, len(queries)))
+            if thinking not in queries_by_mode:
+                queries_by_mode[thinking] = []
+            start = len(queries_by_mode[thinking])
+            queries_by_mode[thinking].extend(queries)
+            check_slices.append((meta, fn, thinking, start, len(queries)))
         except Exception as e:
             logger.error(f"Check {meta.id} build_queries failed: {e}")
             build_failures.append(
@@ -73,28 +70,27 @@ async def run_llm_checks_batched(
                 )
             )
 
-    # Phase 2: one batch call per (thinking, max_tokens) group
-    results_by_batch: dict[BatchKey, list[dict | None]] = {}
-    for (mode, mt), batch_queries in queries_by_batch.items():
+    # Phase 2: one batch call per thinking mode
+    results_by_mode: dict[str, list[dict | None]] = {}
+    for mode, batch_queries in queries_by_mode.items():
         if batch_queries:
             try:
-                results_by_batch[(mode, mt)] = await llm_query_batch(
+                results_by_mode[mode] = await llm_query_batch(
                     batch_queries,
                     config=config,
                     thinking=mode,
-                    max_tokens=mt,
                 )
             except Exception as e:
                 logger.error(f"LLM batch query failed (thinking={mode}): {e}")
-                results_by_batch[(mode, mt)] = [None] * len(batch_queries)
+                results_by_mode[mode] = [None] * len(batch_queries)
 
     # Phase 3: distribute results to each check
     findings: list[Finding] = []
-    for meta, fn, batch_key, start, count in check_slices:
+    for meta, fn, mode, start, count in check_slices:
         try:
             if count > 0:
                 process = getattr(fn, "process_results")
-                mode_results = results_by_batch.get(batch_key, [])
+                mode_results = results_by_mode.get(mode, [])
                 check_results = mode_results[start : start + count]
                 check_findings = process(check_results)
             else:
@@ -135,6 +131,11 @@ def run_check(args: argparse.Namespace) -> int:
     fmt = args.format or config.output_format
     fresh = getattr(args, "fresh", False)
     concurrency = getattr(args, "concurrency", 2)
+
+    # CLI flag overrides config file
+    vision_backend = getattr(args, "vision_backend", None)
+    if vision_backend:
+        config.vision_backend = vision_backend
 
     # Explicit file — no paper config, run text + LLM rules only
     if hasattr(args, "file") and args.file:

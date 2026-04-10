@@ -23,9 +23,11 @@ from loguru import logger
 # Constants
 # ---------------------------------------------------------------------------
 
-# Calibration data (MANIFEST.md with download URLs and ordinal constraints)
-# ships in evals/calibration_data/.  PDFs download on first run into the
-# same directory.  No dependency on the root .sciwrite-lint.toml.
+# Calibration spec (paper list, download URLs, ordinal constraints).
+CALIBRATION_MANIFEST = (Path(__file__).resolve().parent / "calibration_manifest.md").resolve()
+
+# Runtime data directory: PDFs download here on first run, workspaces and
+# results are generated here.  Entirely gitignored — no tracked files.
 CALIBRATION_DIR = (Path(__file__).resolve().parent / "calibration_data").resolve()
 
 NAME_TO_FILE: dict[str, str] = {
@@ -312,7 +314,11 @@ def _get_value(
     if axis is None:
         return float(paper.get("scilint_score", 0.0))
     if axis == "integrity":
-        return float(paper.get("integrity", {}).get("integrity", 0.0))
+        int_data = paper.get("integrity", {})
+        return float(
+            int_data.get("internal_consistency", 0.0)
+            * int_data.get("referencing_quality", 0.0)
+        )
     return float(paper.get("contribution", {}).get(axis, 0.0))
 
 
@@ -377,10 +383,10 @@ def run_calibration(
     config: Any,  # LintConfig
     *,
     papers: list[str] | None = None,
-    rerun: bool = False,
+    fresh: bool = False,
     model: str = "",
     output_dir: Path | None = None,
-    concurrency: int = 2,
+    concurrency: int = 4,
 ) -> CalibrationResult:
     """Score calibration papers and evaluate ordinal constraints.
 
@@ -391,20 +397,17 @@ def run_calibration(
         calibration_dir: Directory containing PDFs and MANIFEST.md.
         config: LintConfig for GROBID/vLLM settings.
         papers: Optional subset of paper short names to score.
-        rerun: Force re-scoring even if cached scilint_*.json exists.
+        fresh: Re-run the full pipeline from scratch (ignore all caches).
         model: vLLM model preset.
         output_dir: Where to save scilint_*.json files (default: calibration_dir).
     """
     out_dir = output_dir or (calibration_dir / "results")
-    manifest_path = calibration_dir / "MANIFEST.md"
-    constraints = parse_constraints(manifest_path)
+    constraints = parse_constraints(CALIBRATION_MANIFEST)
     logger.info(f"Parsed {len(constraints)} ordinal constraints")
 
     # Determine which papers to score
     names_to_score = papers if papers else list(NAME_TO_FILE.keys())
 
-    # Separate cached vs needs-scoring
-    cached_scores: dict[str, dict[str, Any]] = {}
     to_score: list[tuple[str, Path]] = []
     skipped: list[str] = []
 
@@ -418,32 +421,26 @@ def run_calibration(
         pdf_path = calibration_dir / filename
         if not pdf_path.exists():
             # Auto-download from MANIFEST.md URLs
-            fails = download_missing_pdfs(calibration_dir, manifest_path, [filename])
+            fails = download_missing_pdfs(calibration_dir, CALIBRATION_MANIFEST, [filename])
             if fails or not pdf_path.exists():
                 skipped.append(name)
                 continue
 
-        cache_path = out_dir / f"scilint_{pdf_path.stem}.json"
-        if cache_path.exists() and not rerun:
-            logger.info(f"[{name}] Using cached result: {cache_path}")
-            cached_scores[name] = json.loads(cache_path.read_text(encoding="utf-8"))
-        else:
-            to_score.append((name, pdf_path))
+        to_score.append((name, pdf_path))
 
-    # Score all uncached papers in a single event loop
-    new_scores: dict[str, dict[str, Any]] = {}
+    # Score all papers
+    all_scores: dict[str, dict[str, Any]] = {}
     if to_score:
-        new_scores = asyncio.run(
+        all_scores = asyncio.run(
             _score_batch_async(
                 to_score,
                 config,
                 model=model,
                 output_dir=out_dir,
                 concurrency=concurrency,
+                fresh=fresh,
             )
         )
-
-    all_scores = {**cached_scores, **new_scores}
 
     # Evaluate constraints
     constraint_results = evaluate_constraints(constraints, all_scores)
@@ -464,7 +461,8 @@ async def _score_batch_async(
     *,
     model: str = "",
     output_dir: Path | None = None,
-    concurrency: int = 2,
+    concurrency: int = 4,
+    fresh: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Score multiple papers with batch-staged pipeline + concurrent vLLM.
 
@@ -487,6 +485,7 @@ async def _score_batch_async(
     )
     from sciwrite_lint.pipeline import build_pdf_context, run_papers_staged
     from sciwrite_lint.references.metadata import load_all_metadata
+    from sciwrite_lint.references.workspace_db import get_db, update_pipeline_stage
     from sciwrite_lint.scoring.scilint_score import compute_scilint_score
 
     # Phase 1: GROBID parse + per-paper config setup
@@ -519,7 +518,9 @@ async def _score_batch_async(
 
     # Phase 2: Full pipeline via batch-staged orchestration
     logger.info("Phase 2: batch-staged pipeline ({} papers)", len(staged_input))
-    staged_results = await run_papers_staged(staged_input, concurrency=concurrency)
+    staged_results = await run_papers_staged(
+        staged_input, concurrency=concurrency, fresh=fresh
+    )
 
     # Build lookup from name to result
     result_map = {r.paper_name: r for r in staged_results}
@@ -539,17 +540,29 @@ async def _score_batch_async(
         claim_results = sr.claim_results
 
         # Contribution axes
+        refs_dir = paper_config.paper_workspace(name).root
         async with sem:
             logger.info(f"[{name}] Phase 3: contribution axes...")
+            try:
+                with get_db(refs_dir) as conn:
+                    update_pipeline_stage(conn, "contributions", "running")
+            except Exception:
+                pass
             ctx = get_or_create_manuscript_context(pdf_path, paper_config)
             claim_dicts = extract_claims_from_context(ctx, pdf_path)
             ns = _argparse.Namespace(model=model)
-            c_scores, c_reasoning = await compute_contribution_axes_from_ctx(
-                ctx, claim_dicts, paper_config, ns
-            )
+            try:
+                c_scores, c_reasoning = await compute_contribution_axes_from_ctx(
+                    ctx, claim_dicts, paper_config, ns
+                )
+                with get_db(refs_dir) as conn:
+                    update_pipeline_stage(conn, "contributions", "done")
+            except Exception as e:
+                with get_db(refs_dir) as conn:
+                    update_pipeline_stage(conn, "contributions", "failed", str(e)[:200])
+                raise
 
         # Load metadata for child integrity
-        refs_dir = paper_config.paper_workspace(name).root
         metadata_map = load_all_metadata(refs_dir)
 
         # Compute score with real pipeline data
@@ -613,7 +626,10 @@ def print_calibration_report(result: CalibrationResult) -> None:
 
     for i, (name, data) in enumerate(sorted_papers, 1):
         score = data.get("scilint_score", 0.0)
-        integrity = data.get("integrity", {}).get("integrity", 0.0)
+        int_data = data.get("integrity", {})
+        integrity = int_data.get("internal_consistency", 0.0) * int_data.get(
+            "referencing_quality", 0.0
+        )
         c = data.get("contribution", {})
         print(
             f"  {i:3d}  {name:<30s}  {score:5.3f}  "

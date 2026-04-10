@@ -1,7 +1,12 @@
 """Shared LLM utilities for sciwrite-lint rules and eval pipelines.
 
-Provides model configuration, JSON extraction, and a single-query async helper
-for rules that use the local vLLM server.
+Provides model configuration, a single-query async helper for rules that
+use the local vLLM server, and a permissive JSON extractor (``extract_json``)
+retained for eval pipelines. Production ``llm_query`` calls use vLLM's
+constrained decoding (``response_format=json_schema`` + ``strict=True``)
+and parse the result with ``json.loads`` directly — no regex fallback
+needed, since the decoder guarantees a valid JSON object that matches the
+Pydantic schema bounds.
 """
 
 from __future__ import annotations
@@ -12,7 +17,6 @@ import re
 from typing import Any
 
 from loguru import logger
-from pydantic import BaseModel
 
 from sciwrite_lint.config import LintConfig
 
@@ -71,20 +75,25 @@ def extract_json(text: str | None) -> dict | None:
     return None
 
 
-_VLLM_EMPTY_RETRIES = 2
+# Number of retries for "bad response" from vLLM — applies to both empty
+# content (``content=None``, typically ``finish_reason=length`` on the
+# thinking budget) and invalid JSON (rare with constrained decoding, but
+# transient server-side glitches and truncated reads have been observed
+# in production). 2 retries gives ~1.5s of exponential backoff, which
+# fixes the transient case without wasting much if the cause is a real
+# misconfiguration.
+_VLLM_RETRIES = 2
 
 
 async def retry_on_empty(
     create_call: Any,
     label: str,
-    retries: int = _VLLM_EMPTY_RETRIES,
+    retries: int = _VLLM_RETRIES,
 ) -> Any:
     """Retry a vLLM completion call when the model returns empty content.
 
     Retries the same call with a short delay. Handles intermittent vLLM
-    issues. Truncation (``finish_reason=length``) is prevented by per-field
-    ``maxLength`` in the Pydantic schemas (see ``sciwrite_lint.schemas``),
-    not by retry logic.
+    issues (empty content only — does not validate JSON).
 
     Args:
         create_call: Async callable (no args) returning a completion.
@@ -156,14 +165,13 @@ async def llm_query(
     max_tokens: int | None = None,
     client: Any | None = None,
     thinking: str = "off",
-    response_model: type[BaseModel] | None = None,
 ) -> dict | None:
     """Send a JSON query to vLLM.
 
     *thinking* controls chain-of-thought reasoning:
 
     - ``"off"`` (default): disables thinking entirely. Plain JSON prompting
-      with ``extract_json()`` post-processing. Fastest (4-12 q/s on Qwen3).
+      with direct ``json.loads`` parsing. Fastest (4-12 q/s on Qwen3).
 
     - ``"low"``: brief reasoning (200 token budget, low effort). Good for
       simple judgment calls. Uses structured output for JSON safety.
@@ -177,13 +185,18 @@ async def llm_query(
     Budget is a hard cap — thinking is abruptly truncated at the limit.
     Both must be paired: high effort + low budget = truncated reasoning.
 
-    If *response_model* is provided (a Pydantic BaseModel class), the
-    parsed JSON is validated against it. On validation failure, the failed
-    response and the Pydantic error are appended to the messages for
-    multi-turn correction — the model sees what went wrong and can fix it.
-    This is a safety net for constraints beyond JSON schema (custom
-    validators, cross-field rules). vLLM's constrained decoding handles
-    JSON structure; Pydantic catches the rest.
+    JSON structure and field bounds are enforced by vLLM's constrained
+    decoder via ``response_format=json_schema`` with ``strict=True`` —
+    the returned ``raw`` content is always a valid JSON object matching
+    *schema*. Parsed with ``json.loads`` directly.
+
+    A single unified retry loop handles both failure modes that have
+    been observed in production: empty content (``content=None``,
+    usually ``finish_reason=length`` on the thinking budget) and
+    invalid JSON (rare server-side glitch). Both retry up to
+    ``_VLLM_RETRIES`` times with short exponential backoff. Each vLLM
+    call is recorded exactly once in usage stats — tokens on success,
+    tokens + error on failure, never both.
 
     Requires vLLM started with ``--reasoning-parser qwen3`` for Qwen3
     (added automatically by ``sciwrite-lint vllm start --model qwen3``).
@@ -235,71 +248,87 @@ async def llm_query(
                 "chat_template_kwargs": {"enable_thinking": False},
             }
 
-        completion = await retry_on_empty(
-            lambda: client.chat.completions.create(**kwargs),
-            label=schema_name,
-        )
-        raw = completion.choices[0].message.content
-
-        # Track usage
         from sciwrite_lint.usage import current as _usage_current
 
-        run = _usage_current()
-        if run:
+        def _record_call(
+            completion: Any,
+            *,
+            error: bool = False,
+            error_type: str | None = None,
+        ) -> None:
+            """Record one vLLM call in usage stats.
+
+            Always increments ``calls``; adds token counts when the
+            completion exposes usage metadata; sets ``error_type`` and
+            bumps ``errors`` when *error* is True. Called exactly once
+            per vLLM request — never twice.
+            """
+            run = _usage_current()
+            if run is None:
+                return
+            record_kwargs: dict[str, Any] = {}
             try:
                 u = completion.usage
-                run.vllm.record(
-                    0.0,
-                    prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
-                    completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+                record_kwargs["prompt_tokens"] = getattr(u, "prompt_tokens", 0) or 0
+                record_kwargs["completion_tokens"] = (
+                    getattr(u, "completion_tokens", 0) or 0
                 )
             except (AttributeError, TypeError) as e:
                 logger.debug("Could not extract vLLM usage stats: {}", e)
-                run.vllm.record(0.0)  # count the call even if usage unavailable
+            if error_type is not None:
+                record_kwargs["error_type"] = error_type
+            run.vllm.record(0.0, error=error, **record_kwargs)
 
-        parsed = extract_json(raw)
+        # Unified retry loop: a "bad response" from vLLM is either empty
+        # content (content=None, usually finish_reason=length on the
+        # thinking budget) or content that isn't valid JSON (rare —
+        # constrained decoding should prevent it, but we've seen
+        # transient server-side glitches in production). Both cases get
+        # the same treatment: short backoff and retry up to _VLLM_RETRIES
+        # times.
+        last_err_msg = ""
+        for attempt in range(_VLLM_RETRIES + 1):
+            completion = await client.chat.completions.create(**kwargs)
+            raw = completion.choices[0].message.content
 
-        # Pydantic validation (safety net for constraints beyond JSON schema)
-        if parsed is not None and response_model is not None:
-            from pydantic import ValidationError
-
-            try:
-                response_model.model_validate(parsed)
-            except ValidationError as ve:
-                logger.warning(
-                    "vLLM response for {} failed Pydantic validation: {}",
-                    schema_name,
-                    ve,
+            if raw is None:
+                finish = getattr(completion.choices[0], "finish_reason", "unknown")
+                comp_tokens = 0
+                if hasattr(completion, "usage") and completion.usage:
+                    comp_tokens = getattr(completion.usage, "completion_tokens", 0) or 0
+                _record_call(completion, error=True, error_type="EmptyContent")
+                last_err_msg = (
+                    f"empty content (finish_reason={finish}, comp_tokens={comp_tokens})"
                 )
-                # Multi-turn correction: feed back the failed response +
-                # validation error so the model can fix it.
-                correction_messages = kwargs["messages"] + [
-                    {"role": "assistant", "content": raw},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Your JSON had validation errors:\n{ve}\n\n"
-                            "Return the COMPLETE fixed JSON object "
-                            "with ALL required fields."
-                        ),
-                    },
-                ]
-                retry_kwargs = {**kwargs, "messages": correction_messages}
-                completion2 = await client.chat.completions.create(**retry_kwargs)
-                raw2 = completion2.choices[0].message.content
-                parsed2 = extract_json(raw2)
-                if parsed2 is not None:
-                    try:
-                        response_model.model_validate(parsed2)
-                        return parsed2
-                    except ValidationError:
-                        pass
-                logger.warning(
-                    "vLLM correction retry also failed for {}, returning raw",
-                    schema_name,
-                )
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    _record_call(completion, error=True, error_type="JSONDecodeError")
+                    last_err_msg = f"invalid JSON: {e} — raw prefix: {raw[:200]!r}"
+                else:
+                    _record_call(completion)
+                    return parsed
 
-        return parsed
+            if attempt < _VLLM_RETRIES:
+                delay = 0.5 * (attempt + 1)
+                logger.warning(
+                    "vLLM bad response for {} (attempt {}/{}, retrying in {:.1f}s): {}",
+                    schema_name,
+                    attempt + 1,
+                    _VLLM_RETRIES + 1,
+                    delay,
+                    last_err_msg,
+                )
+                await asyncio.sleep(delay)
+
+        logger.warning(
+            "vLLM bad response for {} after {} attempts, giving up: {}",
+            schema_name,
+            _VLLM_RETRIES + 1,
+            last_err_msg,
+        )
+        return None
     except Exception as e:
         logger.debug("LLM query failed: {}", e)
         from sciwrite_lint.usage import current as _usage_current

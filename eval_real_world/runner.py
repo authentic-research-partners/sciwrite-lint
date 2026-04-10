@@ -603,12 +603,27 @@ def run_full_pipeline(
             arxiv_id = paper["arxiv_id"]
             title = paper.get("title", "")
 
-            # Skip if already completed (crash-resilient)
+            # Skip if already completed (crash-resilient).
+            # Stale results missing required fields are discarded so the
+            # paper gets re-processed with the current scoring schema.
+            _REQUIRED_RESULT_KEYS = {
+                "scilint_score",
+                "internal_consistency",
+                "referencing_quality",
+                "contribution",
+            }
             paper_out = out / f"{arxiv_id.replace('/', '_')}.json"
             if paper_out.exists():
-                print(f"  [{i}/{len(papers)}] {arxiv_id}: cached")
-                cached_results.append(json.loads(paper_out.read_text(encoding="utf-8")))
-                continue
+                cached = json.loads(paper_out.read_text(encoding="utf-8"))
+                if "error" in cached or _REQUIRED_RESULT_KEYS <= cached.keys():
+                    print(f"  [{i}/{len(papers)}] {arxiv_id}: cached")
+                    cached_results.append(cached)
+                    continue
+                print(
+                    f"  [{i}/{len(papers)}] {arxiv_id}: stale cache "
+                    f"(missing {_REQUIRED_RESULT_KEYS - cached.keys()}), re-running"
+                )
+                paper_out.unlink()
 
             print(f"  [{i}/{len(papers)}] {arxiv_id}: setting up...")
 
@@ -757,6 +772,16 @@ def run_full_pipeline(
                 c_scores = None
                 c_reasoning = None
                 if contribution:
+                    from sciwrite_lint.references.workspace_db import (
+                        get_db,
+                        update_pipeline_stage,
+                    )
+
+                    try:
+                        with get_db(refs_dir) as conn:
+                            update_pipeline_stage(conn, "contributions", "running")
+                    except Exception:
+                        pass
                     try:
                         from sciwrite_lint.cli.rank import (
                             compute_contribution_axes_from_ctx,
@@ -776,8 +801,20 @@ def run_full_pipeline(
                             paper_config,
                             mock_args,
                         )
+                        with get_db(refs_dir) as conn:
+                            update_pipeline_stage(conn, "contributions", "done")
                     except Exception as e:
                         print(f"    Contribution axes failed: {e}")
+                        try:
+                            with get_db(refs_dir) as conn:
+                                update_pipeline_stage(
+                                    conn,
+                                    "contributions",
+                                    "failed",
+                                    str(e)[:200],
+                                )
+                        except Exception:
+                            pass
 
                 score_result = compute_scilint_score(
                     arxiv_id,
@@ -847,13 +884,14 @@ def run_full_pipeline(
     # ------------------------------------------------------------------
 
     scored = [r for r in all_results if "scilint_score" in r]
+    failed = [r for r in all_results if "error" in r]
     scores = [r["scilint_score"] for r in scored]
 
     summary: dict = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "n_papers": len(papers),
         "n_completed": len(scored),
-        "n_failed": len(all_results) - len(scored),
+        "n_failed": len(failed),
     }
     if scores:
         summary["score_mean"] = round(sum(scores) / len(scores), 4)
@@ -871,6 +909,7 @@ def run_full_pipeline(
     report = {
         "summary": summary,
         "papers": sorted(scored, key=lambda r: r["scilint_score"], reverse=True),
+        "failed": failed,
     }
 
     report_path = out / "report.json"
@@ -883,7 +922,10 @@ def run_full_pipeline(
     print(f"\n{'=' * 60}")
     print("FULL PIPELINE RESULTS")
     print(f"{'=' * 60}")
-    print(f"\nPapers: {summary['n_completed']}/{summary['n_papers']}")
+    print(
+        f"\nPapers: {summary['n_completed']}/{summary['n_papers']} scored"
+        + (f", {summary['n_failed']} failed" if summary["n_failed"] else "")
+    )
     if scores:
         print(
             f"SciLint Score: mean={summary['score_mean']:.3f} "
@@ -903,6 +945,12 @@ def run_full_pipeline(
                 f"{r['internal_consistency']:>5.2f} {r['contribution']:>5.2f} "
                 f"{r['n_findings']:>5}"
             )
+    if failed:
+        print(f"\nFailed ({len(failed)}):")
+        for r in failed:
+            aid = r.get("arxiv_id", "?")
+            err = r.get("error", "unknown")
+            print(f"  {aid}: {err}")
 
     # Save committable record
     record_dir = base_config.results_dir

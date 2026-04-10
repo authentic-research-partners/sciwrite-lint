@@ -63,7 +63,7 @@ def run_eval_calibration(args: argparse.Namespace) -> int:
         calibration_dir=CALIBRATION_DIR,
         config=config,
         papers=papers,
-        rerun=args.rerun,
+        fresh=getattr(args, "fresh", False),
         model=getattr(args, "model", ""),
         output_dir=output_dir,
         concurrency=getattr(args, "concurrency", 2),

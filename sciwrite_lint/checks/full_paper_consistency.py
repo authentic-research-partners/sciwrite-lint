@@ -73,6 +73,8 @@ using established terminology loosely).
 - Set is_genuine to true ONLY for clear, unambiguous factual errors. \
 When in doubt, set is_genuine to false.
 - Prefer returning {{"issues": []}} over flagging borderline cases.
+- Report at most 5 issues. If you find more than 5 genuine issues, \
+return only the 5 most important ones.
 
 Return ONLY valid JSON: {{"issues": [{{"description": "...", "evidence": "...", \
 "location": "section or paragraph where the issue appears", \
@@ -93,11 +95,20 @@ Return {{"issues": []}} if no genuine issues found.\
 # question prompt) plus 2K safety padding for token estimation error.
 _OVERHEAD_TOKENS = 2500
 
-# Minimum output budget: enough for a few issues.
-_MIN_OUTPUT_TOKENS = 1024
+# Output budget reserved for the JSON response. Matches the vLLM model
+# default (VLLM_MODELS["qwen3"]["max_tokens"]). FullPaperIssueList caps
+# the issues list at 5, which fits comfortably in this budget.
+_OUTPUT_RESERVE_TOKENS = 2048
+
+# Worst-case thinking budget (medium preset, see THINKING_PRESETS).
+_THINKING_RESERVE_TOKENS = 1024
 
 # Rough chars-to-tokens ratio (conservative: overestimates tokens).
 _CHARS_PER_TOKEN = 3.5
+
+# Total tokens reserved for overhead + thinking + output. Whatever is left
+# in max_model_len is the budget for paper body + figure descriptions.
+_RESERVED_TOKENS = _OVERHEAD_TOKENS + _OUTPUT_RESERVE_TOKENS + _THINKING_RESERVE_TOKENS
 
 
 def _estimate_tokens(text: str) -> int:
@@ -151,8 +162,10 @@ def _get_max_model_len(config: "LintConfig") -> int:
 def _get_paper_body(tex_path: Path, config: "LintConfig") -> tuple[str, int] | None:
     """Return (paper_body, token_estimate) or *None* if too large.
 
-    Checks the paper body against ``max_model_len`` minus fixed overhead,
-    ensuring enough room for thinking + output.
+    Checks the paper body against ``max_model_len`` minus the fixed reserve
+    for prompt overhead, thinking budget, and output. The output budget is
+    constant — large papers are rejected rather than squeezed into a smaller
+    output window, because findings scale with paper size.
     """
     from sciwrite_lint.manuscript_store import get_or_create_manuscript_context
 
@@ -165,7 +178,7 @@ def _get_paper_body(tex_path: Path, config: "LintConfig") -> tuple[str, int] | N
     body_tokens = _estimate_tokens(body)
 
     max_model_len = _get_max_model_len(config)
-    max_body_tokens = max_model_len - _OVERHEAD_TOKENS - _MIN_OUTPUT_TOKENS
+    max_body_tokens = max_model_len - _RESERVED_TOKENS
     if body_tokens > max_body_tokens:
         logger.info(
             "Paper body ~{}K tokens (limit ~{}K from max_model_len={}) "
@@ -178,21 +191,6 @@ def _get_paper_body(tex_path: Path, config: "LintConfig") -> tuple[str, int] | N
 
     _body_cache[cache_key] = (body, body_tokens)
     return body, body_tokens
-
-
-def _compute_max_tokens(body_tokens: int, config: "LintConfig") -> int:
-    """Compute max_tokens for output based on remaining context budget.
-
-    ``max_tokens`` only caps the non-thinking output (JSON).  Thinking
-    budget is separate (set via ``extra_body.thinking.budget``).  We give
-    the output as much room as possible after the input fills the context.
-    """
-    max_model_len = _get_max_model_len(config)
-    # Available = total context - input (body + overhead) - thinking budget
-    # Thinking budget for medium=1024, low=200.  Use 1024 as worst case.
-    available = max_model_len - body_tokens - _OVERHEAD_TOKENS - 1024
-    # Clamp to reasonable range
-    return max(512, min(available, 4096))
 
 
 def _load_figure_descriptions(config: "LintConfig") -> str:
@@ -213,11 +211,12 @@ def _build_system_prompt(
     tex_path: Path,
     config: "LintConfig",
     figure_descriptions: str = "",
-) -> tuple[str, int] | None:
+) -> str | None:
     """Build the shared system prompt with the full paper body.
 
-    Returns ``(system_prompt, max_tokens)`` or *None* if too large.
-    ``max_tokens`` is computed dynamically based on remaining context.
+    Returns the system prompt string, or *None* if the paper body plus
+    figure descriptions would overflow the context window after reserving
+    the constant output + thinking + overhead budget.
 
     If ``figure_descriptions`` is not provided, attempts to load them
     from the vision cache in the paper workspace.
@@ -237,7 +236,7 @@ def _build_system_prompt(
     total_input_tokens = body_tokens + fig_tokens
 
     max_model_len = _get_max_model_len(config)
-    max_input = max_model_len - _OVERHEAD_TOKENS - _MIN_OUTPUT_TOKENS
+    max_input = max_model_len - _RESERVED_TOKENS
     if total_input_tokens > max_input:
         logger.info(
             "Paper body + figures ~{}K tokens (limit ~{}K) — too large",
@@ -246,13 +245,10 @@ def _build_system_prompt(
         )
         return None
 
-    system = _SYSTEM_TEMPLATE.format(
+    return _SYSTEM_TEMPLATE.format(
         paper_body=body,
         figure_section=figure_section,
     )
-    max_tokens = _compute_max_tokens(total_input_tokens, config)
-
-    return system, max_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -542,12 +538,10 @@ def _make_check_fns(
     def _build_queries(
         tex_path: Path, config: "LintConfig"
     ) -> list[tuple[str, str, dict, str]]:
-        result = _build_system_prompt(tex_path, config)
-        if result is None:
+        system = _build_system_prompt(tex_path, config)
+        if system is None:
             _build_queries._state = None  # type: ignore[attr-defined]
-            _build_queries._max_tokens = None  # type: ignore[attr-defined]
             return []
-        system, max_tokens = result
 
         # Skip figure checks when no figure descriptions are available
         if (
@@ -555,11 +549,9 @@ def _make_check_fns(
             and "Not available." in system.split("</figure_descriptions>")[0]
         ):
             _build_queries._state = None  # type: ignore[attr-defined]
-            _build_queries._max_tokens = None  # type: ignore[attr-defined]
             return []
 
         _build_queries._state = tex_path  # type: ignore[attr-defined]
-        _build_queries._max_tokens = max_tokens  # type: ignore[attr-defined]
         return [(system, question, _ISSUE_SCHEMA, "FullPaperIssue")]
 
     def _process_results(results: list[dict | None]) -> list[Finding]:

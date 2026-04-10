@@ -186,11 +186,13 @@ def _run_embeddings_subprocess(
     keys: list[str],
     references_dir: Path,
     config: LintConfig,
+    claim_texts: list[str] | None = None,
 ) -> str:
     """Run embedding computation in a subprocess for CUDA isolation.
 
     The embedding model brings batch data to VRAM; subprocess isolation
     ensures all CUDA allocations are released when embedding finishes.
+    Also pre-computes claim query vectors if ``claim_texts`` is provided.
 
     Returns:
         Empty string on success. On failure (non-zero exit, timeout, or
@@ -198,17 +200,19 @@ def _run_embeddings_subprocess(
         tail, timeout notice, or exception message) for inclusion in the
         RuntimeError raised by ``_verify_embeddings_or_raise``.
     """
+    import json as _json
     import subprocess
     import sys
 
-    # Pass keys as comma-separated arg, references_dir, and config path
+    # Pass keys as comma-separated arg, references_dir, claim texts as JSON
     keys_str = ",".join(keys)
+    claims_json = _json.dumps(claim_texts or [])
     cmd = [
         sys.executable,
         "-c",
         "import sys; "
         "from sciwrite_lint.pipeline import _embed_keys; "
-        f"_embed_keys({keys_str!r}, {str(references_dir)!r})",
+        f"_embed_keys({keys_str!r}, {str(references_dir)!r}, {claims_json!r})",
     ]
     try:
         result = subprocess.run(
@@ -231,15 +235,19 @@ def _run_embeddings_subprocess(
     return ""
 
 
-def _embed_keys(keys_csv: str, references_dir_str: str) -> None:
-    """Subprocess entry point: compute embeddings for given keys."""
+def _embed_keys(
+    keys_csv: str, references_dir_str: str, claim_texts_json: str = "[]"
+) -> None:
+    """Subprocess entry point: compute embeddings for given keys + claim queries."""
+    import json as _json
+
     from sciwrite_lint.references.reference_store import (
         compute_and_store_embeddings,
         release_embedding_model,
     )
 
     references_dir = Path(references_dir_str)
-    keys = keys_csv.split(",")
+    keys = keys_csv.split(",") if keys_csv else []
 
     for key in keys:
         # Check for parsed markdown
@@ -260,6 +268,11 @@ def _embed_keys(keys_csv: str, references_dir_str: str) -> None:
             logger.debug(f"embedding skipped for {key} ({type(e).__name__}: {e})")
             continue
 
+    # Pre-compute claim query vectors (model already loaded above)
+    claim_texts = _json.loads(claim_texts_json)
+    if claim_texts:
+        _encode_claim_queries(claim_texts, references_dir)
+
     release_embedding_model()
 
 
@@ -267,10 +280,11 @@ def _batch_embed_entry(manifest_path_str: str) -> None:
     """Subprocess entry point: embed keys for multiple papers in one process.
 
     Loads the embedding model once and iterates over papers. Each paper's
-    keys are embedded and stored in its own workspace. Called by
-    ``_batch_embed()`` via ``subprocess.run``.
+    keys are embedded and stored in its own workspace. Also pre-computes
+    claim query vectors so Stage 5 never loads the model in the parent.
 
-    Manifest JSON: list of {"keys": [...], "references_dir": "..."}.
+    Manifest JSON: list of {"keys": [...], "references_dir": "...",
+    "claim_texts": [...]}.
     """
     import json
 
@@ -283,7 +297,7 @@ def _batch_embed_entry(manifest_path_str: str) -> None:
 
     for entry in manifest:
         references_dir = Path(entry["references_dir"])
-        keys = entry["keys"]
+        keys = entry.get("keys", [])
         for key in keys:
             md_path = references_dir / "parsed" / f"{key}.md"
             web_path = references_dir / f"{key}_web.md"
@@ -304,7 +318,43 @@ def _batch_embed_entry(manifest_path_str: str) -> None:
                 logger.debug(f"embedding skipped for {key} ({type(e).__name__}: {e})")
                 continue
 
+        # Pre-compute claim query vectors (model already loaded above)
+        claim_texts = entry.get("claim_texts", [])
+        if claim_texts:
+            _encode_claim_queries(claim_texts, references_dir)
+
     release_embedding_model()
+
+
+def _encode_claim_queries(claim_texts: list[str], references_dir: Path) -> None:
+    """Encode claim query texts and store vectors in workspace.db.
+
+    Called from the embedding subprocess (Stage 4b) while the model is
+    already loaded. The vectors are used by ``retrieve_similar()`` in
+    Stage 5 so it never needs to load the model in the parent process.
+    """
+    import hashlib
+
+    from sciwrite_lint.references.reference_store import (
+        _get_embedding_config,
+        _get_embedding_model,
+    )
+    from sciwrite_lint.references.workspace_db import (
+        get_db,
+        save_query_vector,
+        serialize_f32,
+    )
+
+    model_name, _, _ = _get_embedding_config()
+    model = _get_embedding_model()
+    vecs = model.encode(claim_texts, normalize_embeddings=True)
+
+    with get_db(references_dir) as conn:
+        for text, vec in zip(claim_texts, vecs):
+            h = hashlib.sha256(text.encode()).hexdigest()
+            save_query_vector(conn, h, model_name, serialize_f32(vec.tolist()))
+
+    logger.info("Pre-computed {} claim query vectors", len(claim_texts))
 
 
 def _batch_cited_vision_entry(manifest_path_str: str) -> None:
@@ -323,6 +373,7 @@ def _batch_cited_vision_entry(manifest_path_str: str) -> None:
     for entry in manifest:
         references_dir = Path(entry["references_dir"])
         fresh = entry.get("fresh", False)
+        backend = entry.get("backend", "transformers")
 
         parsed_dir = references_dir / "parsed"
         if not parsed_dir.exists():
@@ -332,25 +383,18 @@ def _batch_cited_vision_entry(manifest_path_str: str) -> None:
         if not keys:
             continue
 
-        from sciwrite_lint.vision.describe import describe_figures
-        from sciwrite_lint.vision.image_extraction import (
-            ExtractedImage,
-            extract_images_from_pdf,
-        )
+        from sciwrite_lint.vision.describe import describe_figures_by_source
+        from sciwrite_lint.vision.image_extraction import collect_cited_images
 
-        all_images: list[ExtractedImage] = []
-        output_dir = references_dir / "parsed" / "ref_figures"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        for key in keys:
-            candidates = sorted(references_dir.glob(f"{key}*.pdf"))
-            if not candidates:
-                continue
-            images = extract_images_from_pdf(candidates[0], output_dir / key)
-            all_images.extend(images)
-
+        all_images, ref_image_ranges = collect_cited_images(keys, references_dir)
         if all_images:
-            describe_figures(all_images, references_dir=references_dir, fresh=fresh)
+            describe_figures_by_source(
+                all_images,
+                ref_image_ranges,
+                references_dir,
+                fresh=fresh,
+                backend=backend,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +582,222 @@ def _batch_cited_vision(
 
 
 # ---------------------------------------------------------------------------
+# vLLM container swap for vision backend
+# ---------------------------------------------------------------------------
+
+
+def _extract_claim_texts(config: LintConfig, tex_path: Path | None = None) -> list[str]:
+    """Extract unique claim context strings for query vector pre-computation.
+
+    Works for both LaTeX (.tex) and PDF input (ManuscriptContext).
+    Returns deduplicated list of claim context strings.
+    """
+    try:
+        if config.is_pdf and config.manuscript_context:
+            texts = list(
+                {ic.context for ic in config.manuscript_context.inline_citations}
+            )
+            logger.debug(
+                "Extracted {} claim texts from PDF ManuscriptContext", len(texts)
+            )
+            return texts
+        if tex_path and tex_path.suffix.lower() == ".tex":
+            from sciwrite_lint.eval_claims import extract_claim_contexts
+
+            claims = extract_claim_contexts(tex_path)
+            texts = list({c.context for c in claims})
+            logger.debug("Extracted {} claim texts from .tex", len(texts))
+            return texts
+        logger.debug(
+            "No claim texts: is_pdf={}, has_ctx={}, tex_path={}",
+            config.is_pdf,
+            config.manuscript_context is not None,
+            tex_path,
+        )
+    except Exception as e:
+        logger.debug("Claim text extraction failed: {}", e)
+        pass
+    return []
+
+
+def _needs_embedding_swap(config: LintConfig) -> bool:
+    """Check if we need to stop text vLLM for GPU embedding.
+
+    On native Linux (no CUDA overcommit), embedding can't coexist with
+    vLLM on the GPU. We stop vLLM first, embed on GPU, then restart.
+    On WSL2, overcommit handles coexistence — no swap needed.
+    """
+    from sciwrite_lint.config import is_wsl2
+
+    if is_wsl2():
+        return False
+    if config.embedding_device == "cpu":
+        return False
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def _is_vllm_responding(endpoint: str) -> bool:
+    """Sync check if vLLM API is responding (for use in sync contexts)."""
+    try:
+        import httpx
+
+        resp = httpx.get(f"{endpoint}/models", timeout=3.0)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _stop_vllm_for_embedding(config: LintConfig) -> None:
+    """Stop text vLLM to free GPU for embedding on native Linux.
+
+    Only stops if text vLLM is actually running.
+    """
+    from sciwrite_lint.vllm.vllm_server import stop_container
+
+    if not _is_vllm_responding(config.llm_endpoint):
+        return
+    logger.info("Stopping text vLLM for GPU embedding (native Linux, no overcommit)...")
+    stop_container(config, model=config.llm_model)
+
+
+def _restart_vllm_after_embedding(config: LintConfig) -> None:
+    """Restart text vLLM after embedding completes."""
+    import time as _time
+
+    from sciwrite_lint.vllm.vllm_server import start_container
+
+    logger.info("Restarting text vLLM after embedding...")
+    ret = start_container(config, model=config.llm_model)
+    if ret != 0:
+        raise RuntimeError(
+            "Failed to restart text vLLM after embedding. "
+            "Check: sciwrite-lint containers start"
+        )
+
+    # Sync poll — we're in a sync context (called from _run_embeddings_for_paper)
+    import httpx
+
+    deadline = _time.monotonic() + 300
+    while _time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{config.llm_endpoint}/models", timeout=5.0)
+            if resp.status_code == 200:
+                logger.info("Text vLLM ready")
+                return
+        except httpx.HTTPError:
+            pass
+        _time.sleep(5)
+    raise RuntimeError(
+        f"Text vLLM did not become ready within 300s at {config.llm_endpoint}. "
+        "Check logs: sciwrite-lint vllm logs"
+    )
+
+
+async def _swap_to_vision_vllm(config: LintConfig) -> None:
+    """Stop text vLLM, start vision vLLM, wait for API ready.
+
+    Called before vision stages when ``config.vision_backend == "vllm"``.
+    Skips if the vision API is already responding (user pre-started it).
+    Skips if no container runtime is available (test environments).
+    """
+    from sciwrite_lint.vllm.vllm_server import (
+        MODELS,
+        _check_api_health,
+        start_container,
+        stop_container,
+        wait_for_ready,
+    )
+
+    vision_port = MODELS["qwen3-vl"]["port"]
+    vision_endpoint = f"http://localhost:{vision_port}/v1"
+
+    # Already running? Skip the swap.
+    if await _check_api_health(vision_endpoint):
+        logger.info("Vision vLLM already running on port {}", vision_port)
+        return
+
+    # Text vLLM not running? Nothing to swap from.
+    if not await _check_api_health(config.llm_endpoint):
+        logger.debug("Text vLLM not running — skipping vision swap")
+        return
+
+    # Stop text vLLM to free GPU
+    logger.info("Stopping text vLLM to free GPU for vision...")
+    stop_container(config, model=config.llm_model)
+
+    # Start vision vLLM
+    logger.info("Starting vision vLLM (qwen3-vl)...")
+    ret = start_container(config, model="qwen3-vl")
+    if ret != 0:
+        raise RuntimeError(
+            "Failed to start vision vLLM container. "
+            "Check: sciwrite-lint vllm start --model qwen3-vl"
+        )
+
+    # Wait for API
+    logger.info("Waiting for vision vLLM API on port {}...", vision_port)
+    ready = await wait_for_ready(vision_endpoint, timeout=300)
+    if not ready:
+        raise RuntimeError(
+            f"Vision vLLM did not become ready within 300s on port {vision_port}. "
+            "Check logs: sciwrite-lint vllm logs --model qwen3-vl"
+        )
+    logger.info("Vision vLLM ready")
+
+
+async def _swap_to_text_vllm(config: LintConfig) -> None:
+    """Stop vision vLLM, start text vLLM, wait for API ready.
+
+    Called after vision stages to restore text vLLM for Stages 1+2.
+    Skips if text API is already responding.
+    Skips if no container runtime is available (test environments).
+    """
+    from sciwrite_lint.vllm.vllm_server import (
+        MODELS,
+        _check_api_health,
+        start_container,
+        stop_container,
+        wait_for_ready,
+    )
+
+    text_endpoint = config.llm_endpoint
+
+    # Always stop vision vLLM if it's running — free VRAM for text stages
+    vision_port = MODELS["qwen3-vl"]["port"]
+    if await _check_api_health(f"http://localhost:{vision_port}/v1"):
+        logger.info("Stopping vision vLLM to free GPU...")
+        stop_container(config, model="qwen3-vl")
+
+    # Text already running? Done.
+    if await _check_api_health(text_endpoint):
+        logger.info("Text vLLM already running")
+        return
+
+    # Start text vLLM
+    logger.info("Starting text vLLM ({})...", config.llm_model)
+    ret = start_container(config, model=config.llm_model)
+    if ret != 0:
+        raise RuntimeError(
+            "Failed to start text vLLM container. Check: sciwrite-lint containers start"
+        )
+
+    # Wait for API
+    logger.info("Waiting for text vLLM API...")
+    ready = await wait_for_ready(text_endpoint, timeout=300)
+    if not ready:
+        raise RuntimeError(
+            f"Text vLLM did not become ready within 300s at {text_endpoint}. "
+            "Check logs: sciwrite-lint vllm logs"
+        )
+    logger.info("Text vLLM ready")
+
+
+# ---------------------------------------------------------------------------
 # Stage 0.5: Vision — figure descriptions for full-paper consistency checks
 # ---------------------------------------------------------------------------
 
@@ -548,7 +808,11 @@ def _stage_vision(
     paper_name: str,
     fresh: bool = False,
 ) -> None:
-    """Extract and describe manuscript figures via Qwen3-VL-2B.
+    """Extract and describe manuscript figures via VL model.
+
+    Backend is selected by ``config.vision_backend``:
+    - ``"transformers"``: Qwen3-VL-2B in subprocess (default)
+    - ``"vllm"``: Qwen3-VL-8B-FP8 via vLLM container on port 5002
 
     Populates the vision cache so that full-paper consistency checks
     (Stage 2) can include figure descriptions in the shared prefix.
@@ -579,6 +843,8 @@ def _stage_vision(
         cmd.append("--fresh")
     if config.config_path:
         cmd.extend(["--config", str(config.config_path)])
+    cmd.extend(["--backend", config.vision_backend])
+    cmd.extend(["--device", config.vision_device])
 
     try:
         result = subprocess.run(
@@ -1307,6 +1573,7 @@ async def _stage_parse(
     references_dir: Path,
     parse_sem: asyncio.Semaphore | None = None,
     skip_embeddings: bool = False,
+    tex_path: Path | None = None,
 ) -> tuple[int, int]:
     """Parse unparsed PDFs via GROBID + build embeddings. Returns (parsed_count, cached_count).
 
@@ -1314,6 +1581,7 @@ async def _stage_parse(
         skip_embeddings: If True, skip the embedding subprocess. Used by
             ``run_papers_staged()`` which runs embedding in a single batch
             subprocess across all papers (see ``_batch_embed``).
+        tex_path: Path to .tex file for claim text extraction (optional).
     """
     from sciwrite_lint.references.reference_store import parse_all_missing
 
@@ -1324,7 +1592,7 @@ async def _stage_parse(
     failed = sum(1 for v in results.values() if v == "failed")
 
     if not skip_embeddings:
-        _run_embeddings_for_paper(results, references_dir, config)
+        _run_embeddings_for_paper(results, references_dir, config, tex_path=tex_path)
 
     parts = []
     if parsed:
@@ -1343,8 +1611,12 @@ def _run_embeddings_for_paper(
     parse_results: dict[str, str],
     references_dir: Path,
     config: LintConfig,
+    tex_path: Path | None = None,
 ) -> None:
     """Run embedding subprocesses for one paper's parsed + web keys.
+
+    Also pre-computes claim query vectors in the same subprocess so
+    Stage 5 never loads the embedding model in the parent process.
 
     Raises ``RuntimeError`` if the embedding subprocess fails to actually
     produce embeddings for any requested key. ``_run_embeddings_subprocess``
@@ -1357,6 +1629,9 @@ def _run_embeddings_for_paper(
     from sciwrite_lint.references.embedding_store import has_embeddings
     from sciwrite_lint.references.reference_store import _get_embedding_config
 
+    # Extract claim texts for query vector pre-computation
+    claim_texts = _extract_claim_texts(config, tex_path)
+
     model_name, _, _ = _get_embedding_config()
     keys_to_embed = []
     for key, status in parse_results.items():
@@ -1368,11 +1643,16 @@ def _run_embeddings_for_paper(
             keys_to_embed.append(key)
 
     # Run embedding in a subprocess to isolate the CUDA context.
-    # The embedding model (~1.2 GB on WSL2/CUDA) brings batch data to
-    # VRAM; subprocess isolation ensures all CUDA allocations are released
-    # when embedding finishes, freeing VRAM for vLLM claim verification.
-    if keys_to_embed:
-        diag = _run_embeddings_subprocess(keys_to_embed, references_dir, config)
+    # On native Linux (no CUDA overcommit), stop text vLLM first to free
+    # GPU, then force CUDA device for ~50x speedup over CPU.
+    embed_swap = False
+    if keys_to_embed or claim_texts:
+        if _needs_embedding_swap(config):
+            embed_swap = True
+            _stop_vllm_for_embedding(config)
+        diag = _run_embeddings_subprocess(
+            keys_to_embed, references_dir, config, claim_texts=claim_texts
+        )
         _verify_embeddings_or_raise(
             keys_to_embed,
             references_dir,
@@ -1397,6 +1677,9 @@ def _run_embeddings_for_paper(
             web_keys.append(key)
 
     if web_keys:
+        if not embed_swap and _needs_embedding_swap(config):
+            embed_swap = True
+            _stop_vllm_for_embedding(config)
         diag = _run_embeddings_subprocess(web_keys, references_dir, config)
         _verify_embeddings_or_raise(
             web_keys,
@@ -1405,6 +1688,9 @@ def _run_embeddings_for_paper(
             kind="web summary",
             subprocess_diag=diag,
         )
+
+    if embed_swap:
+        _restart_vllm_after_embedding(config)
 
 
 def _verify_embeddings_or_raise(
@@ -1561,6 +1847,7 @@ def _claims_to_findings(results: list[dict], tex_path: Path) -> list[Finding]:
 def _stage_cited_vision(
     references_dir: Path,
     fresh: bool = False,
+    backend: str = "transformers",
 ) -> dict[str, str]:
     """Stage 4.2: Describe figures from cited paper PDFs.
 
@@ -1568,7 +1855,10 @@ def _stage_cited_vision(
     the embedding model is unloaded (Stage 4) and before vLLM ref_internal
     queries (Stage 4.5).
 
-    The subprocess runs VL inference and caches results in workspace.db.
+    When backend is "vllm", runs in the current process (no subprocess
+    needed — vLLM handles inference, no CUDA context to isolate).
+
+    The subprocess/function caches results in workspace.db.
     The parent process reads cached descriptions from DB afterwards.
 
     Returns {ref_key: figure_descriptions_str} for injection into
@@ -1578,10 +1868,7 @@ def _stage_cited_vision(
     import sys
 
     from sciwrite_lint.vision.cache import format_descriptions_from_db
-    from sciwrite_lint.vision.image_extraction import (
-        ExtractedImage,
-        extract_images_from_pdf,
-    )
+    from sciwrite_lint.vision.image_extraction import collect_cited_images
 
     parsed_dir = references_dir / "parsed"
     if not parsed_dir.exists():
@@ -1591,66 +1878,63 @@ def _stage_cited_vision(
     if not keys:
         return {}
 
-    # Collect images and their ref_key ranges (lightweight, no GPU)
-    all_images: list[ExtractedImage] = []
-    ref_image_ranges: dict[str, tuple[int, int]] = {}
-
-    output_dir = references_dir / "parsed" / "ref_figures"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for key in keys:
-        candidates = sorted(references_dir.glob(f"{key}*.pdf"))
-        if not candidates:
-            continue
-        start = len(all_images)
-        images = extract_images_from_pdf(candidates[0], output_dir / key)
-        all_images.extend(images)
-        if images:
-            ref_image_ranges[key] = (start, len(all_images))
-
+    all_images, ref_image_ranges = collect_cited_images(keys, references_dir)
     if not all_images:
         return {}
 
-    # Dynamic timeout: ~5s per image (conservative, GPU batch=16), 60s for model load
-    timeout = max(120, 60 + len(all_images) * 5)
+    if backend == "vllm":
+        # vLLM backend: no subprocess needed (no CUDA context to isolate).
+        from sciwrite_lint.vision.describe import describe_figures_by_source
 
-    # Run VL inference in subprocess to isolate CUDA context
-    cmd = [
-        sys.executable,
-        "-c",
-        "from sciwrite_lint.checks.ref_internal_checks import _describe_cited_figures_vl; "
-        f"_describe_cited_figures_vl({str(references_dir)!r}, {fresh!r})",
-    ]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        describe_figures_by_source(
+            all_images,
+            ref_image_ranges,
+            references_dir,
+            fresh=fresh,
+            backend="vllm",
         )
-        if result.returncode != 0:
-            stderr = result.stderr.strip()[-1500:] if result.stderr else ""
-            logger.error(
-                "Cited vision subprocess failed (exit {}): {}\n"
-                "Cited figures missing — ref-internal checks will run with "
-                "reduced visual context.",
-                result.returncode,
-                stderr,
+    else:
+        # Transformers backend: subprocess for CUDA isolation.
+        # Dynamic timeout: ~5s per image (conservative, GPU batch=16), 60s for model load
+        timeout = max(120, 60 + len(all_images) * 5)
+
+        cmd = [
+            sys.executable,
+            "-c",
+            "from sciwrite_lint.checks.ref_internal_checks import "
+            "_describe_cited_figures_vl; "
+            f"_describe_cited_figures_vl({str(references_dir)!r}, {fresh!r})",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
             )
-    except subprocess.TimeoutExpired:
-        logger.error(
-            "Cited vision subprocess timed out ({}s, {} images) — figures missing",
-            timeout,
-            len(all_images),
-        )
-    except Exception as e:
-        logger.error("Cited vision subprocess error: {}: {}", type(e).__name__, e)
+            if result.returncode != 0:
+                stderr = result.stderr.strip()[-1500:] if result.stderr else ""
+                logger.error(
+                    "Cited vision subprocess failed (exit {}): {}\n"
+                    "Cited figures missing — ref-internal checks will run with "
+                    "reduced visual context.",
+                    result.returncode,
+                    stderr,
+                )
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "Cited vision subprocess timed out ({}s, {} images) — figures missing",
+                timeout,
+                len(all_images),
+            )
+        except Exception as e:
+            logger.error("Cited vision subprocess error: {}: {}", type(e).__name__, e)
 
-    # Read cached descriptions from DB (written by subprocess)
+    # Read cached descriptions from DB (written by subprocess or in-process)
     descriptions: dict[str, str] = {}
     for key, (start, end) in ref_image_ranges.items():
         ref_images = all_images[start:end]
-        desc = format_descriptions_from_db(ref_images, references_dir)
+        desc = format_descriptions_from_db(ref_images, references_dir, source=key)
         if desc:
             descriptions[key] = desc
 
@@ -1945,12 +2229,23 @@ async def run_full_check(
     if fresh:
         _backup_workspace(ws)
     ws.ensure_dirs()
-    ws.save_source(tex_path, bib_path=pc.bib)
     refs_dir = ws.root
-    # Set paper context for registered checks that need per-paper paths
     config.current_paper = paper_name
 
-    # Extract citations — source depends on input type
+    # Register in usage.db + init stages BEFORE doing work, so the
+    # monitor can show "setup running" immediately.
+    run = start_run(
+        paper=paper_name,
+        model=config.llm_model or "",
+        workspace_root=str(refs_dir),
+    )
+    with get_db(refs_dir) as conn:
+        init_pipeline_stages(conn)
+    _track(refs_dir, "setup", "running")
+
+    # Now do the actual setup work (save source, extract citations)
+    ws.save_source(tex_path, bib_path=pc.bib)
+
     if config.is_pdf:
         citations = citations_from_pdf_context(config)
     else:
@@ -1963,18 +2258,8 @@ async def run_full_check(
         check_local_sources(citations, refs_dir)
 
     logger.info(f"{len(citations)} citations extracted")
-
-    # Start usage tracking
-    run = start_run(
-        paper=paper_name,
-        model=config.llm_model or "",
-        workspace_root=str(refs_dir),
-    )
     run.citations = len(citations)
-
-    # Initialize pipeline stage tracking
-    with get_db(refs_dir) as conn:
-        init_pipeline_stages(conn)
+    _track(refs_dir, "setup", "done", f"{len(citations)} citations")
 
     t0 = time.monotonic()
     all_findings: list[Finding] = []
@@ -1982,10 +2267,55 @@ async def run_full_check(
     try:
         # Stage 0.5: Vision — describe figures for full-paper consistency checks.
         # Runs before LLM checks so descriptions are in the cache when
-        # _build_system_prompt loads them.  On WSL2, the VL model (~4 GB)
-        # shares VRAM with vLLM via memory overcommit — no container restart.
+        # _build_system_prompt loads them.
+        #
+        # When vision_backend == "vllm": swap containers (stop text, start
+        # vision, run both vision stages back-to-back, swap back).
+        # When vision_backend == "transformers": VL model runs in subprocess,
+        # coexists with text vLLM via WSL2 memory overcommit.
+        use_vllm_vision = config.vision_backend == "vllm"
+
+        # Only swap containers if there are uncached images that need
+        # VL inference. Cached reruns skip the swap entirely.
+        if use_vllm_vision and not fresh:
+            from sciwrite_lint.vision.cache import split_cached_and_new
+            from sciwrite_lint.vision.image_extraction import (
+                extract_images_from_latex,
+                extract_images_from_pdf,
+            )
+
+            if tex_path.suffix.lower() == ".pdf":
+                ws_out = ws.parsed / "extracted_images"
+                probe_imgs = extract_images_from_pdf(tex_path, ws_out)
+            else:
+                ws_tex = ws.source / tex_path.name
+                effective = ws_tex if ws_tex.is_file() else tex_path
+                probe_imgs = extract_images_from_latex(effective)
+
+            if probe_imgs and split_cached_and_new(probe_imgs, refs_dir):
+                await _swap_to_vision_vllm(config)
+            elif probe_imgs:
+                logger.info(
+                    "Vision: all {} figure(s) cached — skipping swap", len(probe_imgs)
+                )
+                use_vllm_vision = False  # no swap needed
+            else:
+                use_vllm_vision = False  # no images at all
+        elif use_vllm_vision and fresh:
+            await _swap_to_vision_vllm(config)
+
         with _stage_tracking(refs_dir, "vision"):
             _stage_vision(tex_path, config, paper_name, fresh=fresh)
+
+        # When using vLLM vision, run cited vision now (while vision
+        # container is still up) instead of at Stage 4.2.
+        ref_figure_descs_early: dict[str, str] | None = None
+        if use_vllm_vision:
+            with _stage_tracking(refs_dir, "cited_vision"):
+                ref_figure_descs_early = _stage_cited_vision(
+                    refs_dir, fresh=False, backend="vllm"
+                )
+            await _swap_to_text_vllm(config)
 
         # Stage 1 + 2: concurrent (text checks in thread, LLM + verify async)
         with _stage_tracking(refs_dir, ["text_checks", "llm_checks", "verify"]):
@@ -2027,7 +2357,7 @@ async def run_full_check(
             t2 = time.monotonic()
             with _stage_tracking(refs_dir, "parse") as st:
                 parsed, cached = await _stage_parse(
-                    config, refs_dir, parse_sem=parse_sem
+                    config, refs_dir, parse_sem=parse_sem, tex_path=tex_path
                 )
                 st.detail = f"{parsed} new, {cached} cached"
             run.stage_parse_s = time.monotonic() - t2
@@ -2038,12 +2368,15 @@ async def run_full_check(
             logger.info(f"Fetch + parse: {run.stage_fetch_s + run.stage_parse_s:.1f}s")
 
         # Stage 4.2: Vision on cited papers (VL model on GPU, sequential).
-        # Never pass fresh — cited paper descriptions use hash-based
-        # invalidation. Passing fresh=True would clear the entire
-        # vision_cache table, destroying source paper descriptions
-        # written by _stage_vision (Stage 0.5).
-        with _stage_tracking(refs_dir, "cited_vision"):
-            ref_figure_descs = _stage_cited_vision(refs_dir, fresh=False)
+        # When vLLM vision backend was used, this already ran after Stage 0.5
+        # (while the vision container was up). Skip the redundant run.
+        if ref_figure_descs_early is not None:
+            ref_figure_descs = ref_figure_descs_early
+        else:
+            with _stage_tracking(refs_dir, "cited_vision"):
+                ref_figure_descs = _stage_cited_vision(
+                    refs_dir, fresh=False, backend=config.vision_backend
+                )
 
         # Stage 4.5: ref internal checks (vLLM, thinking=low/medium)
         t3 = time.monotonic()
@@ -2215,11 +2548,23 @@ async def run_papers_staged(
         if fresh:
             _backup_workspace(ws)
         ws.ensure_dirs()
-        ws.save_source(tex_path, bib_path=pc.bib)
         refs_dir = ws.root
         config.current_paper = paper_name
 
-        # Extract citations
+        # Register in usage.db + init stages BEFORE doing work, so the
+        # monitor can show "setup running" immediately.
+        run = start_run(
+            paper=paper_name,
+            model=config.llm_model or "",
+            workspace_root=str(refs_dir),
+        )
+        with get_db(refs_dir) as conn:
+            init_pipeline_stages(conn)
+        _track(refs_dir, "setup", "running")
+
+        # Now do the actual setup work (save source, extract citations)
+        ws.save_source(tex_path, bib_path=pc.bib)
+
         if config.is_pdf:
             citations = citations_from_pdf_context(config)
         else:
@@ -2232,16 +2577,8 @@ async def run_papers_staged(
             check_local_sources(citations, refs_dir)
 
         logger.info("[{}] {} citations extracted", paper_name, len(citations))
-
-        run = start_run(
-            paper=paper_name,
-            model=config.llm_model or "",
-            workspace_root=str(refs_dir),
-        )
         run.citations = len(citations)
-
-        with get_db(refs_dir) as conn:
-            init_pipeline_stages(conn)
+        _track(refs_dir, "setup", "done", f"{len(citations)} citations")
 
         ctxs.append(
             _PaperCtx(
@@ -2272,11 +2609,46 @@ async def run_papers_staged(
         """Papers that haven't failed yet."""
         return [ctx for ctx in ctxs if ctx.error is None]
 
+    # Use first paper's config for vision backend (all papers share config)
+    use_vllm_vision = ctxs[0].config.vision_backend == "vllm"
+
     try:
         # ------------------------------------------------------------------
         # Stage 0.5: BATCH VISION — one subprocess, all papers
         # ------------------------------------------------------------------
         logger.info("=== Stage 0.5: Batch vision ({} papers) ===", len(ctxs))
+
+        # Only swap if at least one paper has uncached images
+        if use_vllm_vision and not fresh:
+            from sciwrite_lint.vision.cache import split_cached_and_new
+            from sciwrite_lint.vision.image_extraction import (
+                extract_images_from_latex,
+                extract_images_from_pdf,
+            )
+
+            any_uncached = False
+            for ctx in ctxs:
+                if ctx.tex_path.suffix.lower() == ".pdf":
+                    ws_obj = ctx.config.paper_workspace(ctx.name)
+                    out_dir = ws_obj.parsed / "extracted_images"
+                    imgs = extract_images_from_pdf(ctx.tex_path, out_dir)
+                else:
+                    ws_obj = ctx.config.paper_workspace(ctx.name)
+                    ws_tex = ws_obj.source / ctx.tex_path.name
+                    eff = ws_tex if ws_tex.is_file() else ctx.tex_path
+                    imgs = extract_images_from_latex(eff)
+                if imgs and split_cached_and_new(imgs, ctx.refs_dir):
+                    any_uncached = True
+                    break
+
+            if any_uncached:
+                await _swap_to_vision_vllm(ctxs[0].config)
+            else:
+                logger.info("Vision: all figures cached — skipping swap")
+                use_vllm_vision = False
+        elif use_vllm_vision and fresh:
+            await _swap_to_vision_vllm(ctxs[0].config)
+
         vision_manifest = [
             {
                 "paper_name": ctx.name,
@@ -2285,11 +2657,19 @@ async def run_papers_staged(
                 if ctx.config.config_path
                 else None,
                 "fresh": fresh,
+                "backend": ctx.config.vision_backend,
+                "device": ctx.config.vision_device,
             }
             for ctx in ctxs
         ]
         with _stage_tracking([ctx.refs_dir for ctx in ctxs], "vision"):
             _batch_vision(vision_manifest)
+
+        # When using vLLM vision, cited vision cannot run here (cited
+        # papers haven't been fetched/parsed yet). It stays at Stage 4.2.
+        # Swap back to text now so Stages 1+2 can use text vLLM.
+        if use_vllm_vision:
+            await _swap_to_text_vllm(ctxs[0].config)
 
         # ------------------------------------------------------------------
         # Stages 1+2: TEXT + LLM + VERIFY — all papers concurrent
@@ -2430,16 +2810,31 @@ async def run_papers_staged(
                 if web_path.exists():
                     keys_to_embed.append(key)
 
-            if keys_to_embed:
+            # Extract claim texts for query vector pre-computation.
+            # The embedding subprocess encodes these alongside document
+            # chunks so Stage 5 never loads the model in the parent process.
+            claim_texts = _extract_claim_texts(ctx.config, ctx.tex_path)
+
+            if keys_to_embed or claim_texts:
                 embed_manifest.append(
                     {
                         "keys": keys_to_embed,
                         "references_dir": str(ctx.refs_dir),
+                        "claim_texts": claim_texts,
                     }
                 )
 
+        batch_embed_swap = bool(embed_manifest) and _needs_embedding_swap(
+            ctxs[0].config
+        )
+        if batch_embed_swap:
+            _stop_vllm_for_embedding(ctxs[0].config)
+
         with _stage_failure_guard([ctx.refs_dir for ctx in _active()], "parse"):
             embed_diag = _batch_embed(embed_manifest)
+
+        if batch_embed_swap:
+            _restart_vllm_after_embedding(ctxs[0].config)
 
         # Mark parse stage done per paper, now that batch embedding has run.
         # _batch_embed swallows subprocess failures (crash, timeout, partial)
@@ -2504,8 +2899,16 @@ async def run_papers_staged(
         for ctx in active_ctxs:
             _track(ctx.refs_dir, "cited_vision", "running")
 
+        if use_vllm_vision:
+            await _swap_to_vision_vllm(ctxs[0].config)
+
         cited_vis_manifest = [
-            {"references_dir": str(ctx.refs_dir), "fresh": False} for ctx in active_ctxs
+            {
+                "references_dir": str(ctx.refs_dir),
+                "fresh": False,
+                "backend": ctx.config.vision_backend,
+            }
+            for ctx in active_ctxs
         ]
         # Count total images across all papers for dynamic timeout.
         # Image extraction is lightweight (no GPU) — just PDF page scanning.
@@ -2542,7 +2945,7 @@ async def run_papers_staged(
 
         # Read cited vision results from DB for each paper
         from sciwrite_lint.vision.cache import format_descriptions_from_db
-        from sciwrite_lint.vision.image_extraction import extract_images_from_pdf
+        from sciwrite_lint.vision.image_extraction import collect_cited_images
 
         for ctx in active_ctxs:
             parsed_dir = ctx.refs_dir / "parsed"
@@ -2550,19 +2953,19 @@ async def run_papers_staged(
                 _track(ctx.refs_dir, "cited_vision", "done")
                 continue
             keys = [f.stem for f in sorted(parsed_dir.glob("*.md"))]
+            all_imgs, ranges = collect_cited_images(keys, ctx.refs_dir)
             descriptions: dict[str, str] = {}
-            for key in keys:
-                candidates = sorted(ctx.refs_dir.glob(f"{key}*.pdf"))
-                if not candidates:
-                    continue
-                output_dir = ctx.refs_dir / "parsed" / "ref_figures" / key
-                images = extract_images_from_pdf(candidates[0], output_dir)
-                if images:
-                    desc = format_descriptions_from_db(images, ctx.refs_dir)
-                    if desc:
-                        descriptions[key] = desc
+            for key, (start, end) in ranges.items():
+                desc = format_descriptions_from_db(
+                    all_imgs[start:end], ctx.refs_dir, source=key
+                )
+                if desc:
+                    descriptions[key] = desc
             ctx.ref_figure_descs = descriptions
             _track(ctx.refs_dir, "cited_vision", "done")
+
+        if use_vllm_vision:
+            await _swap_to_text_vllm(ctxs[0].config)
 
         # ------------------------------------------------------------------
         # Stage 4.5: REF INTERNAL — all papers concurrent (vLLM)

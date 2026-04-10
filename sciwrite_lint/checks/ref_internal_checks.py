@@ -538,49 +538,24 @@ def _describe_cited_figures(
     Returns {ref_key: formatted_figure_descriptions}.
     """
     from sciwrite_lint.vision.cache import format_descriptions_from_db
-    from sciwrite_lint.vision.image_extraction import (
-        ExtractedImage,
-        extract_images_from_pdf,
-    )
+    from sciwrite_lint.vision.image_extraction import collect_cited_images
 
-    # Collect images from all cited PDFs
-    all_images: list[ExtractedImage] = []
-    ref_image_ranges: dict[str, tuple[int, int]] = {}  # key → (start, end) index
-
-    output_dir = references_dir / "parsed" / "ref_figures"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for key in ref_keys:
-        # Find the PDF for this key (may have suffix like _core, _arxiv)
-        candidates = sorted(references_dir.glob(f"{key}*.pdf"))
-        if not candidates:
-            continue
-        pdf_path = candidates[0]
-
-        ref_output = output_dir / key
-        start = len(all_images)
-        images = extract_images_from_pdf(pdf_path, ref_output)
-        all_images.extend(images)
-        if images:
-            ref_image_ranges[key] = (start, len(all_images))
-
+    all_images, ref_image_ranges = collect_cited_images(ref_keys, references_dir)
     if not all_images:
         return {}
 
-    # Run VL inference on all images at once (batched)
-    from sciwrite_lint.vision.describe import describe_figures
+    # Run VL inference per-ref so each gets tagged with its source key.
+    from sciwrite_lint.vision.describe import describe_figures_by_source
 
-    describe_figures(
-        all_images,
-        references_dir=references_dir,
-        fresh=fresh,
+    describe_figures_by_source(
+        all_images, ref_image_ranges, references_dir, fresh=fresh
     )
 
     # Build per-ref description strings
     result: dict[str, str] = {}
     for key, (start, end) in ref_image_ranges.items():
         ref_images = all_images[start:end]
-        desc = format_descriptions_from_db(ref_images, references_dir)
+        desc = format_descriptions_from_db(ref_images, references_dir, source=key)
         if desc:
             result[key] = desc
 
@@ -598,6 +573,9 @@ def _describe_cited_figures_vl(references_dir_str: str, fresh: bool = False) -> 
 
     Extracts images, runs VL model, caches results in workspace.db.
     Called by _stage_cited_vision() in a subprocess for CUDA isolation.
+
+    Each ref's images are described separately so the cache entries get
+    tagged with the correct ``source=ref_key``.
     """
     from pathlib import Path
 
@@ -607,25 +585,14 @@ def _describe_cited_figures_vl(references_dir_str: str, fresh: bool = False) -> 
     if not keys:
         return
 
-    from sciwrite_lint.vision.describe import describe_figures
-    from sciwrite_lint.vision.image_extraction import (
-        ExtractedImage,
-        extract_images_from_pdf,
-    )
+    from sciwrite_lint.vision.describe import describe_figures_by_source
+    from sciwrite_lint.vision.image_extraction import collect_cited_images
 
-    all_images: list[ExtractedImage] = []
-    output_dir = references_dir / "parsed" / "ref_figures"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for key in keys:
-        candidates = sorted(references_dir.glob(f"{key}*.pdf"))
-        if not candidates:
-            continue
-        images = extract_images_from_pdf(candidates[0], output_dir / key)
-        all_images.extend(images)
-
+    all_images, ref_image_ranges = collect_cited_images(keys, references_dir)
     if all_images:
-        describe_figures(all_images, references_dir=references_dir, fresh=fresh)
+        describe_figures_by_source(
+            all_images, ref_image_ranges, references_dir, fresh=fresh
+        )
 
 
 # ---------------------------------------------------------------------------

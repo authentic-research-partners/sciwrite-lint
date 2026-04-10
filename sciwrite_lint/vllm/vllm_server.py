@@ -26,18 +26,34 @@ MODELS: dict[str, dict] = {
         "hf_model": "RedHatAI/Qwen3-8B-FP8-dynamic",
         "served_name": "qwen3-8b-fp8",
         "reasoning_parser": "qwen3",  # server-side <think> parsing
+        "kind": "text",
     },
     "gemma3": {
         "hf_model": "RedHatAI/gemma-3-12b-it-FP8-dynamic",
         "served_name": "gemma3-12b-fp8",
         "reasoning_parser": "",  # no thinking support
+        "kind": "text",
+    },
+    "qwen3-vl": {
+        "hf_model": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+        "served_name": "qwen3-vl-8b-fp8",
+        "reasoning_parser": "",
+        "kind": "vision",
+        "port": 5002,
+        "max_model_len": 8192,
+        "memory": "8g",  # vision models need more host RAM for image preprocessing
     },
 }
+
+# Convenience sets for CLI choices
+TEXT_MODELS = [k for k, v in MODELS.items() if v["kind"] == "text"]
+VISION_MODELS = [k for k, v in MODELS.items() if v["kind"] == "vision"]
 
 # Default vLLM flags for consumer-GPU deployment
 _DEFAULT_GPU_MEM = 0.9
 _DEFAULT_MAX_MODEL_LEN = 40_960
 _DEFAULT_PORT = 5001
+_DEFAULT_VISION_PORT = 5002
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +93,14 @@ def _port_available(host: str, port: int) -> bool:
         return False
 
 
-def _resolve_port(config: LintConfig) -> int:
-    """Resolve vLLM port: config endpoint > remembered > default."""
+def _resolve_port(config: LintConfig, model_name: str | None = None) -> int:
+    """Resolve vLLM port: profile override > config endpoint > remembered > default."""
+    # Vision models have a fixed port in their profile
+    if model_name:
+        profile = MODELS.get(model_name)
+        if profile and "port" in profile:
+            return profile["port"]
+
     # Parse port from config endpoint
     from urllib.parse import urlparse
 
@@ -111,6 +133,19 @@ async def _check_api_health(endpoint: str) -> dict | None:
     return None
 
 
+async def wait_for_ready(endpoint: str, timeout: int = 300, interval: int = 5) -> bool:
+    """Poll vLLM API until it responds or timeout is reached."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        health = await _check_api_health(endpoint)
+        if health:
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Container helpers
 # ---------------------------------------------------------------------------
@@ -126,6 +161,24 @@ def _detect_container_runtime() -> str | None:
 
 def _container_name(model: str) -> str:
     return f"sciwrite-lint-vllm-{model}"
+
+
+def _identify_port_holder(runtime: str | None, port: int) -> str:
+    """Try to identify which container holds a port. Returns ' by <name>' or ''."""
+    if not runtime:
+        return ""
+    result = subprocess.run(
+        [runtime, "ps", "--format", "{{.Names}}\t{{.Ports}}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    for line in result.stdout.strip().splitlines():
+        if f":{port}->" in line:
+            name = line.split("\t")[0]
+            return f" by container '{name}'"
+    return ""
 
 
 def _container_exists(runtime: str, name: str) -> bool:
@@ -168,7 +221,7 @@ def start_container(
         return 1
 
     name = _container_name(model_name)
-    serve_port = _resolve_port(config)
+    serve_port = _resolve_port(config, model_name)
 
     # Already running?
     if _container_running(runtime, name):
@@ -176,10 +229,31 @@ def start_container(
         logger.info("Use 'sciwrite-lint vllm restart' to restart")
         return 0
 
-    # Remove stopped container (config may have changed)
-    if _container_exists(runtime, name):
-        logger.info(f"Removing stopped container '{name}'")
+    # Restart stopped container (fast — weights cached in page cache)
+    if _container_exists(runtime, name) and not pull:
+        logger.info(f"Restarting stopped container '{name}'")
+        result = subprocess.run(
+            [runtime, "start", name], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            logger.info(f"Container restarted: {name}")
+            logger.info(f"API will be available at http://localhost:{serve_port}/v1")
+            port_key = "vllm-vision" if profile.get("kind") == "vision" else "vllm"
+            _save_last_port(port_key, serve_port)
+            return 0
+        # Start failed (e.g. config changed) — fall through to rm + run
+        logger.info(f"Restart failed, recreating container '{name}'")
         subprocess.run([runtime, "rm", "-f", name], capture_output=True)
+
+    # Check port is free before attempting to start
+    if not _port_available("0.0.0.0", serve_port):
+        blocker = _identify_port_holder(runtime, serve_port)
+        logger.error(
+            f"Port {serve_port} is already in use{blocker}.\n"
+            f"Free it with: sciwrite-lint containers stop\n"
+            f"Or check manually: ss -tlnp | grep {serve_port}"
+        )
+        return 1
 
     # Pull latest image
     image = config.vllm_image
@@ -190,6 +264,10 @@ def start_container(
             logger.error(f"Failed to pull image: {image}")
             return 1
 
+    max_model_len = profile.get("max_model_len", _DEFAULT_MAX_MODEL_LEN)
+    gpu_mem = profile.get("gpu_memory_utilization", _DEFAULT_GPU_MEM)
+    container_memory = profile.get("memory", config.vllm_memory)
+
     cmd = [
         runtime,
         "run",
@@ -199,7 +277,7 @@ def start_container(
         "--device",
         "nvidia.com/gpu=all",
         "--memory",
-        config.vllm_memory,
+        container_memory,
         "-p",
         f"{serve_port}:8000",
         "-v",
@@ -216,9 +294,9 @@ def start_container(
         profile["served_name"],
         "--trust-remote-code",
         "--gpu-memory-utilization",
-        str(_DEFAULT_GPU_MEM),
+        str(gpu_mem),
         "--max-model-len",
-        str(_DEFAULT_MAX_MODEL_LEN),
+        str(max_model_len),
         "--kv-cache-dtype",
         "fp8",
         "--enable-chunked-prefill",
@@ -234,7 +312,7 @@ def start_container(
     logger.info(f"Model: {profile['hf_model']}")
     logger.info(f"Served as: {profile['served_name']}")
     logger.info(f"Port: {serve_port}")
-    logger.info(f"GPU memory: {_DEFAULT_GPU_MEM}")
+    logger.info(f"GPU memory: {gpu_mem}")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -267,7 +345,8 @@ def start_container(
     logger.info(f"Check logs: {runtime} logs -f {name}")
     logger.info("Check status: sciwrite-lint vllm status")
 
-    _save_last_port("vllm", serve_port)
+    port_key = "vllm-vision" if profile.get("kind") == "vision" else "vllm"
+    _save_last_port(port_key, serve_port)
     return 0
 
 

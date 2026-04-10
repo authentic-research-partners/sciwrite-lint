@@ -21,6 +21,7 @@ from loguru import logger
 
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.llm_utils import (
+    _VLLM_RETRIES,
     VLLM_DEFAULT_MODEL,
     VLLM_MODELS,
     extract_json as _extract_json,
@@ -432,51 +433,74 @@ async def _classify_citation_vllm(
     claim: ClaimContext, client: Any, model_cfg: dict
 ) -> str:
     from sciwrite_lint.prompt_safety import wrap_untrusted
+    from sciwrite_lint.usage import current as _usage_current
 
     user_prompt = (
         f"Classify the [TARGET_CITE] citation ({claim.key}):\n\n"
         f"> {wrap_untrusted(claim.context, 'claim_context')}"
     )
-    completion = await retry_on_empty(
-        lambda: client.chat.completions.create(
-            model=model_cfg["model"],
-            messages=[
-                {"role": "system", "content": CLASSIFY_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=model_cfg["temperature"],
-            top_p=model_cfg["top_p"],
-            max_tokens=1024,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "CitationClassify",
-                    "schema": CLASSIFY_SCHEMA,
-                    "strict": True,
+
+    # Outer retry loop for invalid JSON. retry_on_empty handles
+    # empty-content retries inside each attempt; this outer loop adds
+    # JSON-parse retries for transient server-side glitches where the
+    # response is non-empty but malformed.
+    raw = ""
+    result: dict | None = None
+    for _attempt in range(_VLLM_RETRIES + 1):
+        completion = await retry_on_empty(
+            lambda: client.chat.completions.create(
+                model=model_cfg["model"],
+                messages=[
+                    {"role": "system", "content": CLASSIFY_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=model_cfg["temperature"],
+                top_p=model_cfg["top_p"],
+                max_tokens=1024,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "CitationClassify",
+                        "schema": CLASSIFY_SCHEMA,
+                        "strict": True,
+                    },
                 },
-            },
-            **_thinking_kwargs("off"),
-        ),
-        label=claim.key,
-    )
-    raw = completion.choices[0].message.content
-
-    from sciwrite_lint.usage import current as _usage_current
-
-    run = _usage_current()
-    if run:
-        u = completion.usage
-        run.vllm.record(
-            0.0,
-            prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+                **_thinking_kwargs("off"),
+            ),
+            label=claim.key,
         )
+        raw = completion.choices[0].message.content or ""
 
-    result = _extract_json(raw)
+        run = _usage_current()
+        if run:
+            u = completion.usage
+            run.vllm.record(
+                0.0,
+                prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+            )
+
+        result = _extract_json(raw)
+        if result and "purpose" in result:
+            break
+        if _attempt < _VLLM_RETRIES:
+            delay = 0.5 * (_attempt + 1)
+            logger.warning(
+                "Citation classification for {} returned invalid JSON "
+                "(attempt {}/{}, retrying in {:.1f}s): {!r}",
+                claim.key,
+                _attempt + 1,
+                _VLLM_RETRIES + 1,
+                delay,
+                raw[:200],
+            )
+            await asyncio.sleep(delay)
+
     if not result or "purpose" not in result:
         raise RuntimeError(
             f"Citation classification for {claim.key}: "
-            f"LLM returned unparseable response: {raw[:200]}"
+            f"LLM returned unparseable response after "
+            f"{_VLLM_RETRIES + 1} attempts: {raw[:200]}"
         )
     return result["purpose"]
 
@@ -540,28 +564,49 @@ async def _verify_section_vllm(
         },
         **_thinking_kwargs("off"),
     }
-    completion = await retry_on_empty(
-        lambda: client.chat.completions.create(**_verify_kwargs),
-        label=claim.key,
-    )
-    raw = completion.choices[0].message.content
-
     from sciwrite_lint.usage import current as _usage_current
 
-    run = _usage_current()
-    if run:
-        u = completion.usage
-        run.vllm.record(
-            0.0,
-            prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+    # Outer retry loop for invalid JSON (see _classify_citation_vllm).
+    raw = ""
+    result: dict | None = None
+    for _attempt in range(_VLLM_RETRIES + 1):
+        completion = await retry_on_empty(
+            lambda: client.chat.completions.create(**_verify_kwargs),
+            label=claim.key,
         )
+        raw = completion.choices[0].message.content or ""
 
-    result = _extract_json(raw)
+        run = _usage_current()
+        if run:
+            u = completion.usage
+            run.vllm.record(
+                0.0,
+                prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+            )
+
+        result = _extract_json(raw)
+        if result:
+            break
+        if _attempt < _VLLM_RETRIES:
+            delay = 0.5 * (_attempt + 1)
+            logger.warning(
+                "Section verification for {}/{} returned invalid JSON "
+                "(attempt {}/{}, retrying in {:.1f}s): {!r}",
+                claim.key,
+                section.title,
+                _attempt + 1,
+                _VLLM_RETRIES + 1,
+                delay,
+                raw[:200],
+            )
+            await asyncio.sleep(delay)
+
     if not result:
         raise RuntimeError(
             f"Section verification for {claim.key}/{section.title}: "
-            f"LLM returned unparseable response: {raw[:200]}"
+            f"LLM returned unparseable response after "
+            f"{_VLLM_RETRIES + 1} attempts: {raw[:200]}"
         )
     return result
 
@@ -620,11 +665,20 @@ async def verify_claim_vllm(
             sections,
         )
         if filtered is None:
-            raise RuntimeError(
-                f"Embedding retrieval failed for {claim.key}. "
-                "Run 'sciwrite-lint parse --key "
-                f"{claim.key}' to rebuild embeddings."
+            logger.warning(
+                "No embeddings for {} ({} sections) — cannot filter, "
+                "returning CANNOT_DETERMINE. Rebuild with: "
+                "sciwrite-lint parse --key {}",
+                claim.key,
+                len(sections),
+                claim.key,
             )
+            return {
+                "verdict": "CANNOT_DETERMINE",
+                "explanation": f"No embeddings for {claim.key} — "
+                "cannot select relevant sections for verification",
+                "sections_checked": 0,
+            }
         target_sections = filtered
 
     own_client = client is None
@@ -754,34 +808,55 @@ async def _extract_relevant_sentences(
     user_prompt = (
         f"Citation key: {key}\n\nParagraph:\n{wrap_untrusted(context, 'paragraph')}"
     )
-    completion = await retry_on_empty(
-        lambda: client.chat.completions.create(
-            model=model_cfg["model"],
-            messages=[
-                {"role": "system", "content": NARROW_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=512,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "NarrowContext",
-                    "schema": NARROW_SCHEMA,
-                    "strict": True,
+
+    # Outer retry loop for invalid JSON (see _classify_citation_vllm).
+    raw = ""
+    result: dict | None = None
+    for _attempt in range(_VLLM_RETRIES + 1):
+        completion = await retry_on_empty(
+            lambda: client.chat.completions.create(
+                model=model_cfg["model"],
+                messages=[
+                    {"role": "system", "content": NARROW_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=512,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "NarrowContext",
+                        "schema": NARROW_SCHEMA,
+                        "strict": True,
+                    },
                 },
-            },
-            **_thinking_kwargs("off"),
-        ),
-        label=key,
-    )
-    raw = completion.choices[0].message.content
-    result = _extract_json(raw)
+                **_thinking_kwargs("off"),
+            ),
+            label=key,
+        )
+        raw = completion.choices[0].message.content or ""
+        result = _extract_json(raw)
+        if result and "sentences" in result:
+            break
+        if _attempt < _VLLM_RETRIES:
+            delay = 0.5 * (_attempt + 1)
+            logger.warning(
+                "Sentence extraction for {} returned invalid JSON "
+                "(attempt {}/{}, retrying in {:.1f}s): {!r}",
+                key,
+                _attempt + 1,
+                _VLLM_RETRIES + 1,
+                delay,
+                raw[:200],
+            )
+            await asyncio.sleep(delay)
+
     if not result or "sentences" not in result:
         raise RuntimeError(
             f"Sentence extraction for {key}: "
-            f"LLM returned unparseable response: {raw[:200]}"
+            f"LLM returned unparseable response after "
+            f"{_VLLM_RETRIES + 1} attempts: {raw[:200]}"
         )
     return result["sentences"]
 

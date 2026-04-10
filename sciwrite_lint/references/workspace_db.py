@@ -185,12 +185,16 @@ CREATE INDEX IF NOT EXISTS idx_claims_verdict ON claim_results(verdict);
 
 _VISION_CACHE_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS vision_cache (
-    image_key TEXT PRIMARY KEY,
+    image_key TEXT NOT NULL,
+    source TEXT NOT NULL,
     image_hash TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT '',
     caption TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
-    cache_version TEXT NOT NULL DEFAULT '1'
+    figure_type TEXT NOT NULL DEFAULT '',
+    readability_issues_json TEXT NOT NULL DEFAULT '[]',
+    cache_version TEXT NOT NULL DEFAULT '3',
+    PRIMARY KEY (image_key, source)
 );
 """
 
@@ -213,6 +217,15 @@ CREATE TABLE IF NOT EXISTS citation_metadata (
     manual_override_json TEXT NOT NULL DEFAULT '{}'
 );
 """
+
+_QUERY_VECTORS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS query_vectors (
+    text_hash TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    vector BLOB NOT NULL
+);
+"""
+
 
 _PIPELINE_STAGE_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS pipeline_stage (
@@ -258,6 +271,8 @@ def open_db(references_dir: Path) -> sqlite3.Connection:
     conn.executescript(_CLAIM_RESULTS_SCHEMA)
     conn.executescript(_CITATION_METADATA_SCHEMA)
     conn.executescript(_VISION_CACHE_SCHEMA)
+    _migrate_vision_cache(conn)
+    conn.executescript(_QUERY_VECTORS_SCHEMA)
     conn.executescript(_PIPELINE_STAGE_SCHEMA)
 
     return conn
@@ -365,15 +380,24 @@ def lookup_reference(
     lccn: str | None = None,
     title: str | None = None,
     authors: list[str] | None = None,
+    year: str | None = None,
+    venue: str | None = None,
 ) -> dict[str, Any] | None:
-    """Look up an existing reference by structured IDs, then fuzzy title+author.
+    """Look up an existing reference by exact structured ID match.
 
-    Checks in priority order: DOI → arXiv → PMID → PMCID → ISBN → LCCN → fuzzy.
+    Checks in priority order: DOI → arXiv → PMID → PMCID → ISBN → LCCN.
 
-    **Strict matching:** when a candidate is found by one ID, ALL other provided
-    IDs and title/authors are cross-checked. If any conflict is detected, the
-    candidate is rejected (returns None). Worst case: duplicate download. Better
-    than merging two different papers and suppressing real findings.
+    **Fully deterministic.** A hit requires at least one structured ID to
+    match exactly.  When a candidate is found, ALL other available data is
+    cross-checked (other IDs, title, authors, year, venue) — if any field
+    present on both sides disagrees, the candidate is rejected.
+
+    All text comparisons use deterministic normalization (lowercase, strip
+    LaTeX, collapse whitespace) — no fuzzy scoring, no thresholds.
+
+    If no structured IDs are available (or none match), returns None.
+    Worst case: duplicate download. Better than merging two different
+    papers and suppressing real findings.
 
     Returns dict with ref_key, workspace_path, depth, parent_key on match, or None.
     """
@@ -386,22 +410,18 @@ def lookup_reference(
         "lccn": lccn,
     }
 
-    # Structured ID lookups (exact match)
     for col, val in query_ids.items():
         if not val:
             continue
         row = conn.execute(
             "SELECT ref_key, workspace_path, depth, parent_key, "  # noqa: S608
-            f"doi, arxiv_id, pmid, pmcid, isbn, lccn, title, authors_json "
+            f"doi, arxiv_id, pmid, pmcid, isbn, lccn, "
+            f"title, authors_json, year, venue "
             f"FROM ref_registry WHERE {col} = ? LIMIT 1",
             (val,),
         ).fetchone()
-        if row and _all_metadata_agrees(row, query_ids, title, authors):
+        if row and _all_data_agrees(row, query_ids, title, authors, year, venue):
             return _row_to_result(row)
-
-    # Fuzzy title + author match
-    if title:
-        return _fuzzy_lookup(conn, title, authors)
 
     return None
 
@@ -415,18 +435,28 @@ def _row_to_result(row: tuple[Any, ...]) -> dict[str, Any]:
     return dict(zip(_RESULT_COLS, row[:4]))
 
 
-def _all_metadata_agrees(
+def _all_data_agrees(
     row: tuple[Any, ...],
     query_ids: dict[str, str | None],
     title: str | None,
     authors: list[str] | None,
+    year: str | None = None,
+    venue: str | None = None,
 ) -> bool:
-    """Check that ALL provided metadata agrees with the stored row.
+    """Check that ALL available data agrees with the stored row.
 
-    Row layout: ref_key, workspace_path, depth, parent_key,
-                doi, arxiv_id, pmid, pmcid, isbn, lccn, title, authors_json
+    Row layout: ref_key(0), workspace_path(1), depth(2), parent_key(3),
+                doi(4), arxiv_id(5), pmid(6), pmcid(7), isbn(8), lccn(9),
+                title(10), authors_json(11), year(12), venue(13).
+
+    Input data can be unreliable (LLM hallucinations, GROBID misextraction,
+    bib typos), so we cross-check every field present on both sides.
+    Cache hit only when all available data agrees. All text comparisons
+    use deterministic normalization — no fuzzy scoring, no thresholds.
     """
-    # Cross-check structured IDs: if both sides have a value, they must match
+    from sciwrite_lint.references.matching import _normalize
+
+    # Cross-check structured IDs
     stored_ids = dict(zip(_ID_COLS, row[4:10]))
     for col, query_val in query_ids.items():
         if not query_val:
@@ -442,37 +472,50 @@ def _all_metadata_agrees(
             )
             return False
 
-    # Cross-check title if provided
+    # Cross-check title (normalized exact match)
     if title:
         stored_title = row[10]
         if stored_title:
-            from sciwrite_lint.references.matching import (
-                TITLE_THRESHOLD,
-                title_similarity,
-            )
-
-            if title_similarity(title, stored_title) < TITLE_THRESHOLD:
+            if _normalize(title) != _normalize(stored_title):
                 logger.debug(
-                    "Dedup conflict on title: query={!r} vs stored={!r} for ref_key={!r}",
-                    title[:60],
-                    stored_title[:60],
+                    "Dedup conflict on title for ref_key={!r}",
                     row[0],
                 )
                 return False
 
-    # Cross-check authors if provided
+    # Cross-check authors (normalized, sorted exact match)
     if authors:
         stored_authors_json = row[11]
         if stored_authors_json:
             stored_authors = json.loads(stored_authors_json)
-            from sciwrite_lint.references.matching import (
-                AUTHOR_THRESHOLD,
-                author_similarity,
-            )
-
-            if author_similarity(authors, stored_authors) < AUTHOR_THRESHOLD:
+            q_norm = sorted(_normalize(a) for a in authors)
+            s_norm = sorted(_normalize(a) for a in stored_authors)
+            if q_norm != s_norm:
                 logger.debug(
                     "Dedup conflict on authors for ref_key={!r}",
+                    row[0],
+                )
+                return False
+
+    # Cross-check year (exact string match)
+    if year:
+        stored_year = row[12]
+        if stored_year and stored_year != year:
+            logger.debug(
+                "Dedup conflict on year: query={!r} vs stored={!r} for ref_key={!r}",
+                year,
+                stored_year,
+                row[0],
+            )
+            return False
+
+    # Cross-check venue (normalized exact match)
+    if venue:
+        stored_venue = row[13]
+        if stored_venue:
+            if _normalize(venue) != _normalize(stored_venue):
+                logger.debug(
+                    "Dedup conflict on venue for ref_key={!r}",
                     row[0],
                 )
                 return False
@@ -519,53 +562,6 @@ def load_bibliography_entries(
         entry["authors"] = json.loads(aj) if aj else []
         results.append(entry)
     return results
-
-
-def _fuzzy_lookup(
-    conn: sqlite3.Connection,
-    title: str,
-    authors: list[str] | None,
-) -> dict[str, Any] | None:
-    """Find a reference by fuzzy title + author matching.
-
-    Scans all registry entries with a non-null title. Returns the best match
-    if it meets thresholds, or None.
-    """
-    from sciwrite_lint.references.matching import (
-        AUTHOR_THRESHOLD,
-        TITLE_THRESHOLD,
-        author_similarity,
-        title_similarity,
-    )
-
-    rows = conn.execute(
-        "SELECT ref_key, workspace_path, depth, parent_key, title, authors_json "
-        "FROM ref_registry WHERE title IS NOT NULL"
-    ).fetchall()
-
-    best_match: dict[str, Any] | None = None
-    best_title_score = 0.0
-
-    for row in rows:
-        stored_title = row[4]
-        t_score = title_similarity(title, stored_title)
-        if t_score < TITLE_THRESHOLD:
-            continue
-
-        # Title matches — check authors if available
-        if authors:
-            stored_authors_json = row[5]
-            if stored_authors_json:
-                stored_authors = json.loads(stored_authors_json)
-                a_score = author_similarity(authors, stored_authors)
-                if a_score < AUTHOR_THRESHOLD:
-                    continue
-
-        if t_score > best_title_score:
-            best_title_score = t_score
-            best_match = _row_to_result(row[:4])
-
-    return best_match
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1225,44 @@ def list_claims_for_key(
 # Vision cache operations
 # ---------------------------------------------------------------------------
 
-_VISION_CACHE_VERSION = "1"
+_VISION_CACHE_VERSION = "3"
+
+
+def _migrate_vision_cache(conn: sqlite3.Connection) -> None:
+    """Migrate vision_cache to the current schema.
+
+    Old schema had ``image_key TEXT PRIMARY KEY`` without a ``source``
+    column.  Since vision cache is fully rebuildable (``--fresh``), we
+    drop and recreate when the old schema is detected.
+
+    Also adds structured output columns if missing from older DBs:
+    - ``figure_type`` (v2 onwards)
+    - ``readability_issues_json`` (v3 onwards — structured list; the
+      legacy ``readability_issues`` TEXT column from v2, if present, is
+      left alone because v2 rows are ignored by cache_version filter).
+    """
+    # Check if source column exists
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(vision_cache)").fetchall()
+    }
+    if "source" not in cols:
+        # Old schema — drop and recreate with composite PK
+        conn.execute("DROP TABLE vision_cache")
+        conn.executescript(_VISION_CACHE_SCHEMA)
+        logger.debug("Migrated vision_cache to composite PK (image_key, source)")
+        return
+
+    # Add structured output columns if missing.
+    for col, default in [
+        ("figure_type", "''"),
+        ("readability_issues_json", "'[]'"),
+    ]:
+        try:
+            conn.execute(
+                f"ALTER TABLE vision_cache ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 def save_vision_entry(
@@ -1237,23 +1270,49 @@ def save_vision_entry(
     image_key: str,
     *,
     image_hash: str,
+    source: str = "manuscript",
     label: str = "",
     caption: str = "",
     description: str = "",
+    figure_type: str = "",
+    readability_issues: list[str] | None = None,
 ) -> None:
-    """Upsert a single vision cache entry."""
+    """Upsert a single vision cache entry.
+
+    ``source`` discriminates manuscript figures (``"manuscript"``) from
+    cited reference figures (the ref_key, e.g. ``"tanaka2017"``).
+    Together with ``image_key``, it forms the composite primary key.
+
+    ``readability_issues`` is a list of short issue strings (empty list
+    means no issues). Serialized as JSON into the
+    ``readability_issues_json`` column on write.
+    """
+    issues_json = json.dumps(readability_issues or [])
     conn.execute(
         """INSERT INTO vision_cache
-           (image_key, image_hash, label, caption, description, cache_version)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT (image_key) DO UPDATE SET
+           (image_key, source, image_hash, label, caption, description,
+            figure_type, readability_issues_json, cache_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (image_key, source) DO UPDATE SET
              image_hash = excluded.image_hash,
              label = excluded.label,
              caption = excluded.caption,
              description = excluded.description,
+             figure_type = excluded.figure_type,
+             readability_issues_json = excluded.readability_issues_json,
              cache_version = excluded.cache_version
         """,
-        (image_key, image_hash, label, caption, description, _VISION_CACHE_VERSION),
+        (
+            image_key,
+            source,
+            image_hash,
+            label,
+            caption,
+            description,
+            figure_type,
+            issues_json,
+            _VISION_CACHE_VERSION,
+        ),
     )
     conn.commit()
 
@@ -1263,16 +1322,24 @@ def load_vision_entry(
     image_key: str,
     *,
     expected_hash: str,
-) -> dict[str, str] | None:
-    """Load a vision cache entry if hash matches. Returns None on miss."""
+    source: str = "manuscript",
+) -> dict[str, Any] | None:
+    """Load a vision cache entry if hash matches. Returns None on miss.
+
+    Looks up by composite PK ``(image_key, source)``. The returned dict
+    uses the logical key ``readability_issues`` (a ``list[str]``), with
+    JSON deserialization from the storage column
+    ``readability_issues_json``.
+    """
     row = conn.execute(
-        "SELECT image_hash, label, caption, description, cache_version "
-        "FROM vision_cache WHERE image_key = ?",
-        (image_key,),
+        "SELECT image_hash, label, caption, description, "
+        "figure_type, readability_issues_json, cache_version "
+        "FROM vision_cache WHERE image_key = ? AND source = ?",
+        (image_key, source),
     ).fetchone()
     if not row:
         return None
-    if row[4] != _VISION_CACHE_VERSION:
+    if row[6] != _VISION_CACHE_VERSION:
         return None
     if row[0] != expected_hash:
         return None
@@ -1281,24 +1348,41 @@ def load_vision_entry(
         "label": row[1],
         "caption": row[2],
         "description": row[3],
+        "figure_type": row[4],
+        "readability_issues": json.loads(row[5]),
     }
 
 
 def load_all_vision_entries(
     conn: sqlite3.Connection,
-) -> dict[str, dict[str, str]]:
-    """Load all vision cache entries. Returns {image_key: {...}}."""
-    rows = conn.execute(
-        "SELECT image_key, image_hash, label, caption, description "
-        "FROM vision_cache WHERE cache_version = ?",
-        (_VISION_CACHE_VERSION,),
-    ).fetchall()
+    source: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load vision cache entries. Returns {image_key: {...}}.
+
+    When ``source`` is provided, only entries matching that source are
+    returned.  When None, returns all entries (use with care). The
+    returned dicts use the logical key ``readability_issues`` (a
+    ``list[str]``), deserialized from the storage column
+    ``readability_issues_json``.
+    """
+    query = (
+        "SELECT image_key, image_hash, label, caption, description, "
+        "figure_type, readability_issues_json "
+        "FROM vision_cache WHERE cache_version = ?"
+    )
+    params: list[str] = [_VISION_CACHE_VERSION]
+    if source is not None:
+        query += " AND source = ?"
+        params.append(source)
+    rows = conn.execute(query, params).fetchall()
     return {
         row[0]: {
             "image_hash": row[1],
             "label": row[2],
             "caption": row[3],
             "description": row[4],
+            "figure_type": row[5],
+            "readability_issues": json.loads(row[6]),
         }
         for row in rows
     }
@@ -1316,6 +1400,7 @@ def clear_vision_cache(conn: sqlite3.Connection) -> None:
 
 # Canonical stage names and their display order.
 PIPELINE_STAGES: list[str] = [
+    "setup",  # Stage 0: workspace + citations + GROBID (PDF)
     "vision",  # Stage 0.5: manuscript figure descriptions
     "text_checks",  # Stage 1a: regex-based text rules
     "llm_checks",  # Stage 1b: vLLM batch checks
@@ -1327,6 +1412,7 @@ PIPELINE_STAGES: list[str] = [
     "bib_verify",  # Stage 4.6: bibliography verification
     "claims",  # Stage 5: claim verification (vLLM)
     "unreliable",  # Stage 6: reference-unreliable aggregation
+    "contributions",  # Stage 7: contribution axes scoring (vLLM)
 ]
 
 
@@ -1388,3 +1474,35 @@ def load_pipeline_stages(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Query vector cache (pre-computed claim query embeddings)
+# ---------------------------------------------------------------------------
+
+
+def save_query_vector(
+    conn: sqlite3.Connection,
+    text_hash: str,
+    model: str,
+    vector: bytes,
+) -> None:
+    """Store a pre-computed query embedding vector."""
+    conn.execute(
+        "INSERT OR REPLACE INTO query_vectors (text_hash, model, vector) VALUES (?, ?, ?)",
+        (text_hash, model, vector),
+    )
+    conn.commit()
+
+
+def load_query_vector(
+    conn: sqlite3.Connection,
+    text_hash: str,
+    model: str,
+) -> bytes | None:
+    """Load a pre-computed query vector. Returns None on miss or model mismatch."""
+    row = conn.execute(
+        "SELECT vector FROM query_vectors WHERE text_hash = ? AND model = ?",
+        (text_hash, model),
+    ).fetchone()
+    return row[0] if row else None

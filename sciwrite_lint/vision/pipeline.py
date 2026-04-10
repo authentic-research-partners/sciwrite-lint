@@ -26,6 +26,7 @@ def run_vision_pipeline(
     paper_name: str = "",
     device: str = "auto",
     fresh: bool = False,
+    backend: str | None = None,
 ) -> str:
     """Run the full vision pipeline for a manuscript.
 
@@ -40,8 +41,9 @@ def run_vision_pipeline(
         config: Lint configuration.
         paper_name: Paper name for workspace resolution. Uses
             ``config.current_paper`` if empty.
-        device: ``"auto"``, ``"cpu"``, or ``"cuda"``.
+        device: ``"auto"``, ``"cpu"``, or ``"cuda"`` (transformers backend only).
         fresh: Ignore cache and re-describe all images.
+        backend: ``"transformers"`` or ``"vllm"``. Defaults to ``config.vision_backend``.
 
     Returns:
         Formatted figure descriptions string (empty if no images found).
@@ -103,11 +105,13 @@ def run_vision_pipeline(
         return ""
 
     # Describe figures (with DB caching via get_db)
+    effective_backend = backend or config.vision_backend
     result = describe_figures(
         images,
         references_dir=references_dir,
         device=device,
         fresh=fresh,
+        backend=effective_backend,
     )
 
     elapsed = time.monotonic() - t0
@@ -144,6 +148,8 @@ def _cli_main() -> None:
     parser.add_argument("--paper", default=None)
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--backend", default=None)
     parser.add_argument(
         "--batch", type=Path, default=None, help="JSON manifest for batch mode"
     )
@@ -155,7 +161,12 @@ def _cli_main() -> None:
         config = load_config(args.config)
         try:
             result = run_vision_pipeline(
-                args.tex_path, config, paper_name=args.paper, fresh=args.fresh
+                args.tex_path,
+                config,
+                paper_name=args.paper,
+                device=args.device,
+                fresh=args.fresh,
+                backend=args.backend,
             )
             if not result:
                 logger.info("No figures found")
@@ -189,11 +200,20 @@ def _run_batch(manifest_path: Path) -> None:
         tex_path = Path(entry["tex_path"])
         config_path = entry.get("config_path")
         fresh = entry.get("fresh", False)
+        entry_backend = entry.get("backend")
+        entry_device = entry.get("device", "auto")
 
         config = load_config(Path(config_path) if config_path else None)
         logger.info("[{}/{}] Vision: {}", i + 1, len(manifest), paper_name)
         try:
-            run_vision_pipeline(tex_path, config, paper_name=paper_name, fresh=fresh)
+            run_vision_pipeline(
+                tex_path,
+                config,
+                paper_name=paper_name,
+                fresh=fresh,
+                backend=entry_backend,
+                device=entry_device,
+            )
         except Exception as e:
             logger.error("[{}] Vision failed: {}", paper_name, e)
             failed += 1

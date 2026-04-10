@@ -34,7 +34,7 @@ Requires podman or docker. No GPU needed. Uses ~2 GB RAM at idle, up to 8 GB whe
 
 A local language model for checks that require reading comprehension: `cross-section-consistency`, `structure-promises`, `cite-purpose`, `claim-support`, and the 11 full-paper consistency checks.
 
-Default model: Qwen3 8B. Alternative: Gemma 3 12B.
+Default model: Qwen3 8B. Alternative: Gemma 3 12B. Vision model: Qwen3-VL 8B FP8.
 
 ```bash
 # Start (downloads model on first run)
@@ -42,6 +42,9 @@ sciwrite-lint vllm start
 
 # Start with a specific model
 sciwrite-lint vllm start --model gemma3
+
+# Start vision model (Qwen3-VL-8B-FP8 on port 5002)
+sciwrite-lint vllm start --model qwen3-vl
 
 # Check status
 sciwrite-lint vllm status
@@ -180,9 +183,34 @@ To force CPU embedding on any platform, set `device = "cpu"`. This avoids any GP
 
 ### Vision model (figure analysis)
 
-The vision model (Qwen3-VL-2B-Instruct, ~4 GB float16) extracts structured descriptions from manuscript figures. It runs in Stage 0.5, before LLM consistency checks, so figure descriptions are available for caption-vs-content, text-vs-figure, and other figure checks. Also runs on cited paper PDFs during Stage 4.2.
+Two backends for figure description:
 
-**GPU memory sharing:** Same pattern as embeddings — on WSL2, CUDA memory overcommit lets the VL model share VRAM with vLLM transparently. On native Linux, auto-resolves to CPU.
+| Backend | Model | How it runs | Accuracy |
+|---------|-------|-------------|----------|
+| `transformers` (default) | Qwen3-VL-2B-Instruct | In-process subprocess, no container | 85% caption mismatch |
+| `vllm` | Qwen3-VL-8B-Instruct-FP8 | vLLM container on port 5002 | 100% caption mismatch |
+
+The default (2B transformers) needs no extra setup. The 8B vLLM backend gives +15% detection on real-world caption mismatches but requires GPU time-sharing — the pipeline automatically swaps containers when enabled.
+
+```toml
+# .sciwrite-lint.toml
+[vision]
+backend = "vllm"    # or "transformers" (default)
+```
+
+```bash
+# Or via CLI flag (overrides config)
+sciwrite-lint check --paper paper_a --vision-backend vllm
+
+# Standalone
+sciwrite-lint vision --paper paper_a --backend vllm
+```
+
+**GPU memory sharing (transformers backend):** On WSL2, CUDA memory overcommit lets the 2B VL model share VRAM with vLLM transparently. On native Linux, auto-resolves to CPU.
+
+**Container swap (vllm backend):** The pipeline stops text vLLM, starts vision vLLM (~90-130s), runs all vision stages, then swaps back. Skips the swap if the vision container is already running. Pre-start with `sciwrite-lint containers start --vision` to avoid the wait during pipeline runs.
+
+**Native Linux GPU embedding:** On native Linux (no CUDA overcommit), the pipeline automatically stops text vLLM before embedding, runs embedding on GPU (~50x faster than CPU), then restarts text vLLM. This is transparent — no configuration needed. *(Preliminary: tested on WSL2 only; expected to work on native Linux, may need minor fixes.)*
 
 **Caching:** Figure descriptions are cached in workspace.db by SHA-256 of image bytes + caption text. Only changed or new images trigger re-inference. A typical manuscript (5-8 figures) takes ~35s on first run, 0s on subsequent runs.
 

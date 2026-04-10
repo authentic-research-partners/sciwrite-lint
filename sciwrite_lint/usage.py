@@ -480,21 +480,19 @@ def _pid_alive(pid: int) -> bool:
 
 def find_active_db_runs(
     db_path: str | Path = USAGE_DB,
-) -> list[dict[str, str]]:
-    """Find runs with in-progress pipeline stages by checking workspace.db.
+) -> list[dict[str, Any]]:
+    """Find runs owned by a live process.
 
-    Scans recent usage.db rows for workspace_root entries, then checks each
-    workspace.db for pipeline stages in "running" status. Returns a list of
-    dicts with paper name and workspace_root for display in the monitor.
-    Works for CLI runs, eval runs, and batch-staged runs alike.
+    Scans recent usage.db rows for workspace_root entries and checks
+    whether the owning PID is still alive. Returns a list of dicts with
+    paper name, workspace_root, and pid for display in the monitor.
+    Papers sharing a PID belong to the same batch run.
     """
-    import sqlite3
-
     p = Path(db_path)
     if not p.exists():
         return []
 
-    results: list[dict[str, str]] = []
+    results: list[dict[str, Any]] = []
 
     try:
         with get_usage_db(db_path) as conn:
@@ -520,39 +518,17 @@ def find_active_db_runs(
         if not _pid_alive(pid):
             continue
 
-        # Check if workspace.db has running stages
-        ws_db = Path(ws_root) / "parsed" / "workspace.db"
-        if not ws_db.exists():
-            continue
-        try:
-            ws_conn = sqlite3.connect(str(ws_db), timeout=1)
-            ws_conn.row_factory = sqlite3.Row
-            # A run is "active" if any stage is running, OR the pipeline is
-            # mid-flight: at least one stage has reached a terminal state
-            # (done/failed/skipped) while others are still pending. The
-            # second condition keeps the panel visible during brief gaps
-            # between stages when no stage is currently marked "running".
-            counts = ws_conn.execute(
-                "SELECT "
-                "SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS n_running, "
-                "SUM(CASE WHEN status IN ('done','failed','skipped') THEN 1 ELSE 0 END) AS n_terminal, "
-                "SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS n_pending "
-                "FROM pipeline_stage"
-            ).fetchone()
-            ws_conn.close()
-            if counts is None:
-                continue
-            n_running = counts["n_running"] or 0
-            n_terminal = counts["n_terminal"] or 0
-            n_pending = counts["n_pending"] or 0
-            is_active = n_running > 0 or (n_terminal > 0 and n_pending > 0)
-            if is_active:
-                results.append({"paper": paper, "workspace_root": ws_root})
-        except Exception as e:
-            logger.debug(
-                f"active-run check skipped for {paper} ({type(e).__name__}: {e})"
-            )
-            continue
+        # PID is alive → run is active. The process may be in pipeline
+        # stages, post-pipeline work (contribution axes), or scoring.
+        # No need to check workspace.db stage status — a live PID is
+        # the authoritative signal.
+        results.append(
+            {
+                "paper": paper,
+                "workspace_root": ws_root,
+                "pid": pid,
+            }
+        )
 
     return results
 
