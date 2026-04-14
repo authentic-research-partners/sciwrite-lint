@@ -1,5 +1,7 @@
 # sciwrite-lint
 
+[![arXiv](https://img.shields.io/badge/arXiv-2604.08501-b31b1b.svg)](https://arxiv.org/abs/2604.08501)
+
 A linter for scientific manuscripts. Checks that your references exist, your metadata is accurate, your citations support the claims you make, and your cited papers' own bibliographies are real. Works on LaTeX and PDF. Runs entirely on your machine. Produces a **SciLint Score**.
 
 The only open-source tool that combines reference verification, claim checking, manuscript consistency, figure analysis, and bibliography verification in one pipeline — powered entirely by a local LLM on your own GPU.
@@ -103,6 +105,32 @@ uv tool install sciwrite-lint --python 3.13
 
 uv downloads Python 3.13 automatically (does not affect any Python you may already have) and installs sciwrite-lint as a globally available command.
 
+### Reproducible environment (optional)
+
+`pyproject.toml` declares lower bounds for dependencies, so `uv tool install` / `pip install` may resolve newer versions as upstream releases ship. If you want the exact versions the maintainer develops and tests against — for reproducing benchmarks, debugging version-drift issues, or CI — install from [`requirements-pinned.txt`](requirements-pinned.txt) instead.
+
+**What's in it:** top-level packages declared in `pyproject.toml` pinned to `==` versions. Transitive dependencies are not pinned — pip resolves them within each top-level package's own constraints. This is a deliberate middle ground: it locks the packages sciwrite-lint actually imports and tests against, without over-constraining the dep tree.
+
+```bash
+# Clone the public repo (required — uv tool install can't read a local file)
+git clone https://github.com/authentic-research-partners/sciwrite-lint.git
+cd sciwrite-lint
+
+# With uv (recommended — fast, isolated, manages Python itself)
+uv venv --python 3.13 .venv
+source .venv/bin/activate
+uv pip install -r requirements-pinned.txt
+uv pip install -e . --no-deps    # install sciwrite-lint source; deps already pinned
+
+# Or with plain pip
+python3.13 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-pinned.txt
+pip install -e . --no-deps
+```
+
+Activate the venv in each new terminal with `source .venv/bin/activate`. For most users, the plain `uv tool install sciwrite-lint` above is simpler — use the pinned file only when you need exact version reproduction.
+
 ## Setup
 
 ```bash
@@ -116,7 +144,18 @@ sciwrite-lint containers monitor       # live dashboard: service health, VRAM, K
 
 `init` detects `.tex` files and their `.bib` references and generates a `.sciwrite-lint.toml` config. Review to confirm the right files were detected.
 
-**Paywalled references:** drop PDFs into `local_pdfs/` with filenames matching the reference title. The tool fuzzy-matches filenames against your `.bib` titles and uses local copies instead of downloading.
+**Providing PDFs manually (`local_pdfs/`):** Drop any reference PDF into the `local_pdfs/` directory to skip the download step entirely. This is useful when you already have the file, when the paper is paywalled, or when the publisher blocks automated downloads (Cell, Springer, some PMC pages). Name files by the reference title:
+
+```
+local_pdfs/
+├── States of Curiosity Modulate Hippocampus-Dependent Learning.pdf
+├── Mind in Society.pdf
+└── The System of Professions.pdf
+```
+
+The tool fuzzy-matches filenames against your `.bib` titles (threshold 0.80) and copies matches to the workspace. On the next run, matched references upgrade from T2 to T1 and go through GROBID parsing and claim verification like any other full-text reference.
+
+**Finding what to download:** `sciwrite-lint verify` lists T2 references that are confirmed open access with direct URLs — open in your browser and save to `local_pdfs/`. For paywalled papers, use your institution's library access.
 
 **Optional API keys** increase rate limits for Semantic Scholar, NCBI, and CORE:
 
@@ -217,6 +256,21 @@ For contributors and advanced users:
 
 - [docs/evals.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/evals.md) — detection evaluation framework, adding test cases
 - [docs/calibration.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/calibration.md) — SciLint Score calibration against ground-truth papers
+
+## Citation
+
+If you use sciwrite-lint in your research, please cite the accompanying paper ([arXiv:2604.08501](https://arxiv.org/abs/2604.08501)):
+
+```bibtex
+@article{samsonau2026sciwritelint,
+  title   = {sciwrite-lint: Verification Infrastructure for the Age of Science Vibe-Writing},
+  author  = {Samsonau, Sergey V.},
+  journal = {arXiv preprint arXiv:2604.08501},
+  year    = {2026},
+}
+```
+
+GitHub's "Cite this repository" button (powered by [`CITATION.cff`](CITATION.cff)) will also generate this for you.
 
 ## License
 

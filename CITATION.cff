@@ -1,0 +1,47 @@
+cff-version: 1.2.0
+message: "If you use sciwrite-lint in your research, please cite the paper below."
+type: software
+title: sciwrite-lint
+version: 0.2.2
+date-released: "2026-04-14"
+abstract: >
+  A linter for scientific manuscripts. Verifies that cited references exist
+  and have accurate metadata, downloads cited papers and checks whether they
+  actually support the claims made, analyzes figures against their captions,
+  flags cross-section inconsistencies, and batch-checks the bibliographies of
+  cited papers. Runs entirely on the user's machine via local vLLM —
+  manuscript text never leaves the local machine; only citation metadata
+  is sent to verification APIs. Produces a SciLint Score.
+authors:
+  - family-names: Samsonau
+    given-names: Sergey V.
+url: "https://github.com/authentic-research-partners/sciwrite-lint"
+repository-code: "https://github.com/authentic-research-partners/sciwrite-lint"
+license: MIT
+keywords:
+  - linter
+  - latex
+  - bibtex
+  - scientific-writing
+  - academic-writing
+  - citation-checker
+  - reference-verification
+  - claim-verification
+  - manuscript
+  - peer-review
+  - arxiv
+  - vllm
+  - qwen
+preferred-citation:
+  type: article
+  title: "sciwrite-lint: Verification Infrastructure for the Age of Science Vibe-Writing"
+  authors:
+    - family-names: Samsonau
+      given-names: Sergey V.
+  year: 2026
+  month: 4
+  url: "https://arxiv.org/abs/2604.08501"
+  identifiers:
+    - type: other
+      value: "arXiv:2604.08501"
+      description: "arXiv preprint ID"

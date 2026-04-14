@@ -1548,6 +1548,11 @@ async def _stage_fetch(
         elif not result.found:
             if result.reason:
                 meta.access["acquisition_reason"] = result.reason
+            if result.is_oa:
+                meta.access["is_oa"] = True
+            if result.oa_url:
+                meta.access["oa_url"] = result.oa_url
+            if result.reason or result.is_oa or result.oa_url:
                 save_metadata(meta, references_dir)
             logger.debug(
                 f"{c.key}: PDF not acquired (stays T2)"

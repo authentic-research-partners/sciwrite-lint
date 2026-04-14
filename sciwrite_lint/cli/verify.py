@@ -8,7 +8,32 @@ from pathlib import Path
 
 from loguru import logger
 
-from sciwrite_lint.models import CheckResult, Finding
+from sciwrite_lint.models import CheckResult, Citation, CitationMetadata, Finding
+
+
+def classify_t2_refs(
+    citations: list[Citation],
+    all_meta: dict[str, CitationMetadata],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Split T2 refs into OA (manual download) and other (no source).
+
+    Returns (t2_oa, t2_other) where each is a list of (key, url_or_reason).
+    """
+    t2_oa: list[tuple[str, str]] = []
+    t2_other: list[tuple[str, str]] = []
+    for c in sorted(citations, key=lambda x: x.key):
+        meta = all_meta.get(c.key)
+        if not meta:
+            continue
+        tier = meta.access.get("tier", "NC")
+        if tier == "T2":
+            if meta.access.get("is_oa") and meta.access.get("oa_url"):
+                t2_oa.append((c.key, meta.access["oa_url"]))
+            else:
+                reason = meta.access.get("acquisition_reason", "")
+                if reason:
+                    t2_other.append((c.key, reason))
+    return t2_oa, t2_other
 
 
 _TIER_MARKERS = {
@@ -205,21 +230,18 @@ def run_status(args: argparse.Namespace) -> int:
     print("  T2 = verified, no full text (confirmed real)")
     print("  T3 = not found in APIs or dead URL")
 
-    # Show acquisition reasons for T2 refs
-    t2_reasons: list[tuple[str, str]] = []
-    for c in sorted(citations, key=lambda x: x.key):
-        meta = all_meta.get(c.key)
-        if not meta:
-            continue
-        tier = meta.access.get("tier", "NC")
-        if tier == "T2":
-            reason = meta.access.get("acquisition_reason", "")
-            if reason:
-                t2_reasons.append((c.key, reason))
-    if t2_reasons:
+    # Show T2 refs split by OA status
+    t2_oa, t2_other = classify_t2_refs(citations, all_meta)
+    if t2_oa:
+        print()
+        print("  T2 open access — manual download needed:")
+        print("  (download PDF, save to local_pdfs/ by title)")
+        for key, url in t2_oa:
+            print(f"    {key}: {url}")
+    if t2_other:
         print()
         print("  T2 acquisition details:")
-        for key, reason in t2_reasons:
+        for key, reason in t2_other:
             print(f"    {key}: {reason}")
 
     return 0

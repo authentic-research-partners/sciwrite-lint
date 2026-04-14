@@ -122,6 +122,8 @@ class AcquisitionResult(BaseModel):
     url: str | None = None
     abstract: str | None = None
     reason: str = ""
+    is_oa: bool = False
+    oa_url: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -788,10 +790,18 @@ async def acquire_fulltext(
             if progress:
                 print(" not found")
 
-    # 9. Suggest manual download
+    # 9. Determine OA status and suggest manual download
     combined_reason = (
         "; ".join(failed_sources) if failed_sources else "no sources available"
     )
+    # OA confirmed by Unpaywall or OpenAlex
+    known_oa = bool(uw_data) or bool(oa_url)
+    best_oa_url = None
+    if uw_data:
+        best_oa_url = uw_data.get("oa_url") or uw_data.get("pdf_url")
+    if not best_oa_url and oa_url:
+        best_oa_url = oa_url
+
     best_url = None
     if uw_data:
         best_url = uw_data.get("pdf_url") or uw_data.get("oa_url")
@@ -806,6 +816,8 @@ async def acquire_fulltext(
             url=best_url,
             abstract=core_abstract,
             reason=combined_reason,
+            is_oa=known_oa,
+            oa_url=best_oa_url,
         )
 
     return AcquisitionResult(

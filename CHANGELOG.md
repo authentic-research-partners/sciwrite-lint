@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.2] — 2026-04-14
+
+### Added
+- **Paper citation.** Accompanying arXiv preprint ([arXiv:2604.08501](https://arxiv.org/abs/2604.08501)) is now surfaced in the README, `CITATION.cff`, and PyPI project sidebar.
+- **`requirements-pinned.txt`** for reproducing the exact versions the maintainer tests against. Regular installs are unchanged.
+
+### Improved
+- **Open-access references flagged for manual download.** When a reference is confirmed open access but the publisher blocks programmatic downloads, `sciwrite-lint verify` now lists it separately with a direct URL and instructions to save to `local_pdfs/`. Previously these were mixed in with truly unavailable references in the T2 summary.
+
 ## [0.2.1] — 2026-04-10
 
 ### Added

@@ -123,6 +123,12 @@ def fetch_for_citations(
                     except Exception as e:
                         logger.warning(f"{c.key}: parse skipped: {e}")
             elif result.url:
+                if result.is_oa:
+                    meta.access["is_oa"] = True
+                if result.oa_url:
+                    meta.access["oa_url"] = result.oa_url
+                if result.is_oa or result.oa_url:
+                    save_metadata(meta, refs_dir)
                 logger.warning(f"{c.key}: manual download needed: {result.url}")
             else:
                 logger.warning(f"{c.key}: no source found")
