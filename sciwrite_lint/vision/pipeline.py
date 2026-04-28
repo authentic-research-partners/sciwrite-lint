@@ -7,7 +7,7 @@ On WSL2, CUDA memory overcommit lets the VL model (~4 GB float16) share
 VRAM with vLLM transparently — no container restart needed.  On native
 Linux without overcommit, auto-resolves to CPU.
 
-Can also run standalone: ``sciwrite-lint vision --paper paper_a``.
+Can also run standalone: ``sciwrite-lint vision --paper my-paper``.
 """
 
 from __future__ import annotations
@@ -172,7 +172,7 @@ def _cli_main() -> None:
                 logger.info("No figures found")
         except Exception as e:
             logger.error("Vision pipeline failed: {}", e)
-            sys.exit(1)
+            sys.exit(2)
     else:
         parser.error("Provide tex_path + --paper, or --batch <manifest.json>")
 
@@ -220,7 +220,7 @@ def _run_batch(manifest_path: Path) -> None:
 
     if failed:
         logger.warning("Vision batch: {}/{} papers failed", failed, len(manifest))
-        sys.exit(1)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

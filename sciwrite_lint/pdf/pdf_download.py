@@ -3,7 +3,10 @@
 Downloads papers from OA URLs (Unpaywall, publisher sites). Handles:
 - Direct PDF links (Content-Type: application/pdf)
 - HTML pages with embedded/linked PDFs
-- Validates downloaded PDF matches expected paper (title matching)
+- Validates downloaded PDF matches expected paper via
+  :func:`sciwrite_lint.fulltext._validation.validate_pdf_match` (multi-signal
+  — GROBID header title + pypdf first-page surname / DOI / year +
+  template-pattern rejection)
 
 No LLM — just HTTP, HTML parsing, GROBID title extraction,
 and fuzzy string matching.
@@ -14,12 +17,15 @@ from __future__ import annotations
 import re
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
 import httpx
 
 from sciwrite_lint._network import ResponseTooLarge, ssrf_safe_client, stream_with_limit
+
+if TYPE_CHECKING:
+    from sciwrite_lint.fulltext._validation import BibEvidence
 
 _MIN_PDF_SIZE = 5_000
 _MAX_PDF_SIZE = 100 * 1024 * 1024  # 100 MB — reject downloads larger than this
@@ -36,14 +42,19 @@ async def download_and_validate(
     url: str,
     key: str,
     references_dir: Path,
-    expected_title: str = "",
-    expected_authors: list[str] | None = None,
-    title_threshold: float = 0.65,
+    evidence: "BibEvidence | None" = None,
     user_agent: str = _DEFAULT_USER_AGENT,
 ) -> dict[str, Any]:
     """Download a PDF from a URL and validate it matches the expected paper.
 
-    Returns dict with: found, local_path, source_url, pdf_title, match_score, reason.
+    When *evidence* is provided, the downloaded PDF goes through
+    :func:`sciwrite_lint.fulltext._validation.validate_pdf_match` — the same
+    multi-signal gate used by the direct-download path. No *evidence* means
+    bytes-level validation only (PDF magic, minimum size); the caller gets
+    whatever the URL produced without content-match filtering.
+
+    Returns dict with: found, local_path, source_url, pdf_title,
+    match_score, reason.
     """
     result = {
         "found": False,
@@ -76,9 +87,7 @@ async def download_and_validate(
                     url,
                     key,
                     references_dir,
-                    expected_title,
-                    expected_authors,
-                    title_threshold,
+                    evidence,
                     result,
                 )
 
@@ -92,9 +101,7 @@ async def download_and_validate(
                             pdf_url,
                             key,
                             references_dir,
-                            expected_title,
-                            expected_authors,
-                            title_threshold,
+                            evidence,
                             result,
                         )
                     else:
@@ -125,12 +132,12 @@ async def _validate_and_save(
     source_url: str,
     key: str,
     references_dir: Path,
-    expected_title: str,
-    expected_authors: list[str] | None,
-    threshold: float,
+    evidence: "BibEvidence | None",
     result: dict,
 ) -> dict:
     """Validate PDF content and save if it matches."""
+    from sciwrite_lint.fulltext._validation import validate_pdf_match
+
     result["source_url"] = source_url
 
     if len(content) < _MIN_PDF_SIZE:
@@ -146,22 +153,13 @@ async def _validate_and_save(
         tmp_path = Path(tmp.name)
 
     try:
-        if expected_title:
-            from sciwrite_lint.pdf.grobid import extract_title_from_header
-
-            grobid_title = await extract_title_from_header(tmp_path)
-            result["pdf_title"] = grobid_title
-
-            if grobid_title:
-                score = _title_similarity(expected_title, grobid_title)
-                result["match_score"] = score
-                if score < threshold:
-                    result["reason"] = (
-                        f"Title mismatch (score={score:.2f}): "
-                        f"expected '{expected_title[:50]}', "
-                        f"got '{grobid_title[:50]}'"
-                    )
-                    return result
+        if evidence is not None:
+            vr = await validate_pdf_match(tmp_path, evidence)
+            result["pdf_title"] = vr.signals.get("grobid_title", "")
+            result["match_score"] = float(vr.signals.get("title_sim", 0.0) or 0.0)
+            if not vr.accepted:
+                result["reason"] = vr.reason
+                return result
 
         references_dir.mkdir(parents=True, exist_ok=True)
         dest = references_dir / f"{key}.pdf"

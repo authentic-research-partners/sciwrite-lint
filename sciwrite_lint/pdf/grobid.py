@@ -482,11 +482,110 @@ async def process_pdf(pdf_path: Path) -> GrobidResult:
     raise RuntimeError(f"GROBID failed after {max_retries} retries for {pdf_path.name}")
 
 
+class GrobidUnparseableError(RuntimeError):
+    """GROBID refused to parse a specific PDF (not a transient GROBID outage).
+
+    Distinct from generic transport/503 errors so callers can treat an
+    unparseable PDF as "skip this PDF, try the next source" rather than
+    "abort the whole pipeline."
+
+    ``reason`` classifies the failure so the user-facing message can be
+    informative: ``"image-only PDF (no text layer)"``,
+    ``"unsupported PDF producer: CorelDRAW Version 12.0"``, or a generic
+    ``"GROBID returned NO_BLOCKS"`` when neither diagnostic applies.
+    """
+
+    def __init__(self, pdf_name: str, reason: str) -> None:
+        super().__init__(f"GROBID cannot parse {pdf_name}: {reason}")
+        self.pdf_name = pdf_name
+        self.reason = reason
+
+
+def _classify_unparseable_pdf(pdf_path: Path) -> str:
+    """Diagnose *why* a PDF is unparseable — returns a one-line reason.
+
+    Priority:
+      1. If the PDF contains less than 100 bytes of extractable text, it
+         is image-only (scanned) — GROBID cannot OCR.
+      2. Otherwise, check pdfinfo for a known-problematic producer
+         (CorelDRAW, Preview, etc. tend to produce structurally odd PDFs
+         that GROBID's pdfalto extractor chokes on).
+      3. Fallback generic reason.
+
+    Runs shelled-out ``pdftotext`` and ``pdfinfo`` (poppler-utils,
+    already a GROBID system dependency). Any error in the diagnostic
+    path falls through to the generic reason rather than bubbling —
+    we're already in an error path and shouldn't amplify it.
+    """
+    import shutil
+    import subprocess
+
+    # Step 1: is there any extractable text at all?
+    if shutil.which("pdftotext"):
+        try:
+            text = subprocess.run(  # noqa: S603
+                ["pdftotext", "-l", "3", str(pdf_path), "-"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            ).stdout
+            if len(text.strip()) < 100:
+                return "image-only PDF (no text layer) — GROBID cannot parse"
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # Step 2: known-problematic producer?
+    if shutil.which("pdfinfo"):
+        try:
+            info = subprocess.run(  # noqa: S603
+                ["pdfinfo", str(pdf_path)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            ).stdout
+            for line in info.splitlines():
+                if line.startswith("Creator:") or line.startswith("Producer:"):
+                    value = line.split(":", 1)[1].strip()
+                    low = value.lower()
+                    if any(
+                        marker in low
+                        for marker in ("coreldraw", "preview", "quartz pdfcontext")
+                    ):
+                        return f"unsupported PDF producer ({value})"
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    return "GROBID returned NO_BLOCKS (PDF structure not recognizable)"
+
+
+_UNPARSEABLE_MARKERS = ("NO_BLOCKS", "empty content", "no text", "could not parse")
+
+
+def _is_unparseable_pdf_response(body: str) -> bool:
+    """Return True if a GROBID 500 body signals a per-PDF parse failure.
+
+    GROBID surfaces per-PDF failures through error strings in the 500
+    response body; generic 5xx responses without these markers indicate
+    GROBID itself is unhealthy and should propagate as a transient error.
+    """
+    lowered = body.lower()
+    return any(marker.lower() in lowered for marker in _UNPARSEABLE_MARKERS)
+
+
 async def extract_title_from_header(pdf_path: Path) -> str:
     """Extract the paper title via GROBID's processHeaderDocument endpoint.
 
     Lighter than processFulltextDocument — only parses the document header.
-    Raises RuntimeError if GROBID is not running.
+
+    Raises:
+        RuntimeError: GROBID is not running, or GROBID itself returned a
+            transient error after all retries.
+        GrobidUnparseableError: GROBID ran but cannot parse *this specific*
+            PDF (image-only, unsupported producer, or NO_BLOCKS). Callers
+            should treat this as a per-PDF rejection (like title mismatch),
+            not as a fatal GROBID outage.
     """
     if not await is_grobid_running():
         raise RuntimeError(
@@ -525,6 +624,15 @@ async def extract_title_from_header(pdf_path: Path) -> str:
 
         if resp.status_code == 200:
             break
+
+        # A 500 body that mentions NO_BLOCKS / empty content is a
+        # per-PDF parse failure, not a GROBID outage. Don't retry — the
+        # PDF isn't going to become parseable on the second try. Raise
+        # a typed error so callers can skip the PDF and move on.
+        if resp.status_code == 500 and _is_unparseable_pdf_response(resp.text):
+            reason = _classify_unparseable_pdf(pdf_path)
+            logger.info("GROBID cannot parse {}: {}", pdf_path.name, reason)
+            raise GrobidUnparseableError(pdf_path.name, reason)
 
         if resp.status_code in (500, 503) and attempt < max_retries:
             delay = 2**attempt

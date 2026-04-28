@@ -67,6 +67,7 @@ def run_verify(args: argparse.Namespace) -> int:
     ws = config.paper_workspace(pc.name)
     ws.ensure_dirs()
     refs_dir = ws.root
+    config.current_paper = pc.name
 
     logger.info(f"Verifying {pc.name}...")
     citations = asyncio.run(
@@ -155,6 +156,7 @@ def run_status(args: argparse.Namespace) -> int:
         return 2
 
     ws = config.paper_workspace(pc.name)
+    config.current_paper = pc.name
     all_meta = load_all_metadata(ws.root)
 
     if not all_meta:
@@ -191,7 +193,7 @@ def run_status(args: argparse.Namespace) -> int:
             api_match: str = meta.api_match or "?"
             local = meta.access.get("local_file") or "\u2014"
             verified = meta.verified_date or "\u2014"
-            is_web = api_match in ("web_verified", "web_dead")
+            is_web = api_match in ("web_verified", "web_dead", "web_blocked")
         else:
             tier = "NC"
             api_match = "not checked"
@@ -235,7 +237,11 @@ def run_status(args: argparse.Namespace) -> int:
     if t2_oa:
         print()
         print("  T2 open access — manual download needed:")
-        print("  (download PDF, save to local_pdfs/ by title)")
+        print(
+            "  (open URL in browser; save a PDF to local_pdfs/ OR, for HTML pages"
+            " / JS-heavy sites, File -> Save As -> Webpage Single File (.mhtml)"
+            " into local_web/ — filename should start with the citekey)"
+        )
         for key, url in t2_oa:
             print(f"    {key}: {url}")
     if t2_other:
@@ -324,9 +330,11 @@ def run_ref_health(args: argparse.Namespace) -> int:
         if is_web_resource(c):
             web_count += 1
 
-    # --- Local PDFs ---
-    local_matched: dict[str, Path] = {}
-    local_unmatched: list[Path] = []
+    # --- Local sources (academic + web) ---
+    academic_matched: dict[str, Path] = {}
+    academic_unmatched: list[Path] = []
+    web_matched: dict[str, Path] = {}
+    web_unmatched: list[Path] = []
     try:
         if tex_file:
             from sciwrite_lint.config import load_config as _load_cfg
@@ -334,15 +342,22 @@ def run_ref_health(args: argparse.Namespace) -> int:
             _cfg = _load_cfg()
         else:
             _cfg = config  # type: ignore[possibly-undefined]  # noqa: F841
-        local_pdfs_dir = _cfg.local_pdfs_dir
-        if local_pdfs_dir.is_dir() and any(local_pdfs_dir.glob("*.pdf")):
-            from sciwrite_lint.local_pdfs import match_local_pdfs
+        from sciwrite_lint.local_sources import (
+            ACADEMIC_SUFFIXES,
+            WEB_SUFFIXES,
+            match_local_sources,
+        )
 
-            titles = {c.key: c.title for c in citations if c.title}
-            local_matched, local_unmatched = match_local_pdfs(local_pdfs_dir, titles)
+        titles = {c.key: c.title for c in citations if c.title}
+        academic_matched, academic_unmatched = match_local_sources(
+            _cfg.local_pdfs_dir, titles, ACADEMIC_SUFFIXES
+        )
+        web_matched, web_unmatched = match_local_sources(
+            _cfg.local_web_dir, titles, WEB_SUFFIXES
+        )
     except Exception as e:
         logger.debug(
-            f"ref-health: local PDF matching skipped ({type(e).__name__}: {e})"
+            f"ref-health: local source matching skipped ({type(e).__name__}: {e})"
         )
 
     # --- Output ---
@@ -383,17 +398,27 @@ def run_ref_health(args: argparse.Namespace) -> int:
     if web_count:
         print(f"    ({web_count} web resources)")
 
-    # Local PDFs
-    if local_matched or local_unmatched:
-        print("\n  LOCAL PDFs")
-        if local_matched:
-            print(f"    Matched: {len(local_matched)}")
-            for key, pdf_path in sorted(local_matched.items()):
-                print(f"      {pdf_path.name} → {key}")
-        if local_unmatched:
-            print(f"    Unmatched ({len(local_unmatched)}):")
-            for pdf_path in sorted(local_unmatched):
-                print(f"      - {pdf_path.name}  (no matching reference title)")
+    # Local sources — academic (PDFs + MD summaries) + web (MD + MHTML)
+    if academic_matched or academic_unmatched:
+        print("\n  LOCAL ACADEMIC SOURCES")
+        if academic_matched:
+            print(f"    Matched: {len(academic_matched)}")
+            for key, src_path in sorted(academic_matched.items()):
+                print(f"      {src_path.name} → {key}")
+        if academic_unmatched:
+            print(f"    Unmatched ({len(academic_unmatched)}):")
+            for src_path in sorted(academic_unmatched):
+                print(f"      - {src_path.name}  (no matching reference title)")
+    if web_matched or web_unmatched:
+        print("\n  LOCAL WEB CAPTURES")
+        if web_matched:
+            print(f"    Matched: {len(web_matched)}")
+            for key, src_path in sorted(web_matched.items()):
+                print(f"      {src_path.name} → {key}")
+        if web_unmatched:
+            print(f"    Unmatched ({len(web_unmatched)}):")
+            for src_path in sorted(web_unmatched):
+                print(f"      - {src_path.name}  (no matching reference title)")
 
     print()
     return 0
@@ -411,6 +436,7 @@ def run_verify_claims(args: argparse.Namespace) -> int:
     ws = config.paper_workspace(pc.name)
     ws.ensure_dirs()
     refs_dir = ws.root
+    config.current_paper = pc.name
     from sciwrite_lint.eval_claims import run_claim_verification
 
     results = asyncio.run(

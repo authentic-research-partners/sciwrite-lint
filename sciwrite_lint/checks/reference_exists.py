@@ -43,7 +43,12 @@ def check_reference_exists_from_metadata(
 
     Flags:
     - not_found: ERROR — reference not in any API
-    - dead URL: ERROR — web resource URL is dead
+    - dead URL: ERROR — web resource URL returned HTTP 404/410 (server
+      explicitly confirmed the resource does not exist)
+    - blocked by ...: WARNING — unverifiable URL (server refused us,
+      server error, TLS failure, timeout, connection error, decoding
+      error, oversized response); URL may still be valid, user must
+      verify manually
     - content extraction failed: WARNING — URL alive but content not extracted
     """
     findings: list[Finding] = []
@@ -71,6 +76,15 @@ def check_reference_exists_from_metadata(
                 findings.append(
                     Finding(
                         level="error",
+                        rule_id="reference-exists",
+                        message=f"{key}: {issue}",
+                        context=f"Source: {meta.api_source}" if meta.api_source else "",
+                    )
+                )
+            elif "blocked by " in issue_lower:
+                findings.append(
+                    Finding(
+                        level="warning",
                         rule_id="reference-exists",
                         message=f"{key}: {issue}",
                         context=f"Source: {meta.api_source}" if meta.api_source else "",
@@ -107,10 +121,12 @@ def check_reference_exists(tex_path: Path, config: LintConfig) -> list[Finding]:
     if not refs_dir.exists():
         return []
 
-    # Only load refs that could produce findings (not_found, web_dead, or with issues)
+    # Only load refs that could produce findings (not_found / web_dead /
+    # web_blocked / web_verified-with-extract-issue).
     with get_db(refs_dir) as conn:
         candidates = query_refs_by_match(conn, "not_found")
         candidates.update(query_refs_by_match(conn, "web_dead"))
+        candidates.update(query_refs_by_match(conn, "web_blocked"))
         # Web-verified refs may have content extraction issues
         candidates.update(query_refs_by_match(conn, "web_verified"))
     if not candidates:

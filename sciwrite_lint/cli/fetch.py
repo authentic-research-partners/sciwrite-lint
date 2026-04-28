@@ -11,6 +11,23 @@ from loguru import logger
 from sciwrite_lint.config import LintConfig
 
 
+def _coerce_year(value: object) -> int | None:
+    """Coerce a year-ish value from bib/canonical metadata to an int.
+
+    Year fields are stored as ``str`` or ``int`` across the metadata
+    surface. Returns ``None`` for empty, non-numeric, or out-of-range
+    values — the validator treats ``None`` as "no year signal available".
+    """
+    if isinstance(value, int):
+        return value if 1500 <= value <= 2100 else None
+    if isinstance(value, str):
+        match = value.strip()[:4]
+        if match.isdigit():
+            year = int(match)
+            return year if 1500 <= year <= 2100 else None
+    return None
+
+
 def eager_parse(key: str, pdf_path: Path, refs_dir: Path) -> None:
     """Parse a newly-downloaded PDF and compute embeddings (best-effort)."""
     try:
@@ -41,31 +58,41 @@ def fetch_for_citations(
 
     refs_dir = references_dir
 
-    # Check local_pdfs_dir for user-provided PDFs before downloading
-    from sciwrite_lint.local_pdfs import copy_local_pdf, match_local_pdfs
+    # Hash-aware drop-folder ingest before the OA waterfall. Runs for
+    # every citation so a refreshed source on an already-T1 ref still
+    # re-propagates through GROBID + embedding on the next run.
+    from sciwrite_lint.local_sources import ingest_local_sources
 
-    local_pdfs_dir = config.local_pdfs_dir
-    if local_pdfs_dir.is_dir() and any(local_pdfs_dir.glob("*.pdf")):
-        titles = {}
-        for c in citations:
-            if c.local_status != "none":
-                continue
-            meta = load_metadata(c.key, refs_dir)
-            if not meta or meta.access.get("tier") == "T1":
-                continue
-            titles[c.key] = c.title or meta.canonical.get("title", "")
+    keys_titles_hashes: dict[str, tuple[str, str]] = {}
+    for c in citations:
+        if c.local_status != "none":
+            continue
+        meta = load_metadata(c.key, refs_dir)
+        if not meta:
+            continue
+        keys_titles_hashes[c.key] = (
+            c.title or meta.canonical.get("title", ""),
+            meta.access.get("local_file_src_hash", ""),
+        )
 
-        if titles:
-            matched, _ = match_local_pdfs(local_pdfs_dir, titles)
-            for key, pdf_path in matched.items():
-                meta = load_metadata(key, refs_dir)
-                if not meta:
-                    continue
-                local_path = copy_local_pdf(pdf_path, key, refs_dir)
-                meta.access["local_file"] = local_path
-                meta.access["tier"] = compute_tier(meta)
-                save_metadata(meta, refs_dir)
-                logger.info(f"{key}: using local PDF [{meta.access['tier']}]")
+    if keys_titles_hashes:
+        outcomes = ingest_local_sources(
+            keys_titles_hashes,
+            academic_dir=config.effective_local_pdfs_dir(),
+            web_dir=config.effective_local_web_dir(),
+            references_dir=refs_dir,
+        )
+        for key, outcome in outcomes.items():
+            meta = load_metadata(key, refs_dir)
+            if not meta:
+                continue
+            meta.access["local_file"] = outcome.local_file
+            meta.access["local_file_src_hash"] = outcome.src_hash
+            meta.access["tier"] = compute_tier(meta)
+            save_metadata(meta, refs_dir)
+            logger.info(
+                f"{key}: ingested local {outcome.kind} source [{meta.access['tier']}]"
+            )
 
     async def _do_fetch():
         for c in citations:
@@ -87,6 +114,10 @@ def fetch_for_citations(
             pmcid = meta.canonical.get("pmcid")
             expected_title = meta.canonical.get("title", "") or c.title
             expected_authors = meta.canonical.get("authors") or c.authors
+            expected_year = _coerce_year(
+                meta.canonical.get("year") or meta.bibitem.get("year")
+            )
+            expected_entry_type = meta.bibitem.get("entry_type") or "article"
 
             logger.info(f"Fetching {c.key}...")
             result = await acquire_fulltext(
@@ -99,6 +130,8 @@ def fetch_for_citations(
                 pmcid=pmcid,
                 expected_title=expected_title,
                 expected_authors=expected_authors,
+                expected_year=expected_year,
+                expected_entry_type=expected_entry_type,
             )
 
             if result.found and result.local_path:
@@ -129,7 +162,10 @@ def fetch_for_citations(
                     meta.access["oa_url"] = result.oa_url
                 if result.is_oa or result.oa_url:
                     save_metadata(meta, refs_dir)
-                logger.warning(f"{c.key}: manual download needed: {result.url}")
+                logger.warning(
+                    f"{c.key}: manual download needed: {result.url} "
+                    f"(save PDF to local_pdfs/ or MHTML to local_web/)"
+                )
             else:
                 logger.warning(f"{c.key}: no source found")
 
@@ -163,6 +199,7 @@ def run_fetch(args: argparse.Namespace) -> int:
     ws = config.paper_workspace(pc.name)
     ws.ensure_dirs()
     refs_dir = ws.root
+    config.current_paper = pc.name
 
     if args.key:
         all_meta = load_all_metadata(refs_dir)
@@ -213,6 +250,13 @@ def fetch_single(
     s2_pdf_url = meta.canonical.get("s2_pdf_url")  # type: ignore[attr-defined]
     pmcid = meta.canonical.get("pmcid")  # type: ignore[attr-defined]
     expected_title = meta.canonical.get("title", "")  # type: ignore[attr-defined]
+    expected_authors = meta.canonical.get("authors")  # type: ignore[attr-defined]
+    expected_year = _coerce_year(
+        meta.canonical.get("year") or meta.bibitem.get("year")  # type: ignore[attr-defined]
+    )
+    expected_entry_type = (
+        meta.bibitem.get("entry_type") or "article"  # type: ignore[attr-defined]
+    )
 
     async def _do():
         logger.info(f"Fetching full text for {key}...")
@@ -225,6 +269,9 @@ def fetch_single(
             s2_pdf_url=s2_pdf_url,
             pmcid=pmcid,
             expected_title=expected_title,
+            expected_authors=expected_authors,
+            expected_year=expected_year,
+            expected_entry_type=expected_entry_type,
         )
 
         if result.found and result.local_path:
@@ -249,7 +296,10 @@ def fetch_single(
                 except Exception as e:
                     logger.warning(f"{key}: parse skipped: {e}")
         elif result.url:
-            logger.warning(f"{key}: manual download needed: {result.url}")
+            logger.warning(
+                f"{key}: manual download needed: {result.url} "
+                f"(save PDF to local_pdfs/ or MHTML to local_web/)"
+            )
         else:
             logger.warning(f"{key}: no source found")
 

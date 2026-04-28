@@ -5,9 +5,13 @@ output length. This tells vLLM's constrained decoder how much space each
 field gets, so the JSON structure completes within ``max_tokens``. The limits
 are ceilings — the model writes naturally below them.
 
-Conservative token math: at worst-case 3 chars/token, the total constrained
-response for the largest schema (ClaimVerdict) is ~192 tokens, leaving 3904
-of 4096 max_tokens for thinking.
+Conservative token math (3 chars/token worst case): the widest single-item
+schema is ``ClaimVerdict`` at ~300 tokens; list-valued schemas dominate the
+budget at their ``max_length`` cap (``FullPaperIssueList``: 5 × ~220 ≈ 1100
+tokens; ``ConsistencyResult``: 4 × ~400 ≈ 1600 tokens). These response
+sizes, combined with the active thinking preset's budget, determine the
+total ``max_tokens`` sent to vLLM — see ``llm_utils.py::llm_query`` for
+how the two are combined.
 
 To get the JSON schema dict for vLLM::
 
@@ -258,3 +262,28 @@ class FullPaperIssueList(BaseModel):
     """Result from a full-paper consistency check."""
 
     issues: list[FullPaperIssue] = Field(max_length=5)
+
+
+# ---------------------------------------------------------------------------
+# Prose quality — grammar + semantic word-choice (checks/prose_quality.py)
+# ---------------------------------------------------------------------------
+
+
+class ProseIssue(BaseModel):
+    """One grammar or semantic-word-choice issue in a single sentence.
+
+    ``confidence`` maps to ``Finding.level`` — ``low`` findings are
+    dropped; ``medium`` becomes ``info``; ``high`` becomes ``warning``.
+    """
+
+    type: Literal["grammar", "semantic"]
+    span: str = Field(max_length=300)
+    issue: str = Field(max_length=300)
+    suggestion: str = Field(max_length=300)
+    confidence: Literal["low", "medium", "high"]
+
+
+class ProseIssueList(BaseModel):
+    """Per-sentence result from the prose-quality check."""
+
+    issues: list[ProseIssue] = Field(max_length=3)

@@ -189,6 +189,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Vision backend: transformers (2B, default) or vllm (8B FP8 on port 5002)",
     )
+    p_check.add_argument(
+        "--checks",
+        default=None,
+        metavar="ID[,ID...]",
+        help=(
+            "Run only the listed check IDs (comma-separated). Other checks "
+            "are disabled for this invocation. Example: "
+            "--checks prose-quality,dangling-cite. Run `sciwrite-lint checks` "
+            "to list available IDs."
+        ),
+    )
     p_check.set_defaults(func=run_check)
 
     # --- checks ---

@@ -1436,15 +1436,33 @@ async def _verify_web_resource(
             c.issues.append(
                 f"URL alive but content extraction failed: {web_result.error or 'unknown'}"
             )
+    elif web_result.blocked:
+        # Unverifiable: 4xx refusal, 5xx error, TLS/timeout/connection/
+        # decoding/protocol/oversized. The URL may still be valid — we
+        # just could not confirm. Downstream emits a WARN telling the
+        # user to verify manually; distinct from web_dead (ERROR).
+        c.api_match = "web_blocked"
+        c.api_source = "web"
+        c.api_data = {
+            "source": "web",
+            "url": resolved_url,
+            "status_code": web_result.status_code,
+        }
+        reason = web_result.error or "unknown reason"
+        c.issues.append(
+            f"Blocked by {reason}: {resolved_url} — "
+            f"unable to verify automatically, please check manually"
+        )
     else:
+        # Genuinely dead: server explicitly returned 404 or 410 (or the
+        # URL was structurally invalid). Safe to flag as ERROR — cited
+        # resource cannot be retrieved at this URL and likely cannot be
+        # retrieved anywhere at this URL.
         c.api_match = "web_dead"
         c.api_source = "web"
         c.api_data = {"source": "web", "url": resolved_url}
-        if web_result.error and web_result.status_code == 0:
-            # Connection/DNS/timeout error — include the reason, not just "0"
-            c.issues.append(f"Dead URL ({web_result.error}): {resolved_url}")
-        else:
-            c.issues.append(f"Dead URL (HTTP {web_result.status_code}): {resolved_url}")
+        reason = web_result.error or f"HTTP {web_result.status_code}"
+        c.issues.append(f"Dead URL ({reason}): {resolved_url}")
 
     return c.api_data
 

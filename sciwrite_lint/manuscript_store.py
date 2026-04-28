@@ -149,12 +149,33 @@ def strip_latex_for_review(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class ParagraphEntry(BaseModel):
+    """One prose paragraph with its source line number.
+
+    ``text`` is already clean — LaTeX-stripped via pandoc for .tex input,
+    passed through as-is for PDF/markdown input. ``line`` is 1-indexed
+    against the original source file when known, ``None`` for PDF
+    paragraphs where line numbers don't exist.
+    """
+
+    line: int | None = None
+    text: str
+
+
 class ManuscriptSection(BaseModel):
-    """A section of the manuscript with both raw and clean text."""
+    """A section of the manuscript with both raw and clean text.
+
+    ``paragraphs`` is the canonical paragraph-level view used by
+    paragraph-oriented checks (e.g. prose-quality). For LaTeX input it
+    is populated by the single batched pandoc pass in
+    ``_build_context_latex``; ``clean_text`` is the blank-line-joined
+    view of the same paragraphs for section-level consumers.
+    """
 
     title: str
     raw_text: str  # original LaTeX (or plain text for PDF)
-    clean_text: str  # stripped for LLM / embedding
+    clean_text: str  # stripped for LLM / embedding (joined paragraphs)
+    paragraphs: list[ParagraphEntry] = Field(default_factory=list)
     start_line: int
     depth: int
 
@@ -292,42 +313,91 @@ def clear_cache() -> None:
 
 
 def _build_context_latex(tex_path: Path, config: LintConfig) -> ManuscriptContext:
-    """Parse manuscript from LaTeX, strip markup, build context."""
+    """Parse manuscript from LaTeX, clean markup via pandoc, build context.
+
+    Runs exactly one pandoc subprocess per paper: all paragraphs across
+    the abstract and every section are batched into a single
+    ``paragraphs_to_markdown`` call. Results are distributed back to
+    section-level ``paragraphs`` and ``clean_text``. This DRYs the
+    conversion — every downstream LLM check sees the same pandoc-cleaned
+    text, not a mix of regex-stripped and clean variants.
+    """
     from sciwrite_lint.checks._section_utils import (
         analyze_sections_with_text,
         get_abstract_text,
     )
+    from sciwrite_lint.latex_to_markdown import paragraphs_to_markdown
     from sciwrite_lint.tex_parser import (
         extract_bibliography,
         find_all_cite_keys,
+        split_paragraphs,
         strip_comments,
+        strip_non_prose_environments_preserve_lines,
     )
 
     text = strip_comments(tex_path.read_text(encoding="utf-8"))
 
-    # Sections
     raw_sections = analyze_sections_with_text(tex_path)
+    abstract_raw = get_abstract_text(tex_path)
+
+    # Collect every paragraph from abstract + sections into one flat list
+    # so pandoc runs once. Each entry carries an owner tag so we can
+    # re-distribute the cleaned output.
+    batch_raw: list[str] = []
+    # Owner: ("abstract", paragraph_index) or ("section", section_index, abs_line)
+    owners: list[tuple] = []
+
+    if abstract_raw:
+        for _para_line_rel, para_text in split_paragraphs(abstract_raw):
+            batch_raw.append(para_text)
+            owners.append(("abstract",))
+
+    section_paragraph_owners: list[tuple[int, int]] = []
+    for sec_idx, (info, raw_text) in enumerate(raw_sections):
+        stripped = strip_non_prose_environments_preserve_lines(raw_text)
+        for para_line_rel, para_text in split_paragraphs(stripped):
+            abs_line = info.start_line + para_line_rel - 1
+            batch_raw.append(para_text)
+            owners.append(("section", sec_idx, abs_line))
+            section_paragraph_owners.append((sec_idx, abs_line))
+
+    cleaned: list[str] = paragraphs_to_markdown(batch_raw) if batch_raw else []
+
+    # Build sections with paragraphs + joined clean_text
+    section_paragraphs: dict[int, list[ParagraphEntry]] = {
+        i: [] for i in range(len(raw_sections))
+    }
+    abstract_paragraphs: list[str] = []
+    for owner, clean in zip(owners, cleaned):
+        if owner[0] == "abstract":
+            if clean.strip():
+                abstract_paragraphs.append(clean)
+        else:
+            _, sec_idx, abs_line = owner
+            if clean.strip():
+                section_paragraphs[sec_idx].append(
+                    ParagraphEntry(line=abs_line, text=clean)
+                )
+
     sections = []
-    for info, raw_text in raw_sections:
-        clean = strip_latex_for_embedding(raw_text)
+    for i, (info, raw_text) in enumerate(raw_sections):
+        paragraphs = section_paragraphs[i]
+        clean_joined = "\n\n".join(p.text for p in paragraphs)
         sections.append(
             ManuscriptSection(
                 title=info.title,
                 raw_text=raw_text,
-                clean_text=clean,
+                clean_text=clean_joined,
+                paragraphs=paragraphs,
                 start_line=info.start_line,
                 depth=info.depth,
             )
         )
 
-    # Abstract
-    abstract_raw = get_abstract_text(tex_path)
-    abstract_clean = strip_latex_for_embedding(abstract_raw) if abstract_raw else ""
+    abstract_clean = "\n\n".join(abstract_paragraphs)
 
-    # Bibliography
     bibliography_raw = extract_bibliography(text)
 
-    # Inline citations
     cite_keys = find_all_cite_keys(text)
     inline_citations = [
         InlineCitation(key=key, line=line_no, context="") for line_no, key in cite_keys
@@ -350,6 +420,21 @@ def _build_context_latex(tex_path: Path, config: LintConfig) -> ManuscriptContex
     return ctx
 
 
+def _paragraphs_from_clean_text(text: str) -> list[ParagraphEntry]:
+    """Split already-clean text into paragraph entries (no line numbers).
+
+    Used by the GROBID and markdown builders where the source has no
+    LaTeX markup and no reliable line numbers. Paragraphs are separated
+    by blank lines — empty paragraphs are dropped.
+    """
+    entries: list[ParagraphEntry] = []
+    for chunk in re.split(r"\n\s*\n", text):
+        stripped = chunk.strip()
+        if stripped:
+            entries.append(ParagraphEntry(line=None, text=stripped))
+    return entries
+
+
 def _build_context_grobid(pdf_path: Path, grobid_result: Any) -> ManuscriptContext:
     """Build ManuscriptContext from a GROBID-parsed PDF.
 
@@ -368,6 +453,7 @@ def _build_context_grobid(pdf_path: Path, grobid_result: Any) -> ManuscriptConte
             title=sec.title,
             raw_text=sec.text,
             clean_text=sec.text,  # already plain text
+            paragraphs=_paragraphs_from_clean_text(sec.text),
             start_line=0,  # no line numbers in PDF
             depth=sec.level,
         )
@@ -441,6 +527,7 @@ def _build_context_markdown(md_path: Path, ref_key: str) -> ManuscriptContext:
                         title=current_title,
                         raw_text=current_text.strip(),
                         clean_text=current_text.strip(),
+                        paragraphs=_paragraphs_from_clean_text(current_text),
                         start_line=0,
                         depth=part.count("#") if heading_re.match(part) else 1,
                     )
@@ -462,6 +549,7 @@ def _build_context_markdown(md_path: Path, ref_key: str) -> ManuscriptContext:
                 title=current_title,
                 raw_text=current_text.strip(),
                 clean_text=current_text.strip(),
+                paragraphs=_paragraphs_from_clean_text(current_text),
                 start_line=0,
                 depth=1,
             )

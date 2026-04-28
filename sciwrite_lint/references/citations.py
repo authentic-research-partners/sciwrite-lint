@@ -509,6 +509,52 @@ def find_orphans(
     return cite_keys - bib_keys, bib_keys - cite_keys
 
 
+_NOCITE_PATTERN = re.compile(r"\\nocite\{([^}]+)\}")
+
+
+def cited_keys(tex_path: Path, aux_path: Path | None = None) -> set[str]:
+    r"""Return the set of bib keys referenced from the manuscript.
+
+    Includes keys from \cite* commands, \nocite{key} (and \nocite{\*}
+    sentinel), and — when present — the \citation records in the .aux
+    that BibTeX writes at compile time.
+
+    Strips comments first so commented-out lines don't leak keys.
+    The .aux union covers the "\nocite{*} means every bib entry"
+    case: BibTeX expands the sentinel into concrete \citation{key}
+    lines that parse_aux_citations picks up.
+    """
+    from sciwrite_lint.tex_parser import strip_comments
+
+    text = strip_comments(tex_path.read_text(encoding="utf-8"))
+    keys = {k for _, k in find_all_cite_keys(text)}
+    for m in _NOCITE_PATTERN.finditer(text):
+        for key in m.group(1).split(","):
+            key = key.strip()
+            if key:
+                keys.add(key)
+    if aux_path and aux_path.exists():
+        aux_cite, _ = parse_aux_citations(aux_path)
+        keys |= aux_cite
+    return keys
+
+
+def filter_to_cited(
+    citations: list[Citation],
+    tex_path: Path,
+    aux_path: Path | None = None,
+) -> list[Citation]:
+    r"""Drop bib entries that are never \cite'd in the paper.
+
+    Uncited entries don't belong in API verification or full-text
+    acquisition — they have no claim to verify and no text to fetch.
+    The dangling-cite check already reports key-level mismatches
+    directly from the bib, so filtering here doesn't hide anything.
+    """
+    keys = cited_keys(tex_path, aux_path)
+    return [c for c in citations if c.key in keys]
+
+
 def parse_aux_citations(aux_path: Path) -> tuple[set[str], set[str]]:
     """Parse .aux file for citation and bibcite keys."""
     text = aux_path.read_text(encoding="utf-8")
@@ -688,14 +734,22 @@ def check_tiers(
                 )
             )
         elif tier == "T2" and c.key in bare_keys:
+            if meta.api_match == "web_blocked":
+                message = (
+                    f"'{c.key}' is T2 (blocked by site — we could not verify "
+                    f"automatically). Verify the URL manually and use "
+                    f"\\citeunverified{{{c.key}}}."
+                )
+            else:
+                message = (
+                    f"'{c.key}' is T2 (no full text). Use "
+                    f"\\citeunverified{{{c.key}}} or obtain full text."
+                )
             findings.append(
                 Finding(
                     level="warning",
                     rule_id="ref-009",
-                    message=(
-                        f"'{c.key}' is T2 (no full text). Use \\citeunverified{{{c.key}}} "
-                        f"or obtain full text."
-                    ),
+                    message=message,
                     file=str(tex_path.name),
                 )
             )

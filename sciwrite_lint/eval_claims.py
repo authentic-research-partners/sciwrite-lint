@@ -131,7 +131,29 @@ class Section(BaseModel):
 
 
 def extract_claim_contexts(tex_path: Path) -> list[ClaimContext]:
-    r"""Extract claim contexts around each \cite{key} in the paper body."""
+    r"""Extract claim contexts around each reference in the paper body.
+
+    Two kinds of references are handled:
+
+    * ``\cite{key}`` (and ``\citep``/``\citet``/``\citeyearpar``/
+      ``\citeunverified``) — keyed on the bib citekey.
+    * ``\footnote{...\url{URL}...}`` — keyed on the synthetic
+      ``fn_<hash>`` produced by
+      :func:`sciwrite_lint.footnote_urls.synthesize_footnote_key`.
+      The enclosing paragraph is the claim context, and the
+      ``\footnote{...}`` body is stripped from the context (same as
+      ``\cite`` is replaced with ``[CITE]``) so the LLM sees only the
+      host sentence.
+
+    Only footnote URLs whose synthetic key is actually registered as a
+    local source (i.e. the URL had a matching capture in
+    ``local_web_dir``) will have a verifiable claim downstream — but
+    emitting the ``ClaimContext`` unconditionally keeps this function
+    pure (no DB access) and lets the caller filter by
+    ``ClaimContext.key in local_files`` exactly as it already does.
+    """
+    from sciwrite_lint.footnote_urls import synthesize_footnote_key
+
     text = tex_path.read_text(encoding="utf-8")
 
     body_start = text.find("\\begin{document}")
@@ -143,13 +165,12 @@ def extract_claim_contexts(tex_path: Path) -> list[ClaimContext]:
             f"Cannot find \\begin{{document}} in {tex_path}. "
             "Is this a valid LaTeX file?"
         )
-    if bib_start == -1:
-        # No bibliography — paper has no citations to extract
-        return []
-    body = text[body_start:bib_start]
+    # If there is no bibliography we can still have footnote-URL claims,
+    # so compute the body slice accordingly.
+    body = text[body_start:bib_start] if bib_start != -1 else text[body_start:]
 
     paragraphs = _split_paragraphs(body)
-    results = []
+    results: list[ClaimContext] = []
     pattern = re.compile(r"\\cite(?:unverified|[tp]|yearpar)?\{([^}]+)\}")
 
     for match in pattern.finditer(body):
@@ -180,7 +201,55 @@ def extract_claim_contexts(tex_path: Path) -> list[ClaimContext]:
                     ClaimContext(key=key, context=context_text, line=line_no)
                 )
 
+    # Footnote-URL claims. Walk the body for \footnote{...\url{URL}...};
+    # each URL becomes one ClaimContext keyed on its synthetic key. The
+    # claim context is the paragraph containing the footnote, with the
+    # footnote body itself stripped by `_clean_latex` so the verifier
+    # sees only the host sentence.
+    for fn_match in _FOOTNOTE_URL_CLAIM_RE.finditer(body):
+        fn_body = fn_match.group(0)
+        pos = fn_match.start()
+        line_no = body[:pos].count("\n") + 1
+
+        para_idx = _find_paragraph(paragraphs, pos)
+        if para_idx is None:
+            continue
+
+        context_parts = []
+        if para_idx > 0:
+            context_parts.append(paragraphs[para_idx - 1][1])
+        context_parts.append(paragraphs[para_idx][1])
+        fn_offset = pos - paragraphs[para_idx][0]
+        para_len = len(paragraphs[para_idx][1])
+        if fn_offset > para_len * 0.8 and para_idx + 1 < len(paragraphs):
+            context_parts.append(paragraphs[para_idx + 1][1])
+
+        context_text = _clean_latex("\n\n".join(context_parts)).strip()
+        if not context_text:
+            continue
+
+        for url_match in _URL_INSIDE_FOOTNOTE_RE.finditer(fn_body):
+            url = url_match.group(1).strip()
+            if url:
+                results.append(
+                    ClaimContext(
+                        key=synthesize_footnote_key(url),
+                        context=context_text,
+                        line=line_no,
+                    )
+                )
+
     return results
+
+
+# Brace-tolerant enough for common patterns (no nested \footnote{...}
+# inside a \footnote{...} in practice). Falls through to a simple
+# greedy body when an outer footnote contains further balanced braces —
+# the URL-inner regex runs on whatever body we matched.
+_FOOTNOTE_URL_CLAIM_RE = re.compile(
+    r"\\footnote\{(?:[^{}]|\{[^{}]*\})*\\url\{[^}]+\}(?:[^{}]|\{[^{}]*\})*\}"
+)
+_URL_INSIDE_FOOTNOTE_RE = re.compile(r"\\url\{([^}]+)\}")
 
 
 def _split_paragraphs(text: str) -> list[tuple[int, str]]:
@@ -1082,6 +1151,16 @@ async def run_claim_verification(
     if not verifiable:
         logger.info("No claims with local sources to verify")
         return []
+
+    # Ensure claim query vectors exist. In the full pipeline, Stage 4b
+    # pre-computes these; standalone callers (verify-claims, library use)
+    # hit this path and spawn the embedding subprocess for missing ones.
+    if backend != "claude":
+        from sciwrite_lint.pipeline import ensure_claim_query_vectors
+
+        ensure_claim_query_vectors(
+            [cl.context for cl in verifiable], references_dir, config
+        )
 
     if backend == "claude":
         vllm_model = ""

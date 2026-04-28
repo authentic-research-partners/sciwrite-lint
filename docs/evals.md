@@ -32,7 +32,7 @@ sciwrite-lint ships an evaluation framework for verifying detection quality and 
 
 ## Synthetic eval
 
-67 cases across 9 checks. Each case is a LaTeX document with known issues (or known clean).
+Each case is a LaTeX document with known issues (or known clean). LLM-backed checks are warmed concurrently: the runner deduplicates cases by `(tex_content, figure_descriptions)` hash and fires `run_llm_checks_batched` for every unique paper inside a single `asyncio.run`, so vLLM sees one big burst of concurrent queries instead of a sequence of per-case calls. After warm-up, each per-case assertion reads from an in-memory cache. See `evals/synthetic.py::_warm_llm_cache`.
 
 ```bash
 python -m evals eval-synthetic                         # all checks

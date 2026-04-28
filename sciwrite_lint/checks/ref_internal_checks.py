@@ -568,11 +568,21 @@ def _describe_cited_figures(
     return result
 
 
-def _describe_cited_figures_vl(references_dir_str: str, fresh: bool = False) -> None:
+def _describe_cited_figures_vl(
+    references_dir_str: str,
+    fresh: bool = False,
+    backend: str = "transformers",
+) -> None:
     """Subprocess entry point: run VL inference on cited paper images.
 
     Extracts images, runs VL model, caches results in workspace.db.
-    Called by _stage_cited_vision() in a subprocess for CUDA isolation.
+    Called by ``_stage_cited_vision`` in a subprocess (CUDA isolation for
+    transformers; clean asyncio context for vLLM).
+
+    ``backend`` must match the pipeline's configured backend. The caller
+    is responsible for ensuring the corresponding service is reachable
+    (vision vLLM on :5002 for ``"vllm"``; no service needed for
+    ``"transformers"``).
 
     Each ref's images are described separately so the cache entries get
     tagged with the correct ``source=ref_key``.
@@ -591,7 +601,11 @@ def _describe_cited_figures_vl(references_dir_str: str, fresh: bool = False) -> 
     all_images, ref_image_ranges = collect_cited_images(keys, references_dir)
     if all_images:
         describe_figures_by_source(
-            all_images, ref_image_ranges, references_dir, fresh=fresh
+            all_images,
+            ref_image_ranges,
+            references_dir,
+            fresh=fresh,
+            backend=backend,
         )
 
 

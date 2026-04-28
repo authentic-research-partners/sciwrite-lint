@@ -152,6 +152,50 @@ class PaperConfig(BaseModel):
     file_path: Path
     bib: Path | None = None  # explicit .bib path; None = auto-detect from .tex
     prohibited_terms: list[str] = Field(default_factory=list)
+    # Per-paper override of the academic-source directory. Accepts
+    # ``.pdf`` (primary) and ``.md`` (summaries). The key is named
+    # ``local_pdfs_dir`` for historical reasons — it pre-dates markdown
+    # summary support — and is read from the TOML unchanged.
+    local_pdfs_dir: Path | None = None
+
+    # Per-paper override of the web-capture directory. Accepts ``.md``
+    # (hand-written or previously captured) and ``.mhtml`` / ``.mht``
+    # (browser-saved web archives for JS-rendered pages).
+    local_web_dir: Path | None = None
+
+    def resolve_local_pdfs_dir(self, fallback: Path) -> Path:
+        """Return the effective academic-source directory for this paper.
+
+        Resolution order:
+
+        1. ``self.local_pdfs_dir`` if explicitly configured.
+        2. ``<file_path.parent>/Sources/full_text`` if it exists on disk
+           (per-paper curated archive convention).
+        3. ``fallback`` — typically ``LintConfig.local_pdfs_dir``.
+        """
+        if self.local_pdfs_dir is not None:
+            return self.local_pdfs_dir
+        auto = self.file_path.parent / "Sources" / "full_text"
+        if auto.is_dir():
+            return auto
+        return fallback
+
+    def resolve_local_web_dir(self, fallback: Path) -> Path:
+        """Return the effective web-capture directory for this paper.
+
+        Resolution order mirrors :meth:`resolve_local_pdfs_dir`:
+
+        1. ``self.local_web_dir`` if explicitly configured.
+        2. ``<file_path.parent>/Sources/full_text_web`` if it exists on
+           disk (per-paper web-capture archive convention).
+        3. ``fallback`` — typically ``LintConfig.local_web_dir``.
+        """
+        if self.local_web_dir is not None:
+            return self.local_web_dir
+        auto = self.file_path.parent / "Sources" / "full_text_web"
+        if auto.is_dir():
+            return auto
+        return fallback
 
 
 class LintConfig(BaseModel):
@@ -166,6 +210,7 @@ class LintConfig(BaseModel):
     calibration_dir: Path = Field(default=None)  # type: ignore[assignment]
     benchmarks_dir: Path = Field(default=None)  # type: ignore[assignment]
     local_pdfs_dir: Path = Field(default=None)  # type: ignore[assignment]
+    local_web_dir: Path = Field(default=None)  # type: ignore[assignment]
 
     @model_validator(mode="before")
     @classmethod
@@ -187,6 +232,8 @@ class LintConfig(BaseModel):
             data["benchmarks_dir"] = (project_dir / "benchmarks").resolve()
         if data.get("local_pdfs_dir") is None:
             data["local_pdfs_dir"] = (project_dir / "local_pdfs").resolve()
+        if data.get("local_web_dir") is None:
+            data["local_web_dir"] = (project_dir / "local_web").resolve()
         return data
 
     # Papers
@@ -215,6 +262,16 @@ class LintConfig(BaseModel):
     core_interval: float = 1.0
     unpaywall_interval: float = 0.1
     rw_cache_hours: int = 24  # Retraction Watch CSV re-download interval
+    # How long (days) to cache a "definitively unavailable" reference —
+    # one where every OA source returned not-found / no-match / size /
+    # title-mismatch. Within the TTL the fetch stage skips such refs to
+    # avoid re-running ~14 API calls per ref per pipeline invocation.
+    # After the TTL, the ref is retried (OA status can change when a
+    # preprint gets deposited or an embargo lifts). Transient failures
+    # (timeouts, 5xx, connection errors) are never cached — they are
+    # retried every run. ``--fresh`` recreates the workspace and so
+    # bypasses this cache unconditionally.
+    fetch_retry_ttl_days: int = 30
 
     # Output
     output_format: str = "terminal"
@@ -306,6 +363,38 @@ class LintConfig(BaseModel):
             return self.paper_workspace(self.current_paper).root
         return self.references_dir
 
+    def effective_local_pdfs_dir(self, paper_name: str = "") -> Path:
+        """Return the academic-source directory to use for ``paper_name``.
+
+        Accepts both ``.pdf`` (peer-reviewed articles) and ``.md``
+        (summary notes). Per-paper override wins; otherwise auto-detects
+        a sibling ``<file_path.parent>/Sources/full_text`` directory;
+        otherwise returns the project-wide ``local_pdfs_dir``. When
+        ``paper_name`` is empty or unknown, returns the project-wide
+        default.
+        """
+        name = paper_name or self.current_paper
+        if name:
+            paper = self.get_paper(name)
+            if paper is not None:
+                return paper.resolve_local_pdfs_dir(self.local_pdfs_dir)
+        return self.local_pdfs_dir
+
+    def effective_local_web_dir(self, paper_name: str = "") -> Path:
+        """Return the web-capture directory to use for ``paper_name``.
+
+        Accepts ``.md`` and ``.mhtml`` / ``.mht``. Resolution order
+        mirrors :meth:`effective_local_pdfs_dir`: per-paper override,
+        then auto-detection of ``<file_path.parent>/Sources/full_text_web``,
+        then the project-wide ``local_web_dir``.
+        """
+        name = paper_name or self.current_paper
+        if name:
+            paper = self.get_paper(name)
+            if paper is not None:
+                return paper.resolve_local_web_dir(self.local_web_dir)
+        return self.local_web_dir
+
 
 def is_wsl2() -> bool:
     """Detect WSL2 via /proc/version (contains 'microsoft' or 'WSL2')."""
@@ -355,12 +444,20 @@ def load_config(path: Path | None = None) -> LintConfig:
         bib_path = None
         if paper_data.get("bib"):
             bib_path = (project_dir / paper_data["bib"]).resolve()
+        local_pdfs_override: Path | None = None
+        if paper_data.get("local_pdfs_dir"):
+            local_pdfs_override = (project_dir / paper_data["local_pdfs_dir"]).resolve()
+        local_web_override: Path | None = None
+        if paper_data.get("local_web_dir"):
+            local_web_override = (project_dir / paper_data["local_web_dir"]).resolve()
         config.papers.append(
             PaperConfig(
                 name=paper_data.get("name", fp_resolved.stem),
                 file_path=fp_resolved,
                 bib=bib_path,
                 prohibited_terms=paper_data.get("prohibited_terms", []),
+                local_pdfs_dir=local_pdfs_override,
+                local_web_dir=local_web_override,
             )
         )
 
@@ -396,6 +493,7 @@ def load_config(path: Path | None = None) -> LintConfig:
         "core_interval",
         "unpaywall_interval",
         "rw_cache_hours",
+        "fetch_retry_ttl_days",
     ):
         if key in api:
             setattr(config, key, api[key])
@@ -479,6 +577,10 @@ def load_config(path: Path | None = None) -> LintConfig:
         config.local_pdfs_dir = (project_dir / data["local_pdfs_dir"]).resolve()
     else:
         config.local_pdfs_dir = (project_dir / "local_pdfs").resolve()
+    if data.get("local_web_dir"):
+        config.local_web_dir = (project_dir / data["local_web_dir"]).resolve()
+    else:
+        config.local_web_dir = (project_dir / "local_web").resolve()
 
     return config
 
@@ -492,7 +594,8 @@ def generate_default_toml(papers: list[dict[str, str]] | None = None) -> str:
         "# sciwrite-lint configuration",
         "# See: https://github.com/authentic-research-partners/sciwrite-lint",
         "",
-        '# local_pdfs_dir = "local_pdfs"   # folder for user-provided PDFs (e.g. paywalled content)',
+        '# local_pdfs_dir = "local_pdfs"   # academic sources you already have: PDFs (incl. OA pages that need a browser) + .md summaries',
+        '# local_web_dir  = "local_web"    # web captures: .md or .mhtml (for JS-rendered pages)',
         "",
     ]
 
@@ -531,6 +634,7 @@ def generate_default_toml(papers: list[dict[str, str]] | None = None) -> str:
             "[api]",
             '# polite_email = ""             # recommended for CrossRef/Unpaywall polite pool',
             "# Manage email and API keys interactively: sciwrite-lint config show",
+            "# fetch_retry_ttl_days = 30     # cache definitive PDF-not-found results for N days",
             "",
             "[style]",
             "emdash_threshold = 3.0          # max em-dashes per 1000 words",
@@ -593,13 +697,22 @@ def init_project(force: bool = False) -> tuple[bool, str]:
         refs_dir.mkdir()
         created.append(str(refs_dir) + "/")
 
-    # Local PDFs directory (user-provided paywalled content)
+    # Academic-source drop folder — PDFs you already have (paywalled OR
+    # OA pages that need a browser to pass a captcha/JS wall) plus .md summaries.
     local_pdfs = defaults.local_pdfs_dir
     if local_pdfs.exists():
         skipped.append(str(local_pdfs) + "/ (already exists)")
     else:
         local_pdfs.mkdir()
         created.append(str(local_pdfs) + "/")
+
+    # Web-capture drop folder (user-provided .md + .mhtml for JS-rendered pages).
+    local_web = defaults.local_web_dir
+    if local_web.exists():
+        skipped.append(str(local_web) + "/ (already exists)")
+    else:
+        local_web.mkdir()
+        created.append(str(local_web) + "/")
 
     # Build message
     parts: list[str] = []
@@ -623,7 +736,9 @@ def init_project(force: bool = False) -> tuple[bool, str]:
         )
         parts.append("     sciwrite-lint config set-email you@example.com")
         parts.append(
-            "  3. Drop paywalled PDFs into local_pdfs/ (filename ~ reference title)"
+            "  3. Drop pre-downloaded PDFs into local_pdfs/ (paywalled, or OA"
+            " pages a browser was needed to reach) and web captures (.md or"
+            " .mhtml) into local_web/ (filename ~ reference title)"
         )
         parts.append("  4. Start containers: sciwrite-lint containers start")
         parts.append("  5. Run: sciwrite-lint check")

@@ -60,6 +60,7 @@ def _load_generators() -> dict[str, Callable[[], list[SyntheticCase]]]:
         gen_statistical_reporting_cases,
         gen_text_vs_figure_cases,
     )
+    from evals.gen_prose_quality import gen_prose_quality_cases
     from evals.gen_structure import (
         gen_cross_section_cases,
         gen_structure_promises_cases,
@@ -88,6 +89,7 @@ def _load_generators() -> dict[str, Callable[[], list[SyntheticCase]]]:
         "text-vs-figure": gen_text_vs_figure_cases,
         "axis-label-consistency": gen_axis_label_consistency_cases,
         "figure-data-vs-table": gen_figure_data_vs_table_cases,
+        "prose-quality": gen_prose_quality_cases,
     }
 
 
@@ -106,6 +108,7 @@ LLM_CHECKS = [
     "text-vs-figure",
     "axis-label-consistency",
     "figure-data-vs-table",
+    "prose-quality",
 ]
 DB_CHECKS = [
     "reference-exists",

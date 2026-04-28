@@ -7,7 +7,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from sciwrite_lint.config import LintConfig
+from loguru import logger
 
 
 def run_eval_synthetic(args: argparse.Namespace) -> int:
@@ -105,7 +105,7 @@ def run_eval_real_world(args: argparse.Namespace) -> int:
 
         cats = args.categories.split(",") if args.categories else None
         srcs = args.sources.split(",") if getattr(args, "sources", None) else None
-        config = _load_config(args) if getattr(args, "config", None) else LintConfig()
+        config = _load_config(args)
         run_corpus(
             Path(args.workspace),
             n=args.n,
@@ -119,7 +119,7 @@ def run_eval_real_world(args: argparse.Namespace) -> int:
     if action == "fpr":
         from eval_real_world.runner import run_fpr
 
-        config = _load_config(args) if getattr(args, "config", None) else LintConfig()
+        config = _load_config(args)
         output = Path(args.output) if args.output else None
         run_fpr(
             Path(args.workspace),
@@ -133,7 +133,7 @@ def run_eval_real_world(args: argparse.Namespace) -> int:
     if action == "inject":
         from eval_real_world.runner import run_inject
 
-        config = _load_config(args) if getattr(args, "config", None) else LintConfig()
+        config = _load_config(args)
         output = Path(args.output) if args.output else None
         run_inject(
             Path(args.workspace),
@@ -147,8 +147,18 @@ def run_eval_real_world(args: argparse.Namespace) -> int:
 
     if action == "pipeline":
         from eval_real_world.runner import run_full_pipeline
+        from sciwrite_lint.cli.config import check_api_config
 
-        config = _load_config(args) if getattr(args, "config", None) else LintConfig()
+        config = _load_config(args)
+        # Pipeline runs the full fetch stage (OA PDF acquisition), which
+        # requires polite_email for Unpaywall and Retraction Watch. Fail
+        # fast here rather than letting every paper succeed through verify
+        # and then error out mid-pipeline at fetch.
+        api_errors = check_api_config(config, needs_email=True)
+        if api_errors:
+            for e in api_errors:
+                logger.error(f"  ✗ {e}")
+            return 2
         output = Path(args.output) if getattr(args, "output", None) else None
         run_full_pipeline(
             Path(args.workspace),
@@ -181,6 +191,20 @@ def run_eval_real_world(args: argparse.Namespace) -> int:
         from eval_real_world.runner import run_report
 
         run_report(Path(args.results_dir))
+        return 0
+
+    if action == "fetch":
+        from eval_real_world.fetch import run_fetch_eval
+
+        output = Path(args.output) if getattr(args, "output", None) else None
+        download = Path(args.download) if getattr(args, "download", None) else None
+        asyncio.run(
+            run_fetch_eval(
+                output_dir=output,
+                download_to=download,
+                email=getattr(args, "email", ""),
+            )
+        )
         return 0
 
     return 0

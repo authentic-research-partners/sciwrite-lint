@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sciwrite-lint"
-version = "0.2.2"
+version = "0.3.0"
 description = "A linter for scientific manuscripts — reference verification, consistency checking, and structural validation."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
@@ -42,10 +42,13 @@ dependencies = [
     "sqlite-vec>=0.1.6",
     "torch>=2.5",
     "transformers>=4.50",
-    "Pillow>=12.0",
-    "pypdf>=6.0",
+    "Pillow>=12.2",
+    "pypdf>=6.10.2",
     "pypdfium2>=5.0",
     "pdf2image>=1.17",
+    "lxml>=6.1",
+    "pypandoc-binary>=1.15",
+    "rfc3986>=2.0",
 ]
 
 [project.urls]
@@ -57,7 +60,7 @@ Paper = "https://arxiv.org/abs/2604.08501"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "pytest-xdist>=3.0",
 ]
 
@@ -106,5 +109,5 @@ DEP003 = ["sciwrite_lint", "evals", "eval_real_world"]
 plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 # No py.typed marker or typeshed stubs available
-module = ["bibtexparser", "sqlite_vec", "pypdf", "pypdfium2", "pypdfium2.raw", "transformers", "pdf2image"]
+module = ["bibtexparser", "sqlite_vec", "pypdf", "pypdfium2", "pypdfium2.raw", "transformers", "pdf2image", "lxml", "lxml.html", "lxml.html.etree", "rfc3986", "pypandoc"]
 ignore_missing_imports = true

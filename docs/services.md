@@ -56,43 +56,64 @@ sciwrite-lint vllm logs
 sciwrite-lint vllm stop
 ```
 
-Requires an NVIDIA GPU with at least 16 GB VRAM, CUDA drivers, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Runs via podman/docker with `--gpus all`.
+Requires an NVIDIA GPU with at least 16 GB VRAM, CUDA drivers, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Runs via podman/docker with `--device nvidia.com/gpu=all` (CDI).
 
 ## External APIs
 
 Used by `sciwrite-lint verify` and `sciwrite-lint fetch`. Manage credentials with `sciwrite-lint config`.
 
-### Polite email (required)
+### Polite email (required for full-text download)
 
-CrossRef, Unpaywall, and Retraction Watch require a polite email. Without it, `check` and `fetch` will refuse to run.
+Some services treat the email as **required** (the API will reject requests without it); others as an **optional polite-pool identifier** (works without, but you get slower/lower-priority service). `sciwrite-lint check` and `sciwrite-lint fetch` refuse to run without `polite_email` because their full-text stage depends on Unpaywall.
 
 ```bash
 sciwrite-lint config set-email you@example.com
 ```
 
-This writes `polite_email` into your project's `.sciwrite-lint.toml` under `[api]`. Benefits:
+This writes `polite_email` into your project's `.sciwrite-lint.toml` under `[api]`.
 
-- **CrossRef**: polite pool (faster rate limits, 3 concurrent vs 1)
-- **Unpaywall**: required for open-access PDF lookup (will not work without email)
-- **Retraction Watch**: required for retraction database download (will not work without email)
+- **Unpaywall**: **required** — API refuses requests without an email. No email → no open-access lookups at all.
+- **Retraction Watch**: **required** — CSV download endpoint rejects requests without an email. No email → no retraction checks.
+- **CrossRef**: **optional but recommended** — works without an email but puts you on a shared public pool (slower, 1 concurrent request). With email you join the polite pool (3 concurrent, priority queue).
 
-### API keys (optional)
+### API keys (optional, except NASA ADS)
 
-Optional keys increase rate limits. Check current status and get signup links:
+Most keys are *optional* — they raise rate limits but the source works without them. **NASA ADS is the exception:** the source is skipped entirely if no key is configured.
+
+| Service | Status | Get a token at | Effect of setting it |
+|---------|--------|----------------|----------------------|
+| Semantic Scholar | Optional | [semanticscholar.org/product/api#api-key](https://www.semanticscholar.org/product/api#api-key) | Dedicated rate limit (faster) |
+| NCBI (PubMed Central) | Optional | [ncbi.nlm.nih.gov/account/settings/](https://www.ncbi.nlm.nih.gov/account/settings/) | PMC rate 3 → 10 req/s |
+| CORE | Optional | [core.ac.uk/services/api](https://core.ac.uk/services/api) | Full-text PDF downloads from institutional repos |
+| NASA ADS | **Required for source** | [ui.adsabs.harvard.edu/user/settings/token](https://ui.adsabs.harvard.edu/user/settings/token) (sign in free, go to *Settings → API Token*) | Enables the NASA ADS source (5000 req/day cap) |
+
+**Setup (two ways, either works):**
+
+Via CLI (recommended):
 
 ```bash
-sciwrite-lint config show
+sciwrite-lint config set-key semantic-scholar YOUR_KEY
+sciwrite-lint config set-key ncbi YOUR_KEY
+sciwrite-lint config set-key core YOUR_KEY
+sciwrite-lint config set-key nasa-ads YOUR_TOKEN
 ```
 
-Set a key:
+By writing the file directly:
 
 ```bash
-sciwrite-lint config set-key semantic-scholar YOUR_KEY  # dedicated rate limit
-sciwrite-lint config set-key ncbi YOUR_KEY              # PMC: 3 → 10 req/s
-sciwrite-lint config set-key core YOUR_KEY              # CORE: institutional repos
+mkdir -p ~/.sciwrite-lint
+echo "YOUR_TOKEN" > ~/.sciwrite-lint/nasa_ads_api_key
+chmod 600 ~/.sciwrite-lint/nasa_ads_api_key
 ```
 
-Keys are stored in `~/.sciwrite-lint/` with 0600 permissions (owner-read only). Remove with `sciwrite-lint config remove-key <service>`.
+Check status or get signup links at any time:
+
+```bash
+sciwrite-lint config show          # lists configured/missing keys + signup URL for each
+sciwrite-lint config remove-key <service>  # delete a key
+```
+
+Keys are stored in `~/.sciwrite-lint/` with 0600 permissions (owner-read only) and never committed — they live outside your project directory so they don't get swept up by `git add`.
 
 ### API reference
 
@@ -106,6 +127,12 @@ Keys are stored in `~/.sciwrite-lint/` with 0600 permissions (owner-read only). 
 | [PubMed Central](https://www.ncbi.nlm.nih.gov/pmc/) | Full-text PDF download | No — one DOI per request |
 | [Europe PMC](https://europepmc.org/) | Full-text PDF download | No — one DOI per request |
 | [Unpaywall](https://unpaywall.org/) | Open-access PDF URLs (requires `polite_email`) | No — one DOI per request |
+| [NBER](https://www.nber.org/) | Economics working-paper title search (public JSON API) | No — one title query per request |
+| [RePEc / IDEAS](https://ideas.repec.org/) | Economics working-paper title search (HTML scrape of search results + paper landing pages) | No — one title query per request |
+| [HAL](https://hal.science/) | Title search for French national open archive (Solr JSON API; multi-discipline, ~4.5M docs) | No — one title query per request |
+| [ERIC](https://eric.ed.gov/) | Title search for US Dept of Education research (JSON API; `ED*` documents only, ~660K OA docs) | No — one title query per request |
+| [NASA ADS](https://ui.adsabs.harvard.edu/) | Title search for astronomy/astrophysics (JSON API, bearer token required — see API keys below; 5000 req/day cap) | No — one title query per request |
+| [OSF Preprints](https://osf.io/preprints/) | Title search for cross-discipline preprints (SocArXiv, PsyArXiv, ChemRxiv, EarthArXiv, EngrXiv, MetaArXiv; ~190K preprints) | No — one title query per request |
 | [CORE](https://core.ac.uk/) | Full-text PDF download (API key recommended) | No — one DOI per request |
 | [Retraction Watch](https://www.crossref.org/labs/retraction-watch/) | Retraction and expression-of-concern detection (via CrossRef Labs CSV, requires `polite_email`) | N/A — full CSV cached locally; in-memory lookups |
 
@@ -127,8 +154,9 @@ The Retraction Watch database (~60,000+ entries) is downloaded as a CSV and cach
 |------|---------|-----|
 | DOIs, arXiv IDs, PMIDs, ISBNs, LCCNs | CrossRef, OpenAlex, Semantic Scholar, Open Library, Library of Congress | Verify reference existence and metadata |
 | Paper titles and author surnames | Same APIs (search queries) | Find references that lack structured identifiers |
+| Paper titles and author surnames (first author only) | NBER, RePEc/IDEAS, HAL, ERIC, NASA ADS, OSF Preprints | Locate open-access versions of references in economics, French HSS/CS, US education research, astronomy, and cross-discipline preprint servers. First-author surname is used as a server-side filter (HAL, NASA ADS, ERIC) or free-text ranking hint (NBER, IDEAS, OSF) to disambiguate candidates when titles are short or generic. |
 | Your polite email | CrossRef, Unpaywall, Retraction Watch | Required for API access / polite pool |
-| API keys (if configured) | Semantic Scholar, CORE, NCBI | Higher rate limits |
+| API keys (if configured) | Semantic Scholar, CORE, NCBI, NASA ADS | Higher rate limits; NASA ADS requires a key to use the source at all |
 
 All external API calls use HTTPS. Note: while no manuscript text is sent, the pattern of reference queries (titles, authors, DOIs) could allow an API provider or network observer to infer your research topic.
 
@@ -200,10 +228,10 @@ backend = "vllm"    # or "transformers" (default)
 
 ```bash
 # Or via CLI flag (overrides config)
-sciwrite-lint check --paper paper_a --vision-backend vllm
+sciwrite-lint check --paper my-paper --vision-backend vllm
 
 # Standalone
-sciwrite-lint vision --paper paper_a --backend vllm
+sciwrite-lint vision --paper my-paper --backend vllm
 ```
 
 **GPU memory sharing (transformers backend):** On WSL2, CUDA memory overcommit lets the 2B VL model share VRAM with vLLM transparently. On native Linux, auto-resolves to CPU.
@@ -216,4 +244,4 @@ sciwrite-lint vision --paper paper_a --backend vllm
 
 **Requires:** `poppler-utils` installed system-side (for TikZ figure rendering from compiled PDFs). All Python dependencies are included in `pip install sciwrite-lint`.
 
-Can also run standalone: `sciwrite-lint vision --paper paper_a`.
+Can also run standalone: `sciwrite-lint vision --paper my-paper`.

@@ -24,7 +24,9 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 
 # Calibration spec (paper list, download URLs, ordinal constraints).
-CALIBRATION_MANIFEST = (Path(__file__).resolve().parent / "calibration_manifest.md").resolve()
+CALIBRATION_MANIFEST = (
+    Path(__file__).resolve().parent / "calibration_manifest.md"
+).resolve()
 
 # Runtime data directory: PDFs download here on first run, workspaces and
 # results are generated here.  Entirely gitignored — no tracked files.
@@ -421,7 +423,9 @@ def run_calibration(
         pdf_path = calibration_dir / filename
         if not pdf_path.exists():
             # Auto-download from MANIFEST.md URLs
-            fails = download_missing_pdfs(calibration_dir, CALIBRATION_MANIFEST, [filename])
+            fails = download_missing_pdfs(
+                calibration_dir, CALIBRATION_MANIFEST, [filename]
+            )
             if fails or not pdf_path.exists():
                 skipped.append(name)
                 continue

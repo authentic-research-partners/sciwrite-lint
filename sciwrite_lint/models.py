@@ -84,6 +84,7 @@ class Citation(BaseModel):
         "skipped",
         "web_verified",
         "web_dead",
+        "web_blocked",
         "manual",
     ] = ""
     api_source: str = ""
@@ -108,6 +109,7 @@ class CitationMetadata(BaseModel):
         "skipped",
         "web_verified",
         "web_dead",
+        "web_blocked",
         "manual",
     ] = ""
 

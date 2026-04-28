@@ -1,8 +1,12 @@
-"""CLI handlers for misc commands (init, parse, override, dismiss-claim, grobid, vllm, services)."""
+"""Live-refresh terminal monitor for GROBID + vLLM.
+
+Shared by ``sciwrite-lint containers monitor`` and ``sciwrite-lint vllm monitor``.
+Contains the rich Table/Panel builders, stage-label dictionaries, small
+formatting helpers, and the main event loop.
+"""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import subprocess
 from pathlib import Path
@@ -12,277 +16,7 @@ if TYPE_CHECKING:
     from rich.panel import Panel
     from rich.table import Table
 
-from loguru import logger
-
-from sciwrite_lint.config import LintConfig, load_config
-
-
-def run_init(args: argparse.Namespace) -> int:
-    """Initialize a sciwrite-lint project in the current directory."""
-    from sciwrite_lint.config import init_project
-
-    success, message = init_project(force=args.force)
-    print(message)
-    return 0 if success else 1
-
-
-def run_parse(args: argparse.Namespace) -> int:
-    """Parse PDFs via GROBID and store results + embeddings."""
-    from sciwrite_lint.references.reference_store import (
-        parse_all_missing,
-        parse_and_embed,
-    )
-
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
-
-    config = _load_config(args)
-    pc = _resolve_paper(config, args.paper)
-    if not pc:
-        return 2
-    ws = config.paper_workspace(pc.name)
-    ws.ensure_dirs()
-    refs_dir = ws.root
-    force = getattr(args, "fresh", False)
-    embed = not getattr(args, "no_embed", False)
-
-    if args.key:
-        # Parse a single reference by key
-        from sciwrite_lint.references.metadata import load_metadata
-
-        meta = load_metadata(args.key, refs_dir)
-        if not meta:
-            print(f"No metadata for '{args.key}'. Run 'sciwrite-lint verify' first.")
-            return 1
-        local_file = meta.access.get("local_file", "")
-        if not local_file or not local_file.endswith(".pdf"):
-            print(f"'{args.key}' has no PDF (local_file={local_file!r})")
-            return 1
-        pdf_path = refs_dir / local_file
-        if not pdf_path.exists():
-            print(f"PDF not found: {pdf_path}")
-            return 1
-
-        print(f"Parsing {args.key} ({pdf_path.name})...")
-        text, chunks = asyncio.run(
-            parse_and_embed(args.key, pdf_path, refs_dir, force=force, embed=embed)
-        )
-        if text:
-            suffix = f", {chunks} chunks embedded" if chunks else ""
-            print(
-                f"  Done: {len(text)} chars, stored in references/parsed/{args.key}.md{suffix}"
-            )
-        else:
-            print("  Failed (is GROBID running? sciwrite-lint containers start)")
-            return 1
-        return 0
-
-    # Parse all PDFs with local files
-    print("Parsing all references with local PDFs...")
-    from sciwrite_lint.pdf.grobid import is_grobid_running
-
-    if not asyncio.run(is_grobid_running()):
-        logger.error("GROBID not running. Start with: sciwrite-lint containers start")
-        return 1
-
-    results = asyncio.run(parse_all_missing(refs_dir, force=force))
-
-    cached = sum(1 for v in results.values() if v == "cached")
-    parsed = sum(1 for v in results.values() if v == "parsed")
-    failed = sum(1 for v in results.values() if v == "failed")
-
-    # Embed newly parsed references
-    if embed and parsed:
-        logger.info(f"Computing embeddings for {parsed} newly parsed references...")
-        for key, status in results.items():
-            if status == "parsed":
-                md_path = refs_dir / "parsed" / f"{key}.md"
-                if md_path.exists():
-                    try:
-                        from sciwrite_lint.references.reference_store import (
-                            compute_and_store_embeddings,
-                        )
-
-                        text = md_path.read_text(encoding="utf-8")
-                        n = compute_and_store_embeddings(key, text, refs_dir)
-                        print(f"    {key}: {n} chunks")
-                    except ImportError:
-                        print(
-                            "    Embeddings skipped (pip install sentence-transformers)"
-                        )
-                        break
-                    except Exception as e:
-                        print(f"    {key}: error — {e}")
-
-    print(f"\n  Summary: {cached} cached, {parsed} parsed, {failed} failed")
-    if failed:
-        for key, status in results.items():
-            if status == "failed":
-                print(f"    FAILED: {key}")
-
-    return 0
-
-
-def run_override(args: argparse.Namespace) -> int:
-    """Manually override a citation's verification tier."""
-    from datetime import date
-
-    from sciwrite_lint.references.metadata import (
-        compute_tier,
-        load_metadata,
-        save_metadata,
-    )
-    from sciwrite_lint.models import CitationMetadata
-
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
-
-    config = _load_config(args)
-    pc = _resolve_paper(config, args.paper)
-    if not pc:
-        return 2
-    ws = config.paper_workspace(pc.name)
-    refs_dir = ws.root
-
-    key = args.key
-    meta = load_metadata(key, refs_dir)
-
-    if args.clear:
-        if not meta or not meta.manual_override:
-            print(f"No override found for '{key}'.")
-            return 1
-        meta.manual_override = {}
-        meta.access["tier"] = compute_tier(meta)
-        save_metadata(meta, refs_dir)
-        print(f"Cleared override for '{key}'. Tier reverted to {meta.access['tier']}.")
-        return 0
-
-    if not meta:
-        meta = CitationMetadata(key=key)
-        meta.bibitem = {"source_papers": []}
-        meta.access = {
-            "tier": "",
-            "local_file": None,
-            "oa_url": None,
-            "oa_source": None,
-        }
-        meta.canonical = {}
-        meta.api_match = "manual"
-
-    meta.manual_override = {
-        "tier": args.tier,
-        "reason": args.reason,
-        "date": str(date.today()),
-    }
-    meta.access["tier"] = compute_tier(meta)
-    save_metadata(meta, refs_dir)
-
-    print(f"Override set for '{key}':")
-    print(f"  Tier: {args.tier}")
-    print(f"  Reason: {args.reason}")
-    print(f"  Date: {date.today()}")
-    print()
-    print("This override is preserved across verify runs.")
-    return 0
-
-
-def run_dismiss_claim(args: argparse.Namespace) -> int:
-    """Dismiss a claim verification finding as false positive."""
-    from datetime import date
-
-    from sciwrite_lint.__main__ import _load_config
-
-    config = _load_config(args)
-    ws = config.paper_workspace(args.paper)
-    if not ws.root.exists():
-        print(
-            f"No workspace found for paper '{args.paper}'. "
-            f"Run 'sciwrite-lint check --paper {args.paper}' first."
-        )
-        return 1
-
-    from sciwrite_lint.references.workspace_db import (
-        clear_claim_dismissal,
-        dismiss_claim,
-        find_claim,
-        get_db,
-        list_claims_for_key,
-    )
-
-    with get_db(ws.root) as conn:
-        claim = find_claim(conn, args.key, args.line)
-
-        if not claim:
-            print(f"No claim found for key='{args.key}' line={args.line}.")
-            print(f"Available claims for '{args.key}':")
-            for c in list_claims_for_key(conn, args.key):
-                print(
-                    f"  line {c.get('line')}: {c.get('verdict')} \u2014 "
-                    f"{c.get('context', '')[:80]}"
-                )
-            return 1
-
-        claim_id = claim["id"]
-
-        if args.clear:
-            if not claim.get("dismissed"):
-                print(f"Claim not dismissed: {args.key} line {args.line}")
-                return 1
-            clear_claim_dismissal(conn, claim_id)
-            print(f"Cleared dismissal for {args.key} (line {args.line}).")
-            return 0
-
-        dismiss_claim(conn, claim_id, reason=args.reason, date_str=str(date.today()))
-
-    v = claim.get("verdict", "?")
-    print(f"Dismissed: {args.key} (line {args.line}) \u2014 {v}")
-    print(f"  Reason: {args.reason}")
-    print(f"  Date: {date.today()}")
-    print()
-    print("This claim will be shown separately in summaries and UI.")
-    return 0
-
-
-def run_grobid(args: argparse.Namespace) -> int:
-    """Manage GROBID container."""
-    from sciwrite_lint.pdf.grobid import (
-        CONTAINER_IMAGE,
-        CONTAINER_NAME,
-        CONTAINER_RUNTIME,
-        is_grobid_running,
-        start_grobid,
-        stop_grobid,
-    )
-
-    config = load_config(
-        Path(args.config) if hasattr(args, "config") and args.config else None
-    )
-
-    if args.action == "status":
-        if asyncio.run(is_grobid_running()):
-            print("GROBID: running at http://localhost:8070")
-        else:
-            print("GROBID: not running")
-            print("  Start with: sciwrite-lint containers start")
-            print(
-                f"  Or manually: {CONTAINER_RUNTIME} run -d --name {CONTAINER_NAME} "
-                f"--memory {config.grobid_memory} -p 8070:8070 {CONTAINER_IMAGE}"
-            )
-        return 0
-    elif args.action == "start":
-        print(f"Starting GROBID container (memory limit: {config.grobid_memory})...")
-        if asyncio.run(
-            start_grobid(memory=config.grobid_memory, image=config.grobid_image)
-        ):
-            print("GROBID: running at http://localhost:8070")
-            return 0
-        else:
-            print("GROBID: failed to start within 60s")
-            return 1
-    elif args.action == "stop":
-        stop_grobid()
-        print("GROBID: stopped")
-        return 0
-
-    return 0
+from sciwrite_lint.config import LintConfig
 
 
 def _print_container_logs(runtime: str, name: str, tail: int = 15) -> None:
@@ -783,7 +517,6 @@ def _build_batch_stages_panel(
 
     from sciwrite_lint.references.workspace_db import PIPELINE_STAGES
 
-    # Load stages for all papers
     all_stages: list[tuple[str, list[dict[str, str | float | None]]]] = []
     for paper, ws_root in papers:
         stages = _load_stages(ws_root)
@@ -795,7 +528,6 @@ def _build_batch_stages_panel(
 
     now = _time.time()
 
-    # Build table: Paper | Stage1 | Stage2 | ...
     table = Table(box=None, padding=(0, 1), show_header=True)
     table.add_column("Paper", style="bold", min_width=12)
     for stage_name in PIPELINE_STAGES:
@@ -805,13 +537,11 @@ def _build_batch_stages_panel(
             min_width=5,
         )
 
-    # Count how many are running / done / failed across all papers
     n_running = 0
     n_done = 0
     n_failed = 0
 
     for paper, stages in all_stages:
-        # Build a lookup: stage_name → stage dict
         stage_map = {str(s["stage"]): s for s in stages}
         cells: list[Text] = []
         for stage_name in PIPELINE_STAGES:
@@ -843,7 +573,6 @@ def _build_batch_stages_panel(
                 cells.append(Text(".", style="dim"))
         table.add_row(paper, *cells)
 
-    # Title with summary counts
     parts = [f"{len(all_stages)} papers"]
     if n_running:
         parts.append(f"{n_running} stages running")
@@ -889,7 +618,6 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
 
     console = Console()
     endpoint = config.llm_endpoint
-    # Extract port for consistent panel titles (e.g. "localhost:5001")
     from urllib.parse import urlparse
 
     _parsed_ep = urlparse(endpoint)
@@ -901,7 +629,6 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
     prev_gen_tokens = 0.0
     prev_preemptions = 0.0
     prev_time = 0.0
-    # Per-vision-model throughput state (keyed by model name)
     vm_prev: dict[str, dict[str, float]] = {}
     runs_cache: list[dict] | None = None
     runs_cache_time = 0.0
@@ -961,7 +688,6 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                     model_name = models[0] if models else "unknown"
                     metrics = _fetch_vllm_metrics_full(endpoint)
 
-                    # Throughput deltas
                     prompt_tok = float(metrics.get("prompt_tokens_total", 0.0))
                     gen_tok = float(metrics.get("generation_tokens_total", 0.0))
                     cur_preemptions = float(metrics.get("num_preemptions", 0.0))
@@ -1037,7 +763,6 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                         vm_cname = vllm_container_name(vm)
                         vm_metrics = _fetch_vllm_metrics_full(vm_endpoint)
 
-                        # Per-model throughput deltas
                         vp = vm_prev.setdefault(
                             vm,
                             {
@@ -1098,16 +823,10 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                         )
 
                 # --- Active runs + pipeline stages (DB-driven) ---
-                # Detect runs with in-progress pipeline stages by scanning
-                # workspace.db files referenced from usage.db. Works for
-                # CLI runs, eval runs, and batch-staged runs alike —
-                # no process name matching needed.
                 from sciwrite_lint.usage import find_active_db_runs
 
                 active_db_runs = find_active_db_runs()
 
-                # Group by PID: single-paper runs get a detailed panel,
-                # multi-paper batch runs get one compact table.
                 by_pid: dict[int, list[dict]] = {}
                 for db_run in active_db_runs:
                     pid = db_run.get("pid", 0)
@@ -1196,7 +915,6 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                         )
                     )
 
-                # Footer
                 footer = Text.from_markup(
                     f"[dim]Refreshing every {interval:.0f}s — Ctrl+C to exit[/]"
                 )
@@ -1212,298 +930,3 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
 def _run_vllm_monitor(config: LintConfig, interval: float) -> int:
     """Live-refresh terminal monitor (vLLM only, via ``sciwrite-lint vllm monitor``)."""
     return _run_containers_monitor(config, interval)
-
-
-def run_containers(args: argparse.Namespace) -> int:
-    """Manage both GROBID and vLLM containers together."""
-    from sciwrite_lint.pdf.grobid import (
-        CONTAINER_NAME as GROBID_CONTAINER,
-        CONTAINER_RUNTIME,
-        container_memory_status,
-        gpu_memory_status,
-        is_grobid_running,
-        start_grobid,
-        stop_grobid,
-    )
-    from sciwrite_lint.vllm.vllm_server import (
-        VISION_MODELS,
-        _check_api_health,
-        _container_name as vllm_container_name,
-        _container_running,
-        _detect_container_runtime,
-        start_container,
-        stop_container,
-    )
-
-    config = load_config(
-        Path(args.config) if hasattr(args, "config") and args.config else None
-    )
-    action = args.action
-
-    if action == "status":
-        # --- summary ---
-        runtime = _detect_container_runtime()
-        grobid_up = asyncio.run(is_grobid_running())
-        if grobid_up:
-            mem = container_memory_status(CONTAINER_RUNTIME, GROBID_CONTAINER)
-            suffix = f"  RAM: {mem}" if mem else ""
-            print(f"GROBID:  running at http://localhost:8070{suffix}")
-        else:
-            print("GROBID:  not running")
-
-        endpoint = config.llm_endpoint
-        health = asyncio.run(_check_api_health(endpoint))
-        if health:
-            models = [m["id"] for m in health.get("data", [])]
-            vllm_name = vllm_container_name(config.llm_model)
-            mem = container_memory_status(runtime, vllm_name) if runtime else None
-            mem_str = f"  RAM: {mem}" if mem else ""
-            print(
-                f"vLLM (text):   running at {endpoint} ({', '.join(models)}){mem_str}"
-            )
-            # Show GPU details on second line
-            vram = gpu_memory_status()
-            metrics = _fetch_vllm_metrics(endpoint)
-            if vram:
-                used_gb = vram[0] / (1024**3)
-                total_gb = vram[1] / (1024**3)
-                vram_str = (
-                    f"{used_gb:.1f}GB / {total_gb:.1f}GB ({vram[0] / vram[1]:.0%})"
-                )
-            else:
-                vram_str = None
-            gpu_parts = [f"VRAM: {vram_str}"] if vram_str else []
-            if metrics:
-                gpu_parts.append(metrics)
-            if gpu_parts:
-                print(f"               {', '.join(gpu_parts)}")
-        else:
-            print("vLLM (text):   not running")
-
-        # Vision vLLM status
-        runtime = _detect_container_runtime()
-        vision_up = False
-        for vm in VISION_MODELS:
-            vm_name = vllm_container_name(vm)
-            if runtime and _container_running(runtime, vm_name):
-                from sciwrite_lint.vllm.vllm_server import MODELS
-
-                vm_profile = MODELS[vm]
-                vm_port = vm_profile.get("port", 5002)
-                vm_endpoint = f"http://localhost:{vm_port}/v1"
-                vm_health = asyncio.run(_check_api_health(vm_endpoint))
-                if vm_health:
-                    vm_models = [m["id"] for m in vm_health.get("data", [])]
-                    mem = container_memory_status(runtime, vm_name) if runtime else None
-                    mem_str = f"  RAM: {mem}" if mem else ""
-                    print(
-                        f"vLLM (vision): running at {vm_endpoint}"
-                        f" ({', '.join(vm_models)}){mem_str}"
-                    )
-                else:
-                    print("vLLM (vision): loading (container up, API not ready)")
-                vision_up = True
-            else:
-                print("vLLM (vision): not running")
-
-        # --- commands ---
-        print()
-        print("Commands:")
-        if not grobid_up or not health:
-            print(
-                "  sciwrite-lint containers start            # start GROBID + text vLLM"
-            )
-        if not vision_up:
-            print(
-                "  sciwrite-lint containers start --vision   # also start vision vLLM"
-            )
-        print("  sciwrite-lint containers stop             # stop all")
-        print("  sciwrite-lint grobid start|stop|status    # manage GROBID alone")
-        print("  sciwrite-lint vllm start|stop|status      # manage vLLM alone")
-        print("  sciwrite-lint vllm logs [-f]              # follow vLLM logs")
-
-        # --- logs ---
-        if runtime:
-            log_containers = [
-                ("GROBID", GROBID_CONTAINER),
-                ("vLLM (text)", vllm_container_name(config.llm_model)),
-            ]
-            for vm in VISION_MODELS:
-                log_containers.append(("vLLM (vision)", vllm_container_name(vm)))
-            for label, name in log_containers:
-                result = subprocess.run(
-                    [runtime, "container", "inspect", name],
-                    capture_output=True,
-                )
-                if result.returncode != 0:
-                    continue
-                print(f"\n{'─' * 60}")
-                print(f"{label} logs (last 15 lines):")
-                print(f"{'─' * 60}")
-                _print_container_logs(runtime, name, tail=15)
-
-        return 0
-
-    elif action == "start":
-        failed = False
-        update = getattr(args, "update", False)
-        vision = getattr(args, "vision", False)
-
-        if update:
-            print(f"Pulling GROBID image: {config.grobid_image}")
-            subprocess.run([CONTAINER_RUNTIME, "pull", config.grobid_image])
-
-        print(f"Starting GROBID container (memory limit: {config.grobid_memory})...")
-        if asyncio.run(
-            start_grobid(memory=config.grobid_memory, image=config.grobid_image)
-        ):
-            print("GROBID: running at http://localhost:8070")
-        else:
-            print("GROBID: failed to start within 60s")
-            failed = True
-
-        model = getattr(args, "model", None)
-        ret = start_container(config, model=model, pull=update)
-        if ret != 0:
-            failed = True
-
-        if vision:
-            for vm in VISION_MODELS:
-                ret = start_container(config, model=vm, pull=update)
-                if ret != 0:
-                    failed = True
-
-        return 1 if failed else 0
-
-    elif action == "stop":
-        stop_grobid()
-        print("GROBID: stopped")
-        stop_container(config, model=getattr(args, "model", None))
-        # Also stop any running vision containers
-        for vm in VISION_MODELS:
-            stop_container(config, model=vm)
-        return 0
-
-    elif action == "restart":
-        model = getattr(args, "model", None)
-        recreate = getattr(args, "recreate", False)
-        runtime = _detect_container_runtime()
-
-        stop_grobid()
-        stop_container(config, model=model)
-        for vm in VISION_MODELS:
-            stop_container(config, model=vm)
-
-        if recreate and runtime:
-            # Remove containers so they get recreated with current config
-            print("Removing containers to apply current config...")
-            subprocess.run(
-                [runtime, "rm", GROBID_CONTAINER],
-                capture_output=True,
-            )
-            vllm_name = vllm_container_name(config.llm_model)
-            subprocess.run(
-                [runtime, "rm", vllm_name],
-                capture_output=True,
-            )
-            for vm in VISION_MODELS:
-                subprocess.run(
-                    [runtime, "rm", vllm_container_name(vm)],
-                    capture_output=True,
-                )
-
-        print("Containers stopped. Restarting...")
-        args.action = "start"
-        return run_containers(args)
-
-    elif action == "monitor":
-        return _run_containers_monitor(config, interval=getattr(args, "interval", 2))
-
-    return 0
-
-
-def run_vllm(args: argparse.Namespace) -> int:
-    """Dispatch vllm subcommands."""
-    from sciwrite_lint.vllm.vllm_server import (
-        container_logs,
-        remove_container,
-        start_container,
-        status,
-        stop_container,
-    )
-
-    config = load_config(
-        Path(args.config) if hasattr(args, "config") and args.config else None
-    )
-    action = args.vllm_action
-
-    if action == "status":
-        return status(config)
-    elif action == "start":
-        return start_container(config, model=args.model, pull=args.update)
-    elif action == "stop":
-        return stop_container(config, model=args.model)
-    elif action == "logs":
-        return container_logs(
-            config, model=args.model, follow=args.follow, tail=args.tail
-        )
-    elif action == "rm":
-        return remove_container(config, model=args.model, force=args.force)
-    elif action == "monitor":
-        return _run_vllm_monitor(config, interval=args.interval)
-
-    return 0
-
-
-def run_vision(args: argparse.Namespace) -> int:
-    """Extract and describe manuscript figures.
-
-    Supports two backends:
-    - transformers (default): Qwen3-VL-2B in-process, no container needed
-    - vllm: Qwen3-VL-8B-FP8 via container on port 5002
-
-    Populates the vision cache (``vision_cache`` table in workspace.db) so
-    that full-paper consistency checks can use figure descriptions.
-
-    Normally runs automatically as part of ``sciwrite-lint check``.
-    This command is for running vision separately (e.g. to pre-warm cache).
-    """
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
-
-    config = _load_config(args)
-
-    # CLI flags override config
-    backend = getattr(args, "backend", None)
-    if backend:
-        config.vision_backend = backend
-    device = getattr(args, "device", None) or config.vision_device
-    fresh = getattr(args, "fresh", False)
-
-    pc = _resolve_paper(config, args.paper)
-    if not pc:
-        return 2
-
-    if not pc.file_path.exists():
-        logger.error(f"File not found: {pc.file_path}")
-        return 1
-
-    from sciwrite_lint.vision.pipeline import run_vision_pipeline
-
-    config.current_paper = pc.name
-    result = run_vision_pipeline(
-        pc.file_path,
-        config,
-        paper_name=pc.name,
-        device=device,
-        fresh=fresh,
-    )
-
-    if result:
-        print(f"Described figures for {pc.name} — cached in workspace.")
-        print(
-            "Run 'sciwrite-lint check' to use figure descriptions in consistency checks."
-        )
-    else:
-        print(f"No figures found in {pc.file_path.name}")
-
-    return 0

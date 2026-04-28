@@ -165,6 +165,73 @@ def word_count(text: str) -> int:
     return len(cleaned.split())
 
 
+_PROSE_NON_ENV_NAMES = (
+    "figure",
+    "figure*",
+    "table",
+    "table*",
+    "equation",
+    "equation*",
+    "align",
+    "align*",
+    "tikzpicture",
+    "lstlisting",
+    "verbatim",
+    "minted",
+)
+
+_PROSE_NON_ENV_RE = re.compile(
+    r"\\begin\{("
+    + "|".join(re.escape(e) for e in _PROSE_NON_ENV_NAMES)
+    + r")\}.*?\\end\{\1\}",
+    re.DOTALL,
+)
+
+
+def strip_non_prose_environments_preserve_lines(text: str) -> str:
+    """Blank out float/math environments while preserving line count.
+
+    Used before paragraph splitting so environments do not fragment
+    paragraphs or pollute prose content. Replaces each environment with
+    as many newlines as it contained, so line numbers in the stripped
+    text match line numbers in the source. Target envs are non-prose
+    (figures, tables, math displays, verbatim) — their contents are not
+    reviewable as prose regardless of which check is running.
+    """
+
+    def _blank(m: re.Match[str]) -> str:
+        return "\n" * m.group(0).count("\n")
+
+    return _PROSE_NON_ENV_RE.sub(_blank, text)
+
+
+def split_paragraphs(text: str) -> list[tuple[int, str]]:
+    """Split text into paragraphs with 1-indexed start line numbers.
+
+    Paragraphs are separated by one or more blank lines. Each returned
+    ``line_number`` points at the first non-empty line of the paragraph
+    within ``text``. Useful for prose-level checks that need paragraph
+    boundaries plus source line tracking.
+    """
+    results: list[tuple[int, str]] = []
+    lines = text.split("\n")
+    current: list[str] = []
+    start_line: int | None = None
+    for idx, line in enumerate(lines, 1):
+        if line.strip():
+            if start_line is None:
+                start_line = idx
+            current.append(line)
+        else:
+            if current and start_line is not None:
+                results.append((start_line, "\n".join(current)))
+                current = []
+                start_line = None
+    if current and start_line is not None:
+        results.append((start_line, "\n".join(current)))
+    return results
+
+
 def split_sentences(text: str) -> list[tuple[int, str]]:
     """Split text into sentences with line numbers.
 

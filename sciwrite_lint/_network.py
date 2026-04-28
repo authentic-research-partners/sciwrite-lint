@@ -147,8 +147,15 @@ async def stream_with_limit(
     size we actually read.  Always enforces *max_bytes* on the
     decompressed data stream via ``aiter_bytes()``.
 
-    Returns a synthetic ``httpx.Response`` with the full body populated.
-    Raises ``ResponseTooLarge`` if the limit is exceeded.
+    Returns a synthetic ``httpx.Response`` with the full decompressed body
+    populated.  Raises ``ResponseTooLarge`` if the limit is exceeded.
+
+    Content-Encoding (and the now-stale Content-Length) is stripped from the
+    synthetic response's headers. ``aiter_bytes`` already decompressed the
+    body; leaving the header intact would cause httpx to try to decompress a
+    second time when the caller reads ``.content``, which fails with
+    ``DecodingError: incorrect header check`` on servers that gzip real
+    binary content (observed on ``mpra.ub.uni-muenchen.de`` serving PDFs).
     """
     async with client.stream("GET", url, **kwargs) as resp:  # type: ignore[arg-type]
         # Non-success responses are small — read eagerly for diagnostics
@@ -176,9 +183,16 @@ async def stream_with_limit(
             chunks.append(chunk)
 
     body = b"".join(chunks)
+    synthetic_headers = httpx.Headers(
+        [
+            (name, value)
+            for name, value in resp.headers.raw
+            if name.lower() not in (b"content-encoding", b"content-length")
+        ]
+    )
     return httpx.Response(
         status_code=resp.status_code,
-        headers=resp.headers,
+        headers=synthetic_headers,
         content=body,
         request=resp.request,
     )

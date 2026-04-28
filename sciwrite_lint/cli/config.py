@@ -30,6 +30,11 @@ _API_KEY_SERVICES: dict[str, dict[str, str]] = {
         "description": "CORE (institutional repository access)",
         "url": "https://core.ac.uk/services/api",
     },
+    "nasa-ads": {
+        "file": "nasa_ads_api_key",
+        "description": "NASA ADS (astronomy/astrophysics; 5000 req/day per token)",
+        "url": "https://ui.adsabs.harvard.edu/user/settings/token",
+    },
 }
 
 _KEY_DIR = Path.home() / ".sciwrite-lint"

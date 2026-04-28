@@ -434,17 +434,52 @@ def _warm_llm_cache(cases: list[SyntheticCase], config: LintConfig) -> None:
                 f.write(tex_content)
                 tex_paths.append((content_hash, Path(f.name)))
 
-        # Run sequentially when figure descriptions differ (config state is shared)
+        # Split papers by whether they need per-paper config-state setup.
+        # Figure-workspace setup mutates config.current_paper + references_dir,
+        # so those cases must stay sequential. Plain text cases share the
+        # same neutral config and can fan out concurrently via asyncio.gather,
+        # which is what unlocks vLLM's continuous-batching throughput for
+        # per-sentence checks like prose-quality (each case contributes
+        # ~1 query; 33 cases × 1 = 33 in-flight queries instead of 1).
+        simple_jobs: list[tuple[str, Path]] = []
+        complex_jobs: list[tuple[str, Path, str]] = []
         for content_hash, tex_path in tex_paths:
             _, fig_descs = unique_papers[content_hash]
-            tmp_dir = None
-            try:
-                if fig_descs:
-                    tmp_dir = Path(tempfile.mkdtemp())
-                    _setup_figure_workspace(fig_descs, config, tmp_dir)
-                else:
-                    config.current_paper = ""
+            if fig_descs:
+                complex_jobs.append((content_hash, tex_path, fig_descs))
+            else:
+                simple_jobs.append((content_hash, tex_path))
 
+        async def _run_one_simple(
+            content_hash: str, tex_path: Path
+        ) -> tuple[str, list]:
+            try:
+                return (
+                    content_hash,
+                    await run_llm_checks_batched(tex_path, config),
+                )
+            except Exception as e:
+                logger.error("LLM batch failed for {}: {}", content_hash, e)
+                return (content_hash, [])
+
+        if simple_jobs:
+            config.current_paper = ""
+            results = await asyncio.gather(
+                *(_run_one_simple(ch, tp) for ch, tp in simple_jobs)
+            )
+            for content_hash, findings in results:
+                _llm_result_cache[content_hash] = findings
+            for _, tex_path in simple_jobs:
+                tex_path.unlink(missing_ok=True)
+
+        # Figure-workspace cases still run sequentially because each mutates
+        # config.current_paper / references_dir to a different temp workspace.
+        import shutil
+
+        for content_hash, tex_path, fig_descs in complex_jobs:
+            tmp_dir = Path(tempfile.mkdtemp())
+            try:
+                _setup_figure_workspace(fig_descs, config, tmp_dir)
                 result = await run_llm_checks_batched(tex_path, config)
                 _llm_result_cache[content_hash] = result
             except Exception as e:
@@ -452,10 +487,7 @@ def _warm_llm_cache(cases: list[SyntheticCase], config: LintConfig) -> None:
                 _llm_result_cache[content_hash] = []
             finally:
                 tex_path.unlink(missing_ok=True)
-                if tmp_dir:
-                    import shutil
-
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         config.references_dir = saved_refs_dir
         config.current_paper = saved_paper

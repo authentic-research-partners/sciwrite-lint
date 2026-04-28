@@ -2,7 +2,7 @@
 
 Stores CitationMetadata in workspace.db (citation_metadata table).
 All functions accept ``references_dir`` — the per-paper workspace root
-(e.g. ``references/paper_a/``).
+(e.g. ``references/my-paper/``).
 """
 
 from __future__ import annotations
@@ -66,8 +66,14 @@ def compute_tier(meta: CitationMetadata) -> str:
 
     Web resources:
       T1: URL alive + content downloaded locally
-      T2: URL alive but no local content
+      T2: URL alive but no local content, OR blocked by site (unverifiable)
       T3: Dead URL
+
+    ``web_blocked`` → T2 rather than T3: a WAF 403 is evidence the site is
+    operational (just refusing us), so the URL is probably still valid. The
+    user gets a WARN from ``reference-exists`` telling them to verify
+    manually; downstream claim-verification skips it the same as a T2
+    without local content.
     """
     # Manual override takes precedence
     if meta.manual_override and meta.manual_override.get("tier"):
@@ -80,6 +86,8 @@ def compute_tier(meta: CitationMetadata) -> str:
         return "T3"
     if meta.api_match == "web_verified":
         return "T1" if has_local else "T2"
+    if meta.api_match == "web_blocked":
+        return "T2"
 
     # Academic path
     is_verified = meta.api_match in ("verified", "mismatch")

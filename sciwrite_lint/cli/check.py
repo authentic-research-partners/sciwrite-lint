@@ -10,6 +10,7 @@ from typing import Any
 from loguru import logger
 
 from sciwrite_lint.config import LintConfig
+from sciwrite_lint.exceptions import LLMConnectionError, SciWriteLintError
 from sciwrite_lint.models import Finding
 from sciwrite_lint.report import format_findings
 
@@ -28,23 +29,35 @@ async def run_llm_checks_batched(
     tex_path: Path,
     config: LintConfig,
 ) -> list[Finding]:
-    """Run all LLM checks batched by thinking mode.
+    """Run all LLM checks batched by (thinking, temperature, n_samples).
 
     All LLM checks must implement the build_queries/process_results protocol:
     - build_queries(tex_path, config) -> list of (system, user, schema, name) tuples
     - process_results(results) -> list[Finding]
 
-    Each check can set a ``thinking`` attribute ("off", "low", "medium", "high")
-    to control chain-of-thought reasoning. Queries are grouped by thinking mode
-    so each group runs as a single batch call.
+    Each check can set ``thinking`` ("off", "low", "medium", "high") to
+    control chain-of-thought reasoning, ``temperature`` (float, or None
+    for the model default) to control sampling, and ``n_samples`` (int,
+    default 1) to request multiple samples per query for self-consistency
+    voting. Queries are grouped by the ``(thinking, temperature,
+    n_samples)`` triple so each group runs as a single batch call with
+    the correct sampling regime.
+
+    When n_samples > 1, each query contributes ``n_samples`` consecutive
+    entries to its check's result slice — process_results is responsible
+    for slicing in groups of n_samples and voting.
     """
     from sciwrite_lint.llm_utils import llm_query_batch
 
-    # Phase 1: collect queries, grouped by thinking mode. max_tokens is
-    # a fixed per-model constant (see VLLM_MODELS); output length is
+    # Phase 1: collect queries, grouped by (thinking, temperature, n). max_tokens
+    # is a fixed per-model constant (see VLLM_MODELS); output length is
     # bounded by Pydantic schema constraints, not per-query overrides.
-    queries_by_mode: dict[str, list[tuple[str, str, dict, str]]] = {}
-    check_slices: list[tuple[Any, Any, str, int, int]] = []
+    BatchKey = tuple[str, float | None, int]
+    queries_by_key: dict[BatchKey, list[tuple[str, str, dict, str]]] = {}
+    # Slice entry: (meta, fn, key, start_query_idx, query_count, n_samples).
+    # The result slice for this check is
+    #   key_results[start_query_idx * n : (start_query_idx + query_count) * n]
+    check_slices: list[tuple[Any, Any, BatchKey, int, int, int]] = []
     build_failures: list[Finding] = []
 
     for meta, fn in checks:
@@ -54,11 +67,14 @@ async def run_llm_checks_batched(
         try:
             queries = build(tex_path, config)
             thinking = getattr(fn, "thinking", "off")
-            if thinking not in queries_by_mode:
-                queries_by_mode[thinking] = []
-            start = len(queries_by_mode[thinking])
-            queries_by_mode[thinking].extend(queries)
-            check_slices.append((meta, fn, thinking, start, len(queries)))
+            temperature = getattr(fn, "temperature", None)
+            n_samples = int(getattr(fn, "n_samples", 1))
+            key: BatchKey = (thinking, temperature, n_samples)
+            if key not in queries_by_key:
+                queries_by_key[key] = []
+            start = len(queries_by_key[key])
+            queries_by_key[key].extend(queries)
+            check_slices.append((meta, fn, key, start, len(queries), n_samples))
         except Exception as e:
             logger.error(f"Check {meta.id} build_queries failed: {e}")
             build_failures.append(
@@ -70,28 +86,39 @@ async def run_llm_checks_batched(
                 )
             )
 
-    # Phase 2: one batch call per thinking mode
-    results_by_mode: dict[str, list[dict | None]] = {}
-    for mode, batch_queries in queries_by_mode.items():
+    # Phase 2: one batch call per (thinking, temperature, n) group
+    results_by_key: dict[BatchKey, list[dict | None]] = {}
+    for key, batch_queries in queries_by_key.items():
+        thinking, temperature, n_samples = key
         if batch_queries:
             try:
-                results_by_mode[mode] = await llm_query_batch(
+                results_by_key[key] = await llm_query_batch(
                     batch_queries,
                     config=config,
-                    thinking=mode,
+                    thinking=thinking,
+                    temperature=temperature,
+                    n=n_samples,
                 )
+            except LLMConnectionError:
+                raise
             except Exception as e:
-                logger.error(f"LLM batch query failed (thinking={mode}): {e}")
-                results_by_mode[mode] = [None] * len(batch_queries)
+                logger.error(
+                    f"LLM batch query failed (thinking={thinking}, "
+                    f"temperature={temperature}, n={n_samples}): {e}"
+                )
+                results_by_key[key] = [None] * (len(batch_queries) * n_samples)
 
-    # Phase 3: distribute results to each check
+    # Phase 3: distribute results to each check. Slice bounds scale by
+    # n_samples — each query contributed n consecutive result entries.
     findings: list[Finding] = []
-    for meta, fn, mode, start, count in check_slices:
+    for meta, fn, key, start, count, n_samples in check_slices:
         try:
             if count > 0:
                 process = getattr(fn, "process_results")
-                mode_results = results_by_mode.get(mode, [])
-                check_results = mode_results[start : start + count]
+                key_results = results_by_key.get(key, [])
+                result_start = start * n_samples
+                result_end = (start + count) * n_samples
+                check_results = key_results[result_start:result_end]
                 check_findings = process(check_results)
             else:
                 check_findings = []
@@ -136,6 +163,25 @@ def run_check(args: argparse.Namespace) -> int:
     vision_backend = getattr(args, "vision_backend", None)
     if vision_backend:
         config.vision_backend = vision_backend
+
+    # --checks filter: disable every registered check not in the allow-list.
+    # Validated against the registry so a typo fails loudly rather than
+    # silently matching nothing.
+    only_checks_raw = getattr(args, "checks", None)
+    if only_checks_raw:
+        from sciwrite_lint.checks.registry import list_checks
+
+        wanted = {c.strip() for c in only_checks_raw.split(",") if c.strip()}
+        known = {m.id for m in list_checks()}
+        unknown = wanted - known
+        if unknown:
+            logger.error(
+                "Unknown check IDs in --checks: {}. Run `sciwrite-lint checks` "
+                "to see available IDs.",
+                ", ".join(sorted(unknown)),
+            )
+            return 2
+        config.disabled_rules = config.disabled_rules | (known - wanted)
 
     # Explicit file — no paper config, run text + LLM rules only
     if hasattr(args, "file") and args.file:
@@ -198,7 +244,11 @@ def run_check(args: argparse.Namespace) -> int:
 
         asyncio.run(build_pdf_context(tex_path, config))
 
-    findings = asyncio.run(run_full_check(name, tex_path, pc, config, fresh=fresh))
+    try:
+        findings = asyncio.run(run_full_check(name, tex_path, pc, config, fresh=fresh))
+    except SciWriteLintError as e:
+        logger.error(f"Tool error: {e}")
+        return 2
 
     label = f"{name} ({tex_path.name})" if name != tex_path.stem else tex_path.name
     print()
@@ -245,6 +295,9 @@ def _run_check_batch(
         results = asyncio.run(
             run_papers_staged(staged_input, fresh=fresh, concurrency=concurrency)
         )
+    except SciWriteLintError as e:
+        logger.error(f"Tool error: {e}")
+        return 2
     except Exception as e:
         logger.error(f"Batch-staged pipeline failed: {e}")
         return 1
@@ -335,6 +388,14 @@ def _print_integrity_summary(
             reliability["tier"] = meta.access.get("tier", "")
             reliability["retracted"] = bool(meta.canonical.get("retracted"))
             reliability["metadata_mismatches"] = meta.mismatches
+            # For T2 refs, the pipeline records *why* no PDF was acquired
+            # (e.g. "image-only PDF — GROBID cannot parse (from nber);
+            # HAL: no match; …"). Surface this in the report so humans
+            # and agents can see which sources were tried and what each
+            # one said, without reading the debug log.
+            acquisition_reason = meta.access.get("acquisition_reason", "")
+            if acquisition_reason:
+                reliability["acquisition_reason"] = acquisition_reason
             consistency = ref_internal_scores.get(key) if ref_internal_scores else None
             reliability["consistency"] = (
                 round(consistency, 4) if consistency is not None else None
@@ -424,7 +485,11 @@ def run_check_pdf(pdf_path: Path, config: LintConfig, fmt: str) -> int:
         findings.extend(await pipeline_llm_batched(pdf_path, config))
         return findings
 
-    findings = asyncio.run(_do_check())
+    try:
+        findings = asyncio.run(_do_check())
+    except SciWriteLintError as e:
+        logger.error(f"Tool error: {e}")
+        return 2
 
     label = pdf_path.name
     print()
@@ -456,7 +521,11 @@ def run_check_quick(
             continue
 
         findings = run_text_checks(tex_path, config)
-        findings.extend(asyncio.run(pipeline_llm_batched(tex_path, config)))
+        try:
+            findings.extend(asyncio.run(pipeline_llm_batched(tex_path, config)))
+        except SciWriteLintError as e:
+            logger.error(f"Tool error: {e}")
+            return 2
 
         label = f"{name} ({tex_path.name})" if name != tex_path.stem else tex_path.name
         format_findings(findings, label, fmt=fmt, color=config.color)

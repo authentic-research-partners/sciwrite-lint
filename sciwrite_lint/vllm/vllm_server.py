@@ -27,6 +27,7 @@ MODELS: dict[str, dict] = {
         "served_name": "qwen3-8b-fp8",
         "reasoning_parser": "qwen3",  # server-side <think> parsing
         "kind": "text",
+        "gpu_memory_utilization": 0.85,
     },
     "gemma3": {
         "hf_model": "RedHatAI/gemma-3-12b-it-FP8-dynamic",

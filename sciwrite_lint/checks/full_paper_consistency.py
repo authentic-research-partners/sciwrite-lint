@@ -96,11 +96,15 @@ Return {{"issues": []}} if no genuine issues found.\
 _OVERHEAD_TOKENS = 2500
 
 # Output budget reserved for the JSON response. Matches the vLLM model
-# default (VLLM_MODELS["qwen3"]["max_tokens"]). FullPaperIssueList caps
-# the issues list at 5, which fits comfortably in this budget.
+# default (VLLM_MODELS["qwen3"]["max_tokens"]) — this is the response
+# portion only. ``llm_query`` adds the active thinking budget on top
+# when dispatching to vLLM. FullPaperIssueList caps the issues list at
+# 5, which fits comfortably in this budget.
 _OUTPUT_RESERVE_TOKENS = 2048
 
 # Worst-case thinking budget (medium preset, see THINKING_PRESETS).
+# Reserved in the context-window accounting alongside the output budget;
+# the sum matches what ``llm_query`` sends as ``max_tokens``.
 _THINKING_RESERVE_TOKENS = 1024
 
 # Rough chars-to-tokens ratio (conservative: overestimates tokens).

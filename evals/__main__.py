@@ -138,6 +138,32 @@ def main(argv: list[str] | None = None) -> int:
     p_rw_report.add_argument("--results-dir", default="real_world_results")
     p_rw_report.set_defaults(func=run_eval_real_world)
 
+    p_rw_fetch = rw_sub.add_parser(
+        "fetch",
+        help=(
+            "OA fetch-only eval: run the 14-source waterfall on a curated "
+            "set of references; no GROBID, no LLM. Smoke-tests the "
+            "fulltext/ adapters + ranker + validator against live endpoints."
+        ),
+    )
+    p_rw_fetch.add_argument(
+        "--output",
+        help="Directory to write oa_fetch_eval.json into (default: no file output)",
+    )
+    p_rw_fetch.add_argument(
+        "--download",
+        help=(
+            "Keep downloaded PDFs in this directory. Without --download, "
+            "downloads go to a temporary directory and are discarded."
+        ),
+    )
+    p_rw_fetch.add_argument(
+        "--email",
+        default="",
+        help="Polite-contact email for Unpaywall + User-Agent.",
+    )
+    p_rw_fetch.set_defaults(func=run_eval_real_world)
+
 
     args = parser.parse_args(argv)
     if not args.command:
