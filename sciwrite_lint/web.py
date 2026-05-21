@@ -23,7 +23,7 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 from pydantic import BaseModel
 
-from sciwrite_lint._network import is_hostname_safe
+from sciwrite_lint._network import is_hostname_safe, ssrf_safe_client
 
 # Defaults (overridable via LintConfig)
 _DEFAULT_TIMEOUT = 15.0
@@ -60,8 +60,7 @@ BROWSER_HEADERS: dict[str, str] = {
 # server itself. Every other non-2xx/3xx outcome is ambiguous —
 # server refusals (401/403/429/451), server errors (5xx), TLS failures,
 # timeouts, connection errors, and decoding failures all mean "we could
-# not verify", not "URL is gone". Per ``.claude/rules/error-handling.md``:
-# "API failures are not empty results."
+# not verify", not "URL is gone". API failures are not empty results.
 _DEAD_STATUS_CODES: frozenset[int] = frozenset({404, 410})
 
 # HTTP 4xx codes where HEAD→GET escalation may succeed. Some WAFs refuse
@@ -266,9 +265,8 @@ async def check_url(
     """
     own_client = client is None
     if own_client:
-        client = httpx.AsyncClient(
+        client = ssrf_safe_client(
             timeout=timeout,
-            follow_redirects=True,
             headers=_request_headers(user_agent),
         )
     assert client is not None
@@ -588,8 +586,19 @@ def _resolve_url(target: str, source_url: str) -> str:
 
 
 def _html_to_markdown(html: str, url: str) -> str | None:
-    """Convert HTML to clean markdown using trafilatura."""
+    """Convert HTML to clean markdown using trafilatura.
+
+    ``output_format='markdown'`` is required: the default ('txt') emits
+    paragraphs separated by single ``\\n`` rather than blank lines, which
+    looks like prose but isn't valid markdown — the downstream chunker
+    splits on ``\\n\\n`` and would see one giant blob instead of real
+    paragraphs. Without this argument, web archives lose paragraph
+    structure on conversion (regression: collinsbrown1991_web.md was
+    78 KB with only 3 ``\\n\\n`` separators total).
+    """
     import trafilatura
 
-    result = trafilatura.extract(html, url=url, include_links=True)
+    result = trafilatura.extract(
+        html, url=url, include_links=True, output_format="markdown"
+    )
     return result or None

@@ -34,19 +34,28 @@ def format_terminal(
     findings: list[Finding],
     file: str,
     color: bool = True,
-    out: TextIO = sys.stdout,
+    out: TextIO | None = None,
 ) -> None:
     """Print findings using rich for styled terminal output."""
+    # Resolve sys.stdout at call time. Capturing it as a function default
+    # binds at module-import time, which under pytest+xdist can outlive
+    # the worker's original stdout — leading to "I/O operation on closed
+    # file" when format_terminal is called from a later test where capsys
+    # has rotated the stream.
+    if out is None:
+        out = sys.stdout
+
+    if not findings:
+        out.write(f"{file} — no issues found.\n")
+        out.flush()
+        return
+
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
 
     console = Console(file=out, force_terminal=color, no_color=not color)
-
-    if not findings:
-        console.print(f"{file} — no issues found.")
-        return
 
     errors = sum(1 for f in findings if f.level == "error")
     warnings = sum(1 for f in findings if f.level == "warning")

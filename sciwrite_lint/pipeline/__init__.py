@@ -28,10 +28,10 @@ from sciwrite_lint.pipeline.claims import (
     _stage_claims,
 )
 from sciwrite_lint.pipeline.embeddings import (
-    _extract_claim_texts,
     _run_embeddings_for_paper,
     _verify_embeddings_or_raise,
     ensure_claim_query_vectors,
+    persist_manuscript_citations,
 )
 from sciwrite_lint.pipeline.fetch import _stage_fetch
 from sciwrite_lint.pipeline.orchestration import (
@@ -53,13 +53,15 @@ from sciwrite_lint.pipeline.pdf_context import (
 )
 from sciwrite_lint.pipeline.ref_internal import _stage_ref_internal
 from sciwrite_lint.pipeline.runners import (
+    EmbedderWarmer,
     _batch_cited_vision,
     _batch_cited_vision_entry,
     _batch_embed,
     _batch_embed_entry,
     _batch_vision,
     _embed_keys,
-    _encode_claim_queries,
+    _embed_keys_via_stdin,
+    _encode_missing_claim_queries,
     _run_embeddings_subprocess,
 )
 from sciwrite_lint.pipeline.swap import (
@@ -102,6 +104,7 @@ __all__ = [
     "run_text_checks",
     "run_llm_checks_batched",
     "ensure_claim_query_vectors",
+    "persist_manuscript_citations",
     # Internal names used by tests / evals / subprocess launchers
     "_backup_workspace",
     "_batch_cited_vision",
@@ -115,8 +118,9 @@ __all__ = [
     "_collect_parse_hashes",
     "_confirm_venue_findings",
     "_embed_keys",
-    "_encode_claim_queries",
-    "_extract_claim_texts",
+    "_embed_keys_via_stdin",
+    "_encode_missing_claim_queries",
+    "EmbedderWarmer",
     "_format_usage_summary",
     "_is_vllm_responding",
     "_manuscript_needs_inference",

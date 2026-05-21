@@ -16,8 +16,6 @@ if the response doesn't match.
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -123,7 +121,7 @@ def run_claude(
     except FileNotFoundError:
         raise RuntimeError(
             "claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code"
-        )
+        ) from None
     finally:
         if temp_path:
             temp_path.unlink(missing_ok=True)
@@ -177,7 +175,7 @@ async def run_claude_async(
     except FileNotFoundError:
         raise RuntimeError(
             "claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code"
-        )
+        ) from None
     finally:
         if temp_path:
             temp_path.unlink(missing_ok=True)
@@ -200,24 +198,13 @@ async def run_claude_async(
 def extract_json_from_response(text: str) -> dict[str, Any] | None:
     """Extract JSON from Claude CLI text response.
 
-    Handles ``<thinking>`` blocks, markdown code fences, and stray text
-    around the JSON object.
+    Thin alias over :func:`sciwrite_lint.llm_utils.extract_json` — handles
+    ``<thinking>`` blocks, markdown code fences, and stray text around
+    the JSON object.
     """
-    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip(), flags=re.MULTILINE)
-    text = re.sub(r"\n?```\s*$", "", text.strip(), flags=re.MULTILINE)
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    return None
+    from sciwrite_lint.llm_utils import extract_json
+
+    return extract_json(text)
 
 
 def validate_response(

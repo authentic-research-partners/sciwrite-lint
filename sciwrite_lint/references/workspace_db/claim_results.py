@@ -10,7 +10,8 @@ from typing import Any
 _SELECT_FULL = (
     "SELECT id, ref_key, claim_text, line, context, verdict, confidence, "
     "relevant_quote, explanation, backend, model, ref_type, cite_purpose, "
-    "dismissed, reviewer_comment, dismissed_date "
+    "skip_reason, dismissed, reviewer_comment, dismissed_date, "
+    "resolved_at, evidence_locator "
     "FROM claim_results"
 )
 
@@ -31,11 +32,14 @@ def _row_to_claim_dict(row: tuple[Any, ...]) -> dict[str, Any]:
         "model": row[10],
         "ref_type": row[11],
         "cite_purpose": row[12],
+        "skip_reason": row[13],
+        "resolved_at": row[17],
+        "evidence_locator": row[18],
     }
-    if row[13]:
+    if row[14]:
         d["dismissed"] = True
-        d["reviewer_comment"] = row[14]
-        d["dismissed_date"] = row[15]
+        d["reviewer_comment"] = row[15]
+        d["dismissed_date"] = row[16]
     return d
 
 
@@ -53,8 +57,9 @@ def save_claim_results(
             """INSERT INTO claim_results
                (ref_key, claim_text, line, context, verdict, confidence,
                 relevant_quote, explanation, backend, model, ref_type,
-                cite_purpose, dismissed, reviewer_comment, dismissed_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cite_purpose, skip_reason, dismissed, reviewer_comment,
+                dismissed_date, resolved_at, evidence_locator)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 r.get("key", ""),
@@ -69,12 +74,27 @@ def save_claim_results(
                 r.get("model", ""),
                 r.get("ref_type", ""),
                 r.get("cite_purpose", r.get("citation_purpose", "")),
+                r.get("skip_reason", ""),
                 int(r.get("dismissed", False)),
                 r.get("reviewer_comment", ""),
                 r.get("dismissed_date", ""),
+                r.get("resolved_at", ""),
+                r.get("evidence_locator", ""),
             ),
         )
     conn.commit()
+
+
+def count_by_verdict(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return verdict → count for the current run's claim_results.
+
+    Used by the integrity summary to show verified / SKIPPED /
+    CANNOT_DETERMINE counts without loading every row.
+    """
+    rows = conn.execute(
+        "SELECT verdict, COUNT(*) FROM claim_results GROUP BY verdict"
+    ).fetchall()
+    return {row[0]: int(row[1]) for row in rows}
 
 
 def load_claim_results(

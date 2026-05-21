@@ -17,105 +17,24 @@ from pathlib import Path
 from loguru import logger
 
 from sciwrite_lint import __version__
-from sciwrite_lint.config import LintConfig, PaperConfig, load_config
+from sciwrite_lint.cli._common import (
+    _classify_verify_issue as _classify_verify_issue,
+    _load_config as _load_config,
+    _paper_names as _paper_names,
+    _resolve_input_files as _resolve_input_files,
+    _resolve_paper as _resolve_paper,
+    _setup_logging,
+)
+from sciwrite_lint.config import LintConfig, load_config
 from sciwrite_lint.vllm.vllm_server import MODELS as _VLLM_MODELS
 
 _ALL_MODELS = sorted(_VLLM_MODELS.keys())
 _TEXT_MODELS = [k for k, v in _VLLM_MODELS.items() if v["kind"] == "text"]
 
-
-# ---------------------------------------------------------------------------
-# Helpers (used by CLI submodules)
-# ---------------------------------------------------------------------------
-
-
-def _load_config(args: argparse.Namespace) -> LintConfig:
-    """Load config from --config flag or auto-discovery."""
-    if getattr(args, "config", None):
-        return load_config(Path(args.config))
-
-    config = load_config(None)
-    if config.config_path is None:
-        from sciwrite_lint.config import _detect_papers
-
-        logger.error("No .sciwrite-lint.toml found.")
-        detected = _detect_papers()
-        if detected:
-            logger.error("  Detected .tex files:")
-            for p in detected:
-                bib = f" (bib: {p['bib']})" if p.get("bib") else ""
-                logger.error(f"    {p['file_path']}{bib}")
-        logger.error("  Run: sciwrite-lint init")
-        logger.error("  Then review .sciwrite-lint.toml before running checks.")
-    return config
-
-
-def _resolve_paper(config: LintConfig, name: str) -> PaperConfig | None:
-    """Resolve a paper name to its config. Print error if not found."""
-    pc = config.get_paper(name)
-    if not pc:
-        if config.papers:
-            names = ", ".join(p.name for p in config.papers)
-            logger.error(f"Unknown paper '{name}'. Registered: {names}")
-        else:
-            logger.error(f"Unknown paper '{name}'. No papers registered.")
-            logger.error(
-                f"  Add [[papers]] to {config.config_path or '.sciwrite-lint.toml'}"
-            )
-    return pc
-
-
-def _paper_names(config: LintConfig) -> list[str]:
-    return [p.name for p in config.papers]
-
-
-def _resolve_input_files(
-    args: argparse.Namespace, config: LintConfig
-) -> list[tuple[str, Path]]:
-    """Resolve which files to check (.tex or .pdf).
-
-    Priority: positional file > --paper (from config) > all papers in config.
-    Returns list of (name, path) pairs.
-    """
-    if hasattr(args, "file") and args.file:
-        p = Path(args.file)
-        return [(p.stem, p)]
-
-    paper_filter = getattr(args, "paper", None)
-    if paper_filter:
-        pc = _resolve_paper(config, paper_filter)
-        if not pc:
-            return []
-        return [(pc.name, pc.file_path)]
-
-    if config.papers:
-        return [(pc.name, pc.file_path) for pc in config.papers]
-
-    logger.error("No papers registered. Either:")
-    logger.error("  sciwrite-lint check <file.tex|file.pdf> — check a specific file")
-    logger.error(
-        "  sciwrite-lint init                      — set up project with [[papers]]"
-    )
-    return []
-
-
-def _classify_verify_issue(issue: str) -> tuple[str, str]:
-    """Classify a verify issue string into (level, rule_id) for findings."""
-    from sciwrite_lint.pipeline import _classify_verify_issue as _classify
-
-    return _classify(issue)
-
-
-def _setup_logging(config: LintConfig) -> None:
-    """Configure loguru rotating file sink from config."""
-    logger.add(
-        "logs/sciwrite-lint.log",
-        rotation="10 MB",
-        retention="30 days",
-        compression="gz",
-        level=config.log_level,
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {name}:{function}:{line} | {message}",
-    )
+_REPLACE_HELP = (
+    "Stop any other running vLLM container first (two vLLMs can't "
+    "share the GPU safely; without this flag the start is refused)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +124,48 @@ def main(argv: list[str] | None = None) -> int:
     # --- checks ---
     p_checks = sub.add_parser("checks", help="List all registered checks")
     p_checks.set_defaults(func=run_checks_list)
+
+    # --- aicode-lint (optional — only registered when the WIP module is installed) ---
+    # ``sciwrite_lint.aicode_lint`` is excluded from the public release rsync
+    # while it stabilizes. Use ``importlib.util.find_spec`` to check whether
+    # the module is present rather than try/except ImportError (separately
+    # banned). Public installs (pip from PyPI) won't have it; dev installs
+    # do. Check the parent ``sciwrite_lint.aicode_lint`` first because
+    # ``find_spec`` raises ``ModuleNotFoundError`` on a missing intermediate
+    # path; once the parent is confirmed present, the child lookup is safe.
+    import importlib.util as _importlib_util
+
+    if _importlib_util.find_spec("sciwrite_lint.aicode_lint") is not None:
+        from sciwrite_lint.aicode_lint.cli import run_aicode_lint
+
+        p_aicode = sub.add_parser(
+            "aicode-lint",
+            help="LLM code review on Python sources via local vLLM (semantic antipatterns)",
+        )
+        p_aicode.add_argument(
+            "paths",
+            nargs="*",
+            help="Files, directories, or globs to scan (default: sciwrite_lint/**/*.py)",
+        )
+        p_aicode.add_argument(
+            "--rules",
+            default=None,
+            metavar="ID[,ID...]",
+            help="Run only the listed rule IDs (comma-separated). Default: all built-in rules.",
+        )
+        p_aicode.add_argument(
+            "--list-rules",
+            action="store_true",
+            help="Print the rule registry and exit.",
+        )
+        p_aicode.add_argument(
+            "--format",
+            choices=["terminal", "json"],
+            default=None,
+            help="Output format (default: terminal).",
+        )
+        p_aicode.add_argument("--config", help="Path to .sciwrite-lint.toml")
+        p_aicode.set_defaults(func=run_aicode_lint)
 
     # --- init ---
     p_init = sub.add_parser(
@@ -457,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also start vision vLLM (qwen3-vl-8b-fp8 on port 5002)",
     )
+    p_containers.add_argument("--replace", action="store_true", help=_REPLACE_HELP)
     p_containers.add_argument("--config", help="Path to .sciwrite-lint.toml")
     p_containers.set_defaults(func=run_containers)
 
@@ -488,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Pull latest vLLM image before starting",
     )
+    p_vllm_start.add_argument("--replace", action="store_true", help=_REPLACE_HELP)
     p_vllm_start.add_argument("--config", help="Path to .sciwrite-lint.toml")
     p_vllm_start.set_defaults(func=run_vllm)
 

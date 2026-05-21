@@ -81,22 +81,22 @@ sciwrite-lint contributions paper.pdf --format json
 
 ### Optimizations
 
-Three models — a vision model (Qwen3-VL-2B default, or 8B FP8 via `--vision-backend vllm` for +15% accuracy), an embedding model (Arctic Embed), and an 8B reasoning LLM (Qwen3 via vLLM) — share a single consumer GPU. Models run in separate pipeline stages; on WSL2, CUDA memory virtualization pages idle allocations to system RAM, letting all three share physical VRAM. FP8 weights and KV cache (Ada Lovelace+) and per-paper SQLite caching with hash-based invalidation are baseline. On top of that:
+Three models — a vision model (Qwen3-VL-2B default, or 8B FP8 via `--vision-backend vllm` for +15% accuracy), an embedding model (Arctic Embed), and an 8B reasoning LLM (Qwen3 via vLLM) — share a single consumer GPU. The pipeline runs each in its own stage and explicitly stops one before starting the next, so only one ever owns GPU memory at a time (same code path on WSL2 and native Linux). FP8 weights and KV cache (Ada Lovelace+) and per-paper SQLite caching with hash-based invalidation are baseline. On top of that:
 
-- **Semantic section filtering** — embedding-based KNN retrieval sends only the ~5 most relevant sections per claim to the LLM, reducing LLM calls ~4x
+- **Cost-aware verify-claim ladder** — sentence chunk → paragraph chunk → whole section. Each level fans out top-N candidates in parallel; stops on a conclusive verdict. Most claims resolve at the cheap sentence level (~200-token prompts) instead of paying for whole sections (~5K tokens), with full-section escalation reserved for hard cases
 - **Prefix-first prompt structure** — shared context placed before variable content in all prompts, maximizing vLLM's automatic prefix caching
-- **Per-call-site thinking budgets** — each LLM call site has empirically tuned (max_tokens, thinking_preset) pairs, measured via grid search to maximize detection quality
+- **Per-call-site thinking budgets** — each LLM call site has its own (max_tokens, thinking_preset) pair tuned for that check's prompt and output shape
 - **Adaptive embedding batches** — token-aware batch sizing gives ~50x speedup over CPU while staying within VRAM limits
 - **Batch-staged multi-paper pipeline** — when checking 2+ papers, GPU models load once per batch (vision/embedding/cited-vision) and vLLM/network stages run concurrently, giving a meaningful speedup over sequential per-paper runs. Tune via `--concurrency` (default 2, validated up to 4 on a single consumer GPU)
 - **Phased API resolution** — citations flow through OpenAlex → Semantic Scholar → CrossRef → Open Library/LoC, each phase only processing what previous phases didn't resolve
 - **14-source full-text cascade** — early exit on first successful download across arXiv, Semantic Scholar, OpenAlex, PubMed Central, Europe PMC, Unpaywall, bioRxiv, NBER, RePEc/IDEAS, HAL, ERIC, NASA ADS, OSF Preprints, CORE
 - **Live monitoring** *(advanced)* — `sciwrite-lint containers monitor` shows service health, VRAM usage, and KV cache utilization in a terminal dashboard
 
-Full pipeline on a 50-reference paper: ~30 minutes initial (dominated by downloads and claim verification), minutes on cached reruns. On native Linux, the pipeline automatically swaps vLLM containers to free GPU for embedding and vision stages (~50x faster than CPU). *(Native Linux GPU swap is preliminary — tested on WSL2 only; expected to work, may need minor fixes.)*
+Full pipeline on a 50-reference paper: ~30 minutes initial (dominated by downloads and claim verification), minutes on cached reruns. The pipeline automatically swaps vLLM containers to free GPU for embedding and vision stages (~50× faster than CPU) — same code path on WSL2 and native Linux.
 
 ## Install
 
-**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM). Developed and tested on Windows (WSL2). Native Linux is likely to work with GPU memory allocation tuning (see [docs/services.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/services.md#embedding-device)). Not tested on macOS.
+**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM). Tested on WSL2 with NVIDIA driver 546.01+. Native Linux is likely to work with GPU memory allocation tuning (see [docs/services.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/services.md#embedding-device)). Not tested on macOS.
 
 Requires [uv](https://docs.astral.sh/uv/getting-started/installation/), a container runtime (podman or docker), CUDA drivers, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
@@ -140,6 +140,14 @@ sciwrite-lint config set-email you@example.com  # required for Unpaywall + Retra
 sciwrite-lint containers start         # start GROBID + vLLM (needs GPU for vLLM)
 sciwrite-lint containers monitor       # live dashboard: service health, VRAM, KV cache
 ```
+
+### WSL2: disable CUDA Sysmem Fallback (recommended)
+
+By default Windows silently spills GPU overflow into system RAM via PCIe (30–100× slower than VRAM); you'll see this as a sudden throughput collapse during the heaviest pipeline stages with no error in the logs. Tell the NVIDIA driver to fail loudly instead:
+
+> NVIDIA Control Panel → 3D Settings → Manage 3D Settings → *CUDA - Sysmem Fallback Policy* → **Prefer No Sysmem Fallback** → Apply.
+
+Driver 546.01+. After this, WSL2 behaves like native Linux on overflow (CUDA OOM error). The pipeline already sequences GPU consumers so OOM should not happen in normal use; the setting just prevents silent slowdowns when something does go wrong. No setting needed on native Linux — `cudaMalloc` is already loud there.
 
 ![Monitor dashboard](https://github.com/authentic-research-partners/sciwrite-lint/raw/main/docs/monitor.png)
 

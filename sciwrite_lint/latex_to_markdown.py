@@ -111,8 +111,8 @@ def _clean_markdown(text: str) -> str:
     """Normalise pandoc markdown for LLM prose review.
 
     Replaces citation and reference syntax with ``[CITE]`` / ``[REF]``
-    placeholders (same as the legacy regex cleaner so the LLM prompt
-    stays stable), drops images, fixes stranded punctuation, and strips
+    placeholders (matches the LLM-prompt expectations for citation
+    surface form), drops images, fixes stranded punctuation, and strips
     heading attributes + blank-line accumulation.
     """
     text = _NBSP_RE.sub(" ", text)

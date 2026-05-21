@@ -2,10 +2,8 @@
 
 Stores chunk text + embeddings in the per-paper workspace DB
 (``references/{paper}/parsed/workspace.db``) using sqlite-vec for KNN
-retrieval.
-
-OOM-safe: encodes and inserts in small batches (EMBED_BATCH_SIZE),
-never holding all vectors in RAM at once.
+retrieval. Each key's chunks are encoded and persisted in a single
+bulk transaction — see ``store_embeddings``.
 """
 
 from __future__ import annotations
@@ -18,63 +16,55 @@ if TYPE_CHECKING:
     import numpy as np
 
 from loguru import logger
+from pydantic import BaseModel
 
 from sciwrite_lint.references.workspace_db import (
     db_path as _db_path,
-    open_db as _open_db,
+    get_db,
     serialize_f32 as _serialize_f32,
 )
 
-EMBED_BATCH_SIZE = 32  # chunks per encode + insert batch
 
-# Adaptive encode batch sizing based on token length.
-# Eager attention memory scales as O(batch * seq_len^2). With 20 GB VRAM
-# on RTX 4000 Ada and vLLM occupying ~18.6 GB (paged out on WSL2):
-#   ≤512 tokens, batch=32: ~2.5 GB peak — fits easily
-#   ≤2048 tokens, batch=8: ~5.5 GB peak — safe
-#   >2048 tokens, batch=4:  ~11 GB peak — safe on WSL2 (worst real: 3810 tokens)
-_ENCODE_TIERS: list[tuple[int, int]] = [
-    (512, 32),  # short chunks: full batch
-    (2048, 8),  # medium chunks: reduced batch
-]
-_ENCODE_BATCH_LONG = 4  # anything above the last tier threshold
+class ChunkHit(BaseModel):
+    """One KNN hit from the embedding store.
+
+    Used by the verify-claim retrieval helpers in
+    ``sciwrite_lint/references/reference_store.py`` and consumed by the
+    escalation ladder in ``sciwrite_lint/eval_claims.py``. Carries the
+    chunk text the LLM will see plus the locator information
+    (``section_title``, ``start_char``) needed to identify the chunk in
+    the source after the run.
+    """
+
+    text: str
+    section_title: str
+    granularity: str  # "paragraph" | "sentence"
+    start_char: int
+    text_len: int
+    distance: float
+    score: float
+
+
+_ENCODE_BATCH_SIZE = 32  # uniform batch; ST sorts by length internally
 
 
 def _encode_adaptive(model: object, texts: list[str]) -> np.ndarray:
-    """Encode texts with batch size adapted to token length.
+    """Encode all texts in one ``model.encode`` call.
 
-    Short texts (≤512 tokens) are encoded in large batches for throughput.
-    Long texts get smaller batches to stay within GPU memory limits.
-    Results are reassembled in the original order.
+    Sentence-transformers sorts inputs by length internally and batches
+    the sorted sequence, so a single uniform batch size keeps padding
+    overhead minimal — short texts batch with short, long with long.
+    Under SDPA + bf16 a batch of 32 max-length chunks costs ~3 GB peak,
+    well inside the 20 GB GPU ceiling.
     """
-    import numpy as np
+    from sciwrite_lint.references._embed_timing import time_phase
 
-    tokenizer = model.tokenizer  # type: ignore[attr-defined]
-    # Tokenize to get lengths (fast, CPU-only)
-    token_counts = [len(tokenizer(t, truncation=False)["input_ids"]) for t in texts]
-
-    # Group indices by tier
-    groups: dict[int, list[int]] = {}
-    for idx, tok_len in enumerate(token_counts):
-        batch_size = _ENCODE_BATCH_LONG
-        for threshold, bs in _ENCODE_TIERS:
-            if tok_len <= threshold:
-                batch_size = bs
-                break
-        groups.setdefault(batch_size, []).append(idx)
-
-    # Encode each group with its batch size, collect results
-    results: dict[int, np.ndarray] = {}
-    for batch_size, indices in groups.items():
-        group_texts = [texts[i] for i in indices]
-        vecs = model.encode(  # type: ignore[attr-defined]
-            group_texts, normalize_embeddings=True, batch_size=batch_size
+    with time_phase("gpu_encode"):
+        return model.encode(  # type: ignore[attr-defined]
+            texts,
+            normalize_embeddings=True,
+            batch_size=_ENCODE_BATCH_SIZE,
         )
-        for i, idx in enumerate(indices):
-            results[idx] = vecs[i]
-
-    # Reassemble in original order
-    return np.stack([results[i] for i in range(len(texts))])
 
 
 def _ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
@@ -115,41 +105,50 @@ def has_embeddings(
     - No embeddings exist for this key
     - Embedding was interrupted (complete=0) — cleans up broken data
     - Embedding model changed (stored model != current model)
+
+    A fresh workspace DB without the ``ref_status`` / ``embed_meta`` tables
+    is treated as "no embeddings yet" — that is the only swallowed
+    sqlite error. Any other failure (corrupt DB, sqlite-vec extension
+    load failure, locked DB) is allowed to propagate so the caller
+    surfaces the real fault instead of silently re-embedding forever.
     """
     db_file = _db_path(references_dir)
     if not db_file.exists():
         return False
-    try:
-        conn = _open_db(references_dir)
 
+    with get_db(references_dir) as conn:
         # Check completion status
-        row = conn.execute(
-            "SELECT complete FROM ref_status WHERE ref_key = ?", (ref_key,)
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT complete FROM ref_status WHERE ref_key = ?", (ref_key,)
+            ).fetchone()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return False
+            raise
         if row is None:
-            conn.close()
             return False
         if row[0] != 1:
             # Incomplete — clean up broken data
             logger.debug("Cleaning up incomplete embeddings for {}", ref_key)
             _delete_ref_data(conn, ref_key)
             conn.commit()
-            conn.close()
             return False
 
         # Check model compatibility
         if model_name is not None:
-            stored = conn.execute(
-                "SELECT value FROM embed_meta WHERE key='model'"
-            ).fetchone()
+            try:
+                stored = conn.execute(
+                    "SELECT value FROM embed_meta WHERE key='model'"
+                ).fetchone()
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e):
+                    return False
+                raise
             if stored and stored[0] != model_name:
-                conn.close()
                 return False
 
-        conn.close()
         return True
-    except Exception:
-        return False
 
 
 def _delete_ref_data(conn: sqlite3.Connection, ref_key: str) -> int:
@@ -171,84 +170,109 @@ def store_embeddings(
     model_name: str,
     embedding_dim: int,
 ) -> int:
-    """Store chunk text + embeddings in batches (OOM-safe).
+    """Encode all chunks for a key, then bulk-insert in a single transaction.
 
     Each chunk dict must have: text, section_title, granularity, start_char.
-    Embeddings are computed internally in batches of EMBED_BATCH_SIZE.
+
+    Strategy: encode the full chunk list in one ``_encode_adaptive`` call,
+    then write rows + embeddings via two ``executemany`` calls inside a
+    single transaction (one fsync per key). Partial-key progress isn't
+    tracked — resume granularity is per-key via the ``ref_status.complete``
+    flag.
 
     Returns the number of chunks stored.
     """
+    from sciwrite_lint.references._embed_timing import time_phase
     from sciwrite_lint.references.reference_store import _get_embedding_model
 
-    conn = _open_db(references_dir)
-    _ensure_vec_table(conn, embedding_dim)
+    with get_db(references_dir) as conn:
+        _ensure_vec_table(conn, embedding_dim)
 
-    # Clear existing data for this key (including incomplete runs)
-    _delete_ref_data(conn, ref_key)
+        # Clear existing data for this key (including incomplete runs).
+        _delete_ref_data(conn, ref_key)
 
-    # Mark as in-progress (complete=0) with expected count
-    conn.execute(
-        "INSERT INTO ref_status (ref_key, expected_chunks, stored_chunks, complete) "
-        "VALUES (?, ?, 0, 0)",
-        (ref_key, len(chunks)),
-    )
-    conn.commit()
+        # Mark as in-progress (complete=0) with expected count. Committed
+        # immediately so a crash mid-encode leaves a tombstone for the next
+        # ``has_embeddings`` call to clean up.
+        conn.execute(
+            "INSERT INTO ref_status (ref_key, expected_chunks, stored_chunks, complete) "
+            "VALUES (?, ?, 0, 0)",
+            (ref_key, len(chunks)),
+        )
+        conn.commit()
 
-    model = _get_embedding_model()
-    total_stored = 0
+        if not chunks:
+            conn.execute(
+                "UPDATE ref_status SET complete = 1 WHERE ref_key = ?", (ref_key,)
+            )
+            conn.commit()
+            return 0
 
-    # Process in batches — encode + insert, then free vectors
-    for batch_start in range(0, len(chunks), EMBED_BATCH_SIZE):
-        batch = chunks[batch_start : batch_start + EMBED_BATCH_SIZE]
-        texts = [c["text"] for c in batch]
-
-        # Encode with adaptive batch size: group by token length to avoid
-        # OOM on long chunks (eager attention is O(batch * seq_len^2)).
+        # Encode every chunk for this key in one pass. ``_encode_adaptive``
+        # records the ``tokenize_lengths`` and ``gpu_encode`` phases.
+        model = _get_embedding_model()
+        texts = [c["text"] for c in chunks]
         vectors = _encode_adaptive(model, texts)
 
-        # Insert chunk metadata + vectors
-        for i, (chunk, vec) in enumerate(zip(batch, vectors)):
-            cursor = conn.execute(
-                "INSERT INTO chunks (ref_key, chunk_index, text, section_title, "
-                "granularity, start_char, text_len) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        with time_phase("db_store"):
+            # Pre-assign rowids so chunks and chunk_embeddings can be loaded
+            # via independent ``executemany`` calls without round-tripping
+            # through ``cursor.lastrowid``. SQLite is single-writer and the
+            # embedder subprocess is the only writer to this DB, so MAX(id)
+            # is stable across the read-then-insert window.
+            max_id_row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM chunks"
+            ).fetchone()
+            max_id = int(max_id_row[0])
+
+            chunk_rows = [
                 (
+                    max_id + i + 1,
                     ref_key,
-                    batch_start + i,
+                    i,
                     chunk["text"],
                     chunk["section_title"],
                     chunk["granularity"],
                     chunk["start_char"],
                     len(chunk["text"]),
-                ),
-            )
-            chunk_id = cursor.lastrowid
-            conn.execute(
-                "INSERT INTO chunk_embeddings (rowid, embedding) VALUES (?, ?)",
-                (chunk_id, _serialize_f32(vec.tolist())),
-            )
+                )
+                for i, chunk in enumerate(chunks)
+            ]
+            embedding_rows = [
+                (max_id + i + 1, _serialize_f32(vec.tolist()))
+                for i, vec in enumerate(vectors)
+            ]
 
-        conn.commit()
-        total_stored += len(batch)
+            # Single transaction wrapping both bulk inserts plus the
+            # completion update — one fsync for the whole key.
+            try:
+                conn.execute("BEGIN")
+                conn.executemany(
+                    "INSERT INTO chunks "
+                    "(id, ref_key, chunk_index, text, section_title, "
+                    "granularity, start_char, text_len) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    chunk_rows,
+                )
+                conn.executemany(
+                    "INSERT INTO chunk_embeddings (rowid, embedding) VALUES (?, ?)",
+                    embedding_rows,
+                )
+                conn.execute(
+                    "UPDATE ref_status SET stored_chunks = ?, complete = 1 "
+                    "WHERE ref_key = ?",
+                    (len(chunks), ref_key),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO embed_meta (key, value) VALUES ('model', ?)",
+                    (model_name,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
-        # Update progress
-        conn.execute(
-            "UPDATE ref_status SET stored_chunks = ? WHERE ref_key = ?",
-            (total_stored, ref_key),
-        )
-        conn.commit()
-
-        # vectors go out of scope here — GC can reclaim
-
-    # Mark complete
-    conn.execute("UPDATE ref_status SET complete = 1 WHERE ref_key = ?", (ref_key,))
-    conn.execute(
-        "INSERT OR REPLACE INTO embed_meta (key, value) VALUES ('model', ?)",
-        (model_name,),
-    )
-    conn.commit()
-    conn.close()
-
-    return total_stored
+        return len(chunks)
 
 
 def retrieve_similar(
@@ -256,82 +280,98 @@ def retrieve_similar(
     ref_key: str,
     references_dir: Path,
     top_k: int = 15,
-) -> list[dict]:
-    """Find chunks most similar to query via sqlite-vec KNN.
+    granularity: str | None = None,
+) -> list[ChunkHit]:
+    """Find chunks most similar to *query_text* via sqlite-vec KNN.
 
-    Returns list of dicts with: text, section_title, granularity, distance, score.
-    Distance is cosine distance (0 = identical, 2 = opposite).
-    Score is cosine similarity (1 - distance).
+    Distance is cosine distance (0 = identical, 2 = opposite); score is
+    cosine similarity (``1 - distance``). Returns an empty list if the
+    DB is missing, the embedding model has changed since the chunks were
+    indexed, or no pre-computed query vector is available.
+
+    When *granularity* is given (``"sentence"`` or ``"paragraph"``), the
+    rowid pre-filter additionally scopes the KNN MATCH to that
+    granularity, so the verify-claim ladder retrieves the top-N at one
+    level without sentence and paragraph chunks competing for the same
+    ranking slots.
     """
     db_file = _db_path(references_dir)
     if not db_file.exists():
         return []
 
-    conn = _open_db(references_dir)
+    with get_db(references_dir) as conn:
+        # Check model compatibility
+        stored_model = conn.execute(
+            "SELECT value FROM embed_meta WHERE key='model'"
+        ).fetchone()
+        from sciwrite_lint.references.reference_store import _get_embedding_config
 
-    # Check model compatibility
-    stored_model = conn.execute(
-        "SELECT value FROM embed_meta WHERE key='model'"
-    ).fetchone()
-    from sciwrite_lint.references.reference_store import _get_embedding_config
+        current_model, _, _ = _get_embedding_config()
+        if stored_model and stored_model[0] != current_model:
+            logger.warning(
+                "Embedding model changed ({} → {}), re-embedding needed",
+                stored_model[0],
+                current_model,
+            )
+            return []
 
-    current_model, _, _ = _get_embedding_config()
-    if stored_model and stored_model[0] != current_model:
-        logger.warning(
-            "Embedding model changed ({} → {}), re-embedding needed",
-            stored_model[0],
-            current_model,
-        )
-        conn.close()
-        return []
+        # Load pre-computed query vector from DB (encoded in Stage 4b subprocess).
+        # Never load the embedding model in the parent process — it competes
+        # with vLLM for VRAM during Stage 5 (claim verification).
+        import hashlib
 
-    # Load pre-computed query vector from DB (encoded in Stage 4b subprocess).
-    # Never load the embedding model in the parent process — it competes
-    # with vLLM for VRAM during Stage 5 (claim verification).
-    import hashlib
+        from sciwrite_lint.references.workspace_db import load_query_vector
 
-    from sciwrite_lint.references.workspace_db import load_query_vector
+        text_hash = hashlib.sha256(query_text.encode()).hexdigest()
+        query_blob = load_query_vector(conn, text_hash, current_model)
+        if query_blob is None:
+            logger.warning(
+                "No pre-computed query vector (hash {}) — "
+                "run pipeline again to pre-compute",
+                text_hash[:12],
+            )
+            return []
 
-    text_hash = hashlib.sha256(query_text.encode()).hexdigest()
-    query_blob = load_query_vector(conn, text_hash, current_model)
-    if query_blob is None:
-        logger.warning(
-            "No pre-computed query vector (hash {}) — "
-            "run pipeline again to pre-compute",
-            text_hash[:12],
-        )
-        conn.close()
-        return []
+        # KNN search scoped to target ref via rowid pre-filter.
+        # sqlite-vec supports `rowid IN (...)` during MATCH, so we restrict
+        # the search to only the target ref's chunks — no global scan needed.
+        # When granularity is given, the inner SELECT also filters by
+        # granularity so the KNN sees only chunks of that level.
+        if granularity is not None and granularity not in ("sentence", "paragraph"):
+            raise ValueError(
+                f"granularity must be 'sentence' or 'paragraph', got {granularity!r}"
+            )
 
-    # KNN search scoped to target ref via rowid pre-filter.
-    # sqlite-vec supports `rowid IN (...)` during MATCH, so we restrict
-    # the search to only the target ref's chunks — no global scan needed.
-    rows = conn.execute(
-        """
-        SELECT c.text, c.section_title, c.granularity, c.start_char,
-               c.text_len, ce.distance
-        FROM chunk_embeddings ce
-        INNER JOIN chunks c ON c.id = ce.rowid
-        WHERE ce.embedding MATCH ?
-            AND k = ?
-            AND ce.rowid IN (SELECT id FROM chunks WHERE ref_key = ?)
-        ORDER BY ce.distance
-        """,
-        (query_blob, top_k, ref_key),
-    ).fetchall()
+        inner_where = "ref_key = ?"
+        inner_params: tuple[object, ...] = (ref_key,)
+        if granularity is not None:
+            inner_where += " AND granularity = ?"
+            inner_params = (ref_key, granularity)
 
-    conn.close()
+        rows = conn.execute(
+            f"""
+            SELECT c.text, c.section_title, c.granularity, c.start_char,
+                   c.text_len, ce.distance
+            FROM chunk_embeddings ce
+            INNER JOIN chunks c ON c.id = ce.rowid
+            WHERE ce.embedding MATCH ?
+                AND k = ?
+                AND ce.rowid IN (SELECT id FROM chunks WHERE {inner_where})
+            ORDER BY ce.distance
+            """,
+            (query_blob, top_k, *inner_params),
+        ).fetchall()
 
     return [
-        {
-            "text": row[0],
-            "section_title": row[1],
-            "granularity": row[2],
-            "start_char": row[3],
-            "text_len": row[4],
-            "distance": row[5],
-            "score": 1.0 - row[5],
-        }
+        ChunkHit(
+            text=row[0],
+            section_title=row[1],
+            granularity=row[2],
+            start_char=row[3],
+            text_len=row[4],
+            distance=row[5],
+            score=1.0 - row[5],
+        )
         for row in rows
     ]
 
@@ -342,10 +382,9 @@ def delete_embeddings(ref_key: str, references_dir: Path) -> int:
     if not db_file.exists():
         return 0
 
-    conn = _open_db(references_dir)
-    count = _delete_ref_data(conn, ref_key)
-    conn.commit()
-    conn.close()
+    with get_db(references_dir) as conn:
+        count = _delete_ref_data(conn, ref_key)
+        conn.commit()
     return count
 
 
@@ -358,19 +397,18 @@ def clear_all_embeddings(references_dir: Path) -> int:
     if not db_file.exists():
         return 0
 
-    conn = _open_db(references_dir)
-    count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    conn.execute("DELETE FROM chunks")
-    conn.execute("DELETE FROM ref_status")
-    conn.execute("DELETE FROM embed_meta")
-    # Drop vec table — will be recreated with correct dim on next store
-    try:
-        conn.execute("DROP TABLE IF EXISTS chunk_embeddings")
-    except Exception as e:
-        logger.debug(f"chunk_embeddings drop skipped ({type(e).__name__}: {e})")
-    conn.commit()
-    conn.execute("VACUUM")
-    conn.close()
+    with get_db(references_dir) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        conn.execute("DELETE FROM chunks")
+        conn.execute("DELETE FROM ref_status")
+        conn.execute("DELETE FROM embed_meta")
+        # Drop vec table — will be recreated with correct dim on next store
+        try:
+            conn.execute("DROP TABLE IF EXISTS chunk_embeddings")
+        except Exception as e:
+            logger.debug(f"chunk_embeddings drop skipped ({type(e).__name__}: {e})")
+        conn.commit()
+        conn.execute("VACUUM")
     logger.info("Cleared {} embeddings from {}", count, db_file)
     return count
 
@@ -381,9 +419,11 @@ def get_stored_model(references_dir: Path) -> str | None:
     if not db_file.exists():
         return None
     try:
-        conn = _open_db(references_dir)
-        row = conn.execute("SELECT value FROM embed_meta WHERE key='model'").fetchone()
-        conn.close()
+        with get_db(references_dir) as conn:
+            row = conn.execute(
+                "SELECT value FROM embed_meta WHERE key='model'"
+            ).fetchone()
         return row[0] if row else None
-    except Exception:
+    except sqlite3.Error as e:
+        logger.debug("get_stored_model: DB read failed ({}: {})", type(e).__name__, e)
         return None

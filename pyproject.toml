@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sciwrite-lint"
-version = "0.3.0"
+version = "0.4.0"
 description = "A linter for scientific manuscripts — reference verification, consistency checking, and structural validation."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
@@ -49,6 +49,8 @@ dependencies = [
     "lxml>=6.1",
     "pypandoc-binary>=1.15",
     "rfc3986>=2.0",
+    "psutil>=5.9",
+    "annotated-types>=0.6",
 ]
 
 [project.urls]
@@ -59,9 +61,23 @@ Issues = "https://github.com/authentic-research-partners/sciwrite-lint/issues"
 Paper = "https://arxiv.org/abs/2604.08501"
 
 [project.optional-dependencies]
+# `pip install -e ".[dev]"` brings in every tool used by the mandatory checks
+# and the release pipeline. Exception: the `claude` CLI is a Node app —
+# install separately per https://docs.anthropic.com/en/docs/claude-code.
 dev = [
+    # Mandatory checks — run after every code change
     "pytest>=9.0.3",
     "pytest-xdist>=3.0",
+    "ruff>=0.15",
+    "mypy>=1.18",
+    "ast-grep-cli>=0.35",
+    # Release pipeline (scripts/release.sh phases 3–6)
+    "deptry>=0.25",
+    "bandit>=1.9",
+    "pip-audit>=2.10",
+    "pip-licenses>=5.5",
+    "twine>=6.0",
+    "build>=1.0",
 ]
 
 [project.scripts]
@@ -70,44 +86,3 @@ sciwrite-lint = "sciwrite_lint.__main__:main"
 [tool.setuptools.packages.find]
 include = ["sciwrite_lint*"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-markers = [
-    "integration: tests that read actual paper files",
-    "network: tests that make real network connections (slow)",
-]
-# PID-unique basetemp set in conftest.py — prevents FileExistsError
-# when multiple pytest processes run concurrently.
-addopts = "-n auto -p no:cacheprovider"
-
-[tool.bandit]
-skips = [
-    "B101",  # assert — used for type narrowing and internal invariants
-    "B104",  # bind 0.0.0.0 — container start commands for GROBID/vLLM
-    "B314",  # xml.etree.fromstring — parsing trusted GROBID TEI output
-    "B404",  # subprocess import — CLI tool, subprocess is core functionality
-    "B405",  # xml.etree import — parsing trusted GROBID TEI output
-    "B603",  # subprocess call — CLI invokes grobid/vllm/claude by design
-    "B607",  # partial path — CLI tools resolved via PATH
-    "B608",  # SQL string — internal usage.db, no user input in queries
-    "B615",  # HF from_pretrained without revision pin — trusted publisher (Qwen), research tool
-]
-
-[tool.deptry]
-optional_dependencies_dev_groups = ["dev"]
-
-[tool.deptry.per_rule_ignores]
-# Self-imports of shipped non-package directories
-DEP001 = ["evals", "eval_real_world", "bench"]
-# Lazy/conditional imports in optional groups — deptry can't detect these
-DEP002 = ["bibtexparser", "pdfplumber", "sentence-transformers", "numpy", "sqlite-vec", "grobid-tei-xml", "torch", "transformers", "Pillow", "pypdf", "pdf2image"]
-# Intra-package imports
-DEP003 = ["sciwrite_lint", "evals", "eval_real_world"]
-
-[tool.mypy]
-plugins = ["pydantic.mypy"]
-[[tool.mypy.overrides]]
-# No py.typed marker or typeshed stubs available
-module = ["bibtexparser", "sqlite_vec", "pypdf", "pypdfium2", "pypdfium2.raw", "transformers", "pdf2image", "lxml", "lxml.html", "lxml.html.etree", "rfc3986", "pypandoc"]
-ignore_missing_imports = true

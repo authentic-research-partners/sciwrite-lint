@@ -10,10 +10,19 @@ from sciwrite_lint.checks.registry import check
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.models import Finding
 
-from sciwrite_lint.schemas import ContribCount, vllm_schema
+from sciwrite_lint.schemas import (
+    ContribCount,
+    chars_to_word_hint,
+    pydantic_max,
+    vllm_schema_unbounded,
+)
 
 
-_CONTRIBUTION_SCHEMA = vllm_schema(ContribCount)
+_CONTRIBUTION_SCHEMA = vllm_schema_unbounded(ContribCount)
+
+# Prompt-side word target derived from the Pydantic cap — Layer 1 of
+# the schema bounds architecture (see ``schemas.py``).
+_EXPL_MAX_WORDS = chars_to_word_hint(pydantic_max(ContribCount, "explanation"))
 
 _SYSTEM = """\
 You are checking whether a scientific paper delivers on its introduction's promises.
@@ -36,9 +45,11 @@ A contribution that is simply summarized briefly still counts as delivered.
 If no explicit contribution claim is made in the introduction, set both counts \
 to 0 and mismatch to false.
 
-Reply ONLY with JSON: {"claimed_count": N, "listed_count": N, "mismatch": \
-true/false, "explanation": "..."}\
-"""
+Keep ``explanation`` under ~{expl_max_words} words.
+
+Reply ONLY with JSON: {{"claimed_count": N, "listed_count": N, "mismatch": \
+true/false, "explanation": "..."}}\
+""".format(expl_max_words=_EXPL_MAX_WORDS)
 
 
 def _build_queries(tex_path: Path, config: LintConfig):
@@ -54,12 +65,11 @@ def _build_queries(tex_path: Path, config: LintConfig):
             "Document ~{} pages — too large for structure-promises check",
             total_chars // 3500,
         )
-        _build_queries._state = (None, None)  # type: ignore[attr-defined]
-        return []
+        return [], None
 
     intro_sections = ctx.get_section_by_title("introduction", "intro")
     if not intro_sections:
-        return []
+        return [], None
     conclusion_sections = ctx.get_section_by_title(
         "conclusion", "conclusions", "discussion", "summary"
     )
@@ -75,12 +85,13 @@ def _build_queries(tex_path: Path, config: LintConfig):
         f"## INTRODUCTION\n\n{wrap_untrusted(intro_text[:4000], 'section')}\n\n"
         f"## CONCLUSION\n\n{wrap_untrusted(conclusion_text[:4000], 'section')}\n"
     )
-    _build_queries._state = (intro_sections[0], tex_path)  # type: ignore[attr-defined]
-    return [(_SYSTEM, user_prompt, _CONTRIBUTION_SCHEMA, "ContribCount")]
+    state = (intro_sections[0], tex_path)
+    queries = [(_SYSTEM, user_prompt, _CONTRIBUTION_SCHEMA, "ContribCount")]
+    return queries, state
 
 
-def _process_results(results):
-    sec, tex_path = getattr(_build_queries, "_state", (None, None))
+def _process_results(results, *, state):
+    sec, tex_path = state if state is not None else (None, None)
     result = results[0] if results else None
     findings = []
     if result and result.get("mismatch"):

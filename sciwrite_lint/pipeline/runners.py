@@ -14,6 +14,7 @@ strings, so they must remain importable from ``sciwrite_lint.pipeline``
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -100,13 +101,14 @@ def _run_embeddings_subprocess(
     keys: list[str],
     references_dir: Path,
     config: LintConfig,
-    claim_texts: list[str] | None = None,
 ) -> str:
     """Run embedding computation in a subprocess for CUDA isolation.
 
     The embedding model brings batch data to VRAM; subprocess isolation
     ensures all CUDA allocations are released when embedding finishes.
-    Also pre-computes claim query vectors if ``claim_texts`` is provided.
+    Claim query vectors are also pre-computed in the same subprocess —
+    contexts come from ``workspace.db.manuscript_citations``, so the
+    parent does not marshal claim text across the process boundary.
 
     Returns:
         Empty string on success. On failure (non-zero exit, timeout, or
@@ -114,19 +116,15 @@ def _run_embeddings_subprocess(
         tail, timeout notice, or exception message) for inclusion in the
         RuntimeError raised by ``_verify_embeddings_or_raise``.
     """
-    import json as _json
     import subprocess
     import sys
 
-    # Pass keys as comma-separated arg, references_dir, claim texts as JSON
     keys_str = ",".join(keys)
-    claims_json = _json.dumps(claim_texts or [])
     cmd = [
         sys.executable,
         "-c",
-        "import sys; "
         "from sciwrite_lint.pipeline import _embed_keys; "
-        f"_embed_keys({keys_str!r}, {str(references_dir)!r}, {claims_json!r})",
+        f"_embed_keys({keys_str!r}, {str(references_dir)!r})",
     ]
     timeout = _compute_embed_timeout(_iter_embed_text_paths(keys, references_dir))
     try:
@@ -150,51 +148,208 @@ def _run_embeddings_subprocess(
     return ""
 
 
-def _embed_keys(
-    keys_csv: str, references_dir_str: str, claim_texts_json: str = "[]"
-) -> None:
-    """Subprocess entry point: compute embeddings for given keys + claim queries."""
-    import json as _json
+def _embed_keys(keys_csv: str, references_dir_str: str) -> None:
+    """Subprocess entry point: compute embeddings for given keys + claim queries.
 
+    Reference texts come from ``parsed/{key}.md`` (resolved via
+    ``_resolve_embed_text_paths``). Claim contexts come from the
+    ``manuscript_citations`` table — the parent must have populated it
+    via ``persist_inline_citations`` before invoking the subprocess.
+    """
     from sciwrite_lint.references.reference_store import (
         compute_and_store_embeddings,
         release_embedding_model,
     )
+    from sciwrite_lint.references._embed_timing import (
+        log_summary as _log_timing_summary,
+        reset as _reset_timing,
+        time_phase,
+    )
+
+    _reset_timing()
 
     references_dir = Path(references_dir_str)
     keys = keys_csv.split(",") if keys_csv else []
 
     paths = _resolve_embed_text_paths(keys, references_dir)
+    keys_processed = 0
     for key in keys:
         text_path = paths.get(key)
         if text_path is None:
             continue
         try:
-            text = text_path.read_text(encoding="utf-8")
+            with time_phase("read_text"):
+                text = text_path.read_text(encoding="utf-8")
             compute_and_store_embeddings(key, text, references_dir)
-        except ImportError:
-            break  # sentence-transformers not installed
+            keys_processed += 1
         except Exception as e:
             logger.debug(f"embedding skipped for {key} ({type(e).__name__}: {e})")
             continue
 
-    # Pre-compute claim query vectors (model already loaded above)
-    claim_texts = _json.loads(claim_texts_json)
-    if claim_texts:
-        _encode_claim_queries(claim_texts, references_dir)
+    _encode_missing_claim_queries(references_dir)
 
+    _log_timing_summary(keys_processed)
     release_embedding_model()
+
+
+def _embed_keys_via_stdin() -> None:
+    """Subprocess entry point: pre-warm embedder, then receive keys via stdin.
+
+    Loads the embedder model into VRAM immediately, then blocks reading
+    one JSON line from stdin: ``{"keys_csv": "a,b,c", "references_dir": "..."}``.
+    Once received, delegates to ``_embed_keys`` with the same semantics
+    as the direct one-shot entry point.
+
+    Used by ``EmbedderWarmer`` to overlap the embedder's model-load
+    latency (~3-5 s) with GROBID parse work — the parent kicks off this
+    subprocess at parse start and submits the keys list when parse
+    finishes.
+
+    Logs to stderr; the parent inherits both pipes and surfaces stderr
+    in the failure path of ``submit_and_wait``.
+    """
+    import json
+    import sys as _sys
+
+    from sciwrite_lint.references.reference_store import _get_embedding_model
+
+    # Eagerly load model into VRAM. The bf16 cast + budget check inside
+    # _get_embedding_model fires here, BEFORE the parent has handed us
+    # any work — so any model-related warning/error surfaces during the
+    # parse stage rather than at embed time.
+    _get_embedding_model()
+
+    line = _sys.stdin.readline()
+    if not line:
+        logger.warning(
+            "embed pre-warm subprocess: stdin closed without payload; "
+            "exiting without doing work"
+        )
+        return
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as e:
+        logger.error(f"embed pre-warm subprocess: bad stdin JSON: {e}")
+        raise
+    _embed_keys(payload["keys_csv"], payload["references_dir"])
+
+
+class EmbedderWarmer:
+    """Long-running embedder subprocess that loads its model in parallel.
+
+    Lifecycle:
+
+    1. ``start()`` — launches the subprocess via ``_embed_keys_via_stdin``.
+       The subprocess loads the embedder model into VRAM (~3-5 s) and
+       then blocks on stdin. The parent returns immediately so its work
+       (typically the GROBID parse stage) overlaps with model load.
+    2. ``submit_and_wait(keys)`` — sends the keys CSV + references_dir
+       JSON line over stdin, then blocks until the subprocess completes
+       embedding. Returns the same diagnostic string contract as
+       ``_run_embeddings_subprocess``: ``""`` on success, a
+       human-readable error message otherwise.
+    3. ``cancel()`` — kills the subprocess without sending work; called
+       from the failure path so VRAM is released even if parse raises.
+
+    Caller is responsible for vLLM swap orchestration. The warmer assumes
+    text vLLM has already been stopped (peak VRAM during model load is
+    ~3 GB; without the swap it would brush the VRAM ceiling).
+    """
+
+    def __init__(self, references_dir: Path, config: LintConfig) -> None:
+        self.references_dir = references_dir
+        self.config = config
+        self.proc: "subprocess.Popen[str] | None" = None
+
+    def start(self) -> None:
+        """Launch the subprocess; it loads the model and blocks on stdin."""
+        import sys
+
+        cmd = [
+            sys.executable,
+            "-c",
+            "from sciwrite_lint.pipeline import _embed_keys_via_stdin; "
+            "_embed_keys_via_stdin()",
+        ]
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(self.config.project_dir) if self.config.project_dir else None,
+        )
+        logger.info(f"Embedder pre-warm subprocess started (pid={self.proc.pid})")
+
+    def submit_and_wait(self, keys: list[str]) -> str:
+        """Send keys to the warming subprocess and wait for completion.
+
+        Returns ``""`` on success or a diagnostic on failure (subprocess
+        non-zero exit, timeout, or pre-submit pipe error).
+        """
+        import json
+
+        if self.proc is None:
+            return "EmbedderWarmer.start() was not called"
+
+        keys_csv = ",".join(keys)
+        timeout = _compute_embed_timeout(
+            _iter_embed_text_paths(keys, self.references_dir)
+        )
+        payload = json.dumps(
+            {
+                "keys_csv": keys_csv,
+                "references_dir": str(self.references_dir),
+            }
+        )
+
+        if self.proc.stdin is None:
+            return "EmbedderWarmer subprocess has no stdin"
+        try:
+            self.proc.stdin.write(payload + "\n")
+            self.proc.stdin.flush()
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError) as e:
+            stderr_tail = ""
+            if self.proc.stderr is not None:
+                stderr_tail = self.proc.stderr.read()[-1500:]
+            return f"failed to send keys to subprocess ({e}); stderr: {stderr_tail}"
+
+        try:
+            _stdout, stderr = self.proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            return f"subprocess timed out after {timeout}s"
+        if self.proc.returncode != 0:
+            tail = stderr.strip()[-1500:] if stderr else ""
+            logger.warning("Embedding subprocess failed: {}", tail)
+            return f"non-zero exit {self.proc.returncode}: {tail}"
+        return ""
+
+    def cancel(self) -> None:
+        """Kill the subprocess without sending work; idempotent."""
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
+            self.proc.kill()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired as e:
+                logger.debug(f"Embedding subprocess wait timed out after kill: {e}")
+            except OSError as e:
+                logger.debug(f"Embedding subprocess wait raised OSError: {e}")
 
 
 def _batch_embed_entry(manifest_path_str: str) -> None:
     """Subprocess entry point: embed keys for multiple papers in one process.
 
     Loads the embedding model once and iterates over papers. Each paper's
-    keys are embedded and stored in its own workspace. Also pre-computes
-    claim query vectors so Stage 5 never loads the model in the parent.
+    keys are embedded and stored in its own workspace. Claim query
+    vectors are pre-computed by reading each paper's
+    ``manuscript_citations`` table — the parent must have populated it
+    via ``persist_inline_citations`` before this subprocess runs.
 
-    Manifest JSON: list of {"keys": [...], "references_dir": "...",
-    "claim_texts": [...]}.
+    Manifest JSON: list of {"keys": [...], "references_dir": "..."}.
     """
     import json
 
@@ -216,27 +371,21 @@ def _batch_embed_entry(manifest_path_str: str) -> None:
             try:
                 text = text_path.read_text(encoding="utf-8")
                 compute_and_store_embeddings(key, text, references_dir)
-            except ImportError:
-                release_embedding_model()
-                return
             except Exception as e:
                 logger.debug(f"embedding skipped for {key} ({type(e).__name__}: {e})")
                 continue
 
-        # Pre-compute claim query vectors (model already loaded above)
-        claim_texts = entry.get("claim_texts", [])
-        if claim_texts:
-            _encode_claim_queries(claim_texts, references_dir)
+        _encode_missing_claim_queries(references_dir)
 
     release_embedding_model()
 
 
-def _encode_claim_queries(claim_texts: list[str], references_dir: Path) -> None:
-    """Encode claim query texts and store vectors in workspace.db.
+def _encode_missing_claim_queries(references_dir: Path) -> None:
+    """Encode any persisted citation contexts that lack a query vector.
 
-    Called from the embedding subprocess (Stage 4b) while the model is
-    already loaded. The vectors are used by ``retrieve_similar()`` in
-    Stage 5 so it never needs to load the model in the parent process.
+    Reads the missing-context set from ``manuscript_citations`` (via
+    ``find_unembedded_contexts``) and encodes only that subset. Called
+    from the embedding subprocess while the model is already loaded.
     """
     import hashlib
 
@@ -245,21 +394,27 @@ def _encode_claim_queries(claim_texts: list[str], references_dir: Path) -> None:
         _get_embedding_model,
     )
     from sciwrite_lint.references.workspace_db import (
+        find_unembedded_contexts,
         get_db,
         save_query_vector,
         serialize_f32,
     )
 
     model_name, _, _ = _get_embedding_config()
+    with get_db(references_dir) as conn:
+        missing = find_unembedded_contexts(conn, model_name)
+    if not missing:
+        return
+
     model = _get_embedding_model()
-    vecs = model.encode(claim_texts, normalize_embeddings=True)
+    vecs = model.encode(missing, normalize_embeddings=True)
 
     with get_db(references_dir) as conn:
-        for text, vec in zip(claim_texts, vecs):
+        for text, vec in zip(missing, vecs):
             h = hashlib.sha256(text.encode()).hexdigest()
             save_query_vector(conn, h, model_name, serialize_f32(vec.tolist()))
 
-    logger.info("Pre-computed {} claim query vectors", len(claim_texts))
+    logger.info("Pre-computed {} claim query vectors", len(missing))
 
 
 def _batch_cited_vision_entry(manifest_path_str: str) -> None:

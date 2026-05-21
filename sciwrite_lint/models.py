@@ -27,10 +27,6 @@ class CheckMeta(BaseModel):
     description: str
 
 
-# Legacy alias for backwards compatibility
-RuleMeta = CheckMeta
-
-
 class CheckResult(BaseModel):
     """Result from running checks on a paper."""
 

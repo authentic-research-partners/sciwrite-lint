@@ -23,10 +23,46 @@ from pydantic import BaseModel, Field, StringConstraints
 from sciwrite_lint.vision.image_extraction import ExtractedImage
 
 
-# Per-item char limit for ``readability_issues``. Individual issues are
-# short phrases like "y-axis label partially obscured" (~30 chars); 150
-# leaves headroom for slightly longer notes without inviting essays.
-ReadabilityIssue = Annotated[str, StringConstraints(max_length=150)]
+# --- Vision output budget — single source of truth --------------------------
+#
+# One ``_MAX`` per field. That value is:
+#   - the Pydantic ``max_length`` (cache-write validation)
+#   - what ``describe.py:_parse_json_response`` truncates to
+#   - what the prompt asks the model to stay under
+#   - what ``describe.py:_MAX_NEW_TOKENS_VLLM`` is sized to fit
+#
+# **The wire schema sent to vLLM has NO length caps at all** —
+# ``maxLength`` / ``maxItems`` constraints trigger xgrammar's slow
+# path on this stack (0/30 success, every request times out).
+#
+# How runaway generation is contained. The original schema used
+# ``maxLength`` on the wire to force the constrained decoder to stop a
+# field at its cap so the rest of the JSON could close. We can no
+# longer do that without triggering the xgrammar trap, so the
+# protection is now layered:
+#   1. Prompt asks the model to stay under ``_MAX`` for each field.
+#   2. ``_MAX_NEW_TOKENS_VLLM`` is sized exactly to a fully-filled
+#      response + JSON chrome — if the model writes a runaway
+#      description, it hits the token cap mid-string before issues
+#      can be emitted, the JSON truncates, and the parser falls back
+#      to "store as free text" (the existing JSONDecodeError branch).
+#   3. Even if a non-runaway response modestly over-shoots a single
+#      field, the parser silently truncates it to ``_MAX`` before
+#      Pydantic sees it.
+#
+# Calibration: dense scientific figure descriptions in our benches
+# run 200–400 words (~1600–3200 chars). 4000 chars / 500 words is the
+# realistic upper end. The model rarely emits at the cap, but the
+# budget covers worst-case full-fill so a well-behaved long response
+# fits without truncation.
+
+_FIGURE_TYPE_MAX = 100  # chars; figure_type is enum-like ("bar chart" etc)
+_DESCRIPTION_MAX = 4000  # chars; ~500 words at ~8 chars/word
+_ISSUE_MAX = 200  # chars per readability_issues item; short notes only
+_MAX_ISSUES = 5
+
+# Per-item char limit for ``readability_issues``.
+ReadabilityIssue = Annotated[str, StringConstraints(max_length=_ISSUE_MAX)]
 
 
 class VisionResult(BaseModel):
@@ -36,33 +72,33 @@ class VisionResult(BaseModel):
     The transformers backend populates only ``description`` (free text)
     and leaves ``readability_issues`` as an empty list.
 
-    Field bounds are decoder-enforced: the vLLM backend sends this model
-    as a ``json_schema`` response format with ``strict=True`` (see
-    ``vision/describe.py:_vision_response_format``), so Pydantic's
-    ``max_length`` shows up as ``maxLength`` / ``maxItems`` in the
-    generated JSON schema and the constrained decoder respects both
-    during token generation.
+    Field bounds are enforced **at parse time**, not on the wire
+    schema. See module-level comment for the rationale (xgrammar's
+    slow path). The parser
+    (``describe.py:_parse_json_response``) truncates to these same
+    caps before constructing this model, so ``ValidationError`` is a
+    defense-in-depth signal that should not fire in production.
 
-    - ``description``: ~1000 words cap (4000 chars) — plenty of room
-      for a dense figure write-up.
-    - ``readability_issues``: list of at most 5 short notes, each up to
-      150 chars. Empty list means "no issues". This is a list rather
-      than a string because a figure can legitimately have several
-      distinct problems (obscured label + cut-off legend + unreadable
-      tick marks), and making each an explicit item keeps the
-      downstream consumer's formatting clean and lets the prompt cap
-      "at most 5, most important first".
-    - ``figure_type``: short enum-style label (~10-20 chars natural).
+    - ``description``: up to ``_DESCRIPTION_MAX`` chars (~500 words).
+    - ``readability_issues``: list of at most ``_MAX_ISSUES`` (5)
+      short notes, each up to ``_ISSUE_MAX`` chars. Empty list means
+      "no issues". This is a list rather than a string because a
+      figure can legitimately have several distinct problems
+      (obscured label + cut-off legend + unreadable tick marks);
+      making each an explicit item keeps the downstream consumer's
+      formatting clean.
+    - ``figure_type``: short enum-style label (~10-20 chars natural,
+      capped at ``_FIGURE_TYPE_MAX``).
 
     Python-side defaults (``default=""``, ``default_factory=list``)
     exist so the transformers backend and test fixtures can construct
     instances without all three fields.
     """
 
-    figure_type: str = Field(default="", max_length=80)
-    description: str = Field(default="", max_length=4000)
+    figure_type: str = Field(default="", max_length=_FIGURE_TYPE_MAX)
+    description: str = Field(default="", max_length=_DESCRIPTION_MAX)
     readability_issues: list[ReadabilityIssue] = Field(
-        default_factory=list, max_length=5
+        default_factory=list, max_length=_MAX_ISSUES
     )
 
 

@@ -26,7 +26,7 @@ from sciwrite_lint.claims import ClaimClassification, classify_claims_batch
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.scoring.contribution import compute_problem_solving_score
 
-from evals.scilint_score_types import (  # noqa: F401 — re-export for backward compat
+from evals.scilint_score_types import (
     TAXONOMY_DIMS,
     LaudanCase,
     LaudanCaseResult,

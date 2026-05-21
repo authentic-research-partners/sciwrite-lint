@@ -15,7 +15,7 @@ import asyncio
 import re
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -32,8 +32,21 @@ from sciwrite_lint.schemas import (
     CitationClassify,
     ClaimVerdict,
     NarrowContext,
-    vllm_schema,
+    chars_to_word_hint,
+    pydantic_max,
+    vllm_schema_unbounded,
 )
+
+if TYPE_CHECKING:
+    from sciwrite_lint.llm.concurrency_optimizer import SlotFactory
+    from sciwrite_lint.manuscript_store import ManuscriptContext
+    from sciwrite_lint.references.embedding_store import ChunkHit
+
+# Prompt-side word targets derived from Pydantic caps — Layer 1 of
+# the schema bounds architecture (see ``schemas.py``).
+_REASONING_MAX_WORDS = chars_to_word_hint(pydantic_max(CitationClassify, "reasoning"))
+_QUOTE_MAX_WORDS = chars_to_word_hint(pydantic_max(ClaimVerdict, "relevant_quote"))
+_SENTENCES_MAX_WORDS = chars_to_word_hint(pydantic_max(NarrowContext, "sentences"))
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -61,12 +74,14 @@ Respond with ONLY a valid JSON object:
   "purpose": {purpose_options},
   "reasoning": "one sentence explaining why"
 }}
+
+Keep ``reasoning`` under ~{_REASONING_MAX_WORDS} words (one sentence is enough).
 """
 
 
 CLASSIFY_PROMPT = _build_classify_prompt()
 
-CLASSIFY_SCHEMA = vllm_schema(CitationClassify)
+CLASSIFY_SCHEMA = vllm_schema_unbounded(CitationClassify)
 
 VERIFY_PROMPT = """\
 You are an academic citation verifier. You will receive:
@@ -94,13 +109,29 @@ Respond with ONLY a valid JSON object:
   "relevant_quote": "exact quote from the section, or empty string if none",
   "explanation": "brief explanation answering the verification question"
 }}
-"""
 
-VERIFY_SCHEMA = vllm_schema(ClaimVerdict)
+Keep ``relevant_quote`` and ``explanation`` under ~{quote_max_words} words each.
+""".format(quote_max_words=_QUOTE_MAX_WORDS)
+
+VERIFY_SCHEMA = vllm_schema_unbounded(ClaimVerdict)
 
 # ---------------------------------------------------------------------------
 # vLLM model presets (imported from llm_utils)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Verdict + skip-reason vocabulary
+# ---------------------------------------------------------------------------
+#
+# ``claim_results`` rows have one of these verdicts. ``SKIPPED`` rows
+# carry a structured ``skip_reason`` so callers can tell *why* the cite
+# never reached the verifier; LLM verdicts use empty ``skip_reason``.
+VERDICT_SKIPPED = "SKIPPED"
+
+SKIP_NO_LOCAL_SOURCE = "no_local_source"
+SKIP_KEY_FILTER_EXCLUDED = "key_filter_excluded"
+SKIP_LIMIT_TRUNCATED = "limit_truncated"
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +156,32 @@ class Section(BaseModel):
     index: int
 
 
+class LevelUnit(BaseModel):
+    """One unit of work at a single ladder level.
+
+    Bundles the ``Section`` that ships to the LLM with the
+    ``evidence_locator`` recording which evidence produced the verdict.
+    Pairing them at construction time means the aggregator never has to
+    keep a parallel locator list aligned with the units list, and the
+    locator format is decided once where the unit is built, not at the
+    aggregation site. Used by the verify-claim escalation ladder
+    (``verify_claim_vllm``).
+    """
+
+    section: Section
+    locator: str
+
+
 # ---------------------------------------------------------------------------
 # Claim extraction
 # ---------------------------------------------------------------------------
 
 
-def extract_claim_contexts(tex_path: Path) -> list[ClaimContext]:
+def extract_claim_contexts(
+    tex_path: Path,
+    *,
+    ctx: "ManuscriptContext | None" = None,
+) -> list[ClaimContext]:
     r"""Extract claim contexts around each reference in the paper body.
 
     Two kinds of references are handled:
@@ -145,17 +196,49 @@ def extract_claim_contexts(tex_path: Path) -> list[ClaimContext]:
       ``\cite`` is replaced with ``[CITE]``) so the LLM sees only the
       host sentence.
 
+    When ``ctx`` is provided and the source is LaTeX, ``\cite{}`` claim
+    contexts are read from ``ctx.inline_citations`` (already populated
+    by :func:`_build_context_latex` via the same paragraph-window
+    logic) — the file is still read for footnote-URL extraction, since
+    those synthetic keys are not in ``inline_citations``.
+
     Only footnote URLs whose synthetic key is actually registered as a
-    local source (i.e. the URL had a matching capture in
-    ``local_web_dir``) will have a verifiable claim downstream — but
-    emitting the ``ClaimContext`` unconditionally keeps this function
-    pure (no DB access) and lets the caller filter by
-    ``ClaimContext.key in local_files`` exactly as it already does.
+    local source will have a verifiable claim downstream — emitting
+    the ``ClaimContext`` unconditionally keeps this function pure (no
+    DB access) and lets the caller filter by ``ClaimContext.key in
+    local_files`` exactly as it already does.
     """
-    from sciwrite_lint.footnote_urls import synthesize_footnote_key
-
     text = tex_path.read_text(encoding="utf-8")
+    body = _slice_tex_body(text, tex_path)
+    # Body-relative line numbers from the helpers must be translated
+    # to absolute (full-file) lines so they match what
+    # find_all_cite_keys / InlineCitation.line use everywhere else.
+    line_offset = text[: text.find("\\begin{document}")].count("\n")
 
+    if ctx is not None and ctx.source_type == "latex":
+        cite_claims = [
+            ClaimContext(
+                key=ic.key,
+                context=ic.context,
+                line=ic.line or 0,
+                source_file=str(tex_path),
+            )
+            for ic in ctx.inline_citations
+            if ic.context
+        ]
+    else:
+        cite_claims = _extract_cite_claims_from_body(body, line_offset=line_offset)
+
+    return cite_claims + _extract_footnote_url_claims(body, line_offset=line_offset)
+
+
+def _slice_tex_body(text: str, tex_path: Path) -> str:
+    r"""Return the slice between ``\begin{document}`` and the bibliography.
+
+    Raises if no ``\begin{document}`` marker is present (likely not a
+    valid LaTeX file). When the bibliography marker is absent the slice
+    runs to end-of-file — footnote-URL claims may still appear there.
+    """
     body_start = text.find("\\begin{document}")
     bib_start = text.find("\\begin{thebibliography}")
     if bib_start == -1:
@@ -165,66 +248,98 @@ def extract_claim_contexts(tex_path: Path) -> list[ClaimContext]:
             f"Cannot find \\begin{{document}} in {tex_path}. "
             "Is this a valid LaTeX file?"
         )
-    # If there is no bibliography we can still have footnote-URL claims,
-    # so compute the body slice accordingly.
-    body = text[body_start:bib_start] if bib_start != -1 else text[body_start:]
+    return text[body_start:bib_start] if bib_start != -1 else text[body_start:]
 
+
+def _context_window(paragraphs: list[tuple[int, str]], pos: int) -> list[str] | None:
+    """Build the prev/curr/[next] paragraph window for a body position.
+
+    Returns the surrounding paragraphs as raw text (no cleaning yet) —
+    callers run ``_clean_latex`` on the joined window with their own
+    ``target_key`` argument. Returns ``None`` when ``pos`` is not
+    inside any paragraph (caller should ``continue``).
+
+    The "include next paragraph" rule fires when the match falls in
+    the last 20% of its paragraph: the convention is that a cite
+    near the paragraph end probably refers to whatever the next
+    paragraph elaborates on, so the wider window improves retrieval.
+    """
+    para_idx = _find_paragraph(paragraphs, pos)
+    if para_idx is None:
+        return None
+
+    parts: list[str] = []
+    if para_idx > 0:
+        parts.append(paragraphs[para_idx - 1][1])
+    parts.append(paragraphs[para_idx][1])
+    offset = pos - paragraphs[para_idx][0]
+    para_len = len(paragraphs[para_idx][1])
+    if offset > para_len * 0.8 and para_idx + 1 < len(paragraphs):
+        parts.append(paragraphs[para_idx + 1][1])
+    return parts
+
+
+def _extract_cite_claims_from_body(
+    body: str, *, line_offset: int = 0
+) -> list[ClaimContext]:
+    r"""Extract ``\cite{}`` claim contexts from a LaTeX body slice.
+
+    Pure function — no file I/O. Used both by the file-parse entry
+    point (:func:`extract_claim_contexts` without ``ctx``) and by
+    :func:`_build_context_latex` to populate
+    ``InlineCitation.context`` at build time. Output of these two
+    callers must match exactly because downstream ``query_vectors``
+    lookups are keyed by ``sha256(context)``.
+
+    ``line_offset`` is added to body-relative line numbers so callers
+    can return absolute (full-file) lines.
+    """
     paragraphs = _split_paragraphs(body)
     results: list[ClaimContext] = []
-    pattern = re.compile(r"\\cite(?:unverified|[tp]|yearpar)?\{([^}]+)\}")
-
-    for match in pattern.finditer(body):
+    for match in _CITE_RE.finditer(body):
         keys_str = match.group(1)
         pos = match.start()
-        line_no = body[:pos].count("\n") + 1
+        line_no = body[:pos].count("\n") + 1 + line_offset
 
-        para_idx = _find_paragraph(paragraphs, pos)
-        if para_idx is None:
+        window = _context_window(paragraphs, pos)
+        if window is None:
             continue
-
-        context_parts = []
-        if para_idx > 0:
-            context_parts.append(paragraphs[para_idx - 1][1])
-        context_parts.append(paragraphs[para_idx][1])
-        cite_offset = pos - paragraphs[para_idx][0]
-        para_len = len(paragraphs[para_idx][1])
-        if cite_offset > para_len * 0.8 and para_idx + 1 < len(paragraphs):
-            context_parts.append(paragraphs[para_idx + 1][1])
 
         for key in keys_str.split(","):
             key = key.strip()
             if key:
-                context_text = _clean_latex(
-                    "\n\n".join(context_parts), target_key=key
-                ).strip()
+                context_text = _clean_latex("\n\n".join(window), target_key=key).strip()
                 results.append(
                     ClaimContext(key=key, context=context_text, line=line_no)
                 )
+    return results
 
-    # Footnote-URL claims. Walk the body for \footnote{...\url{URL}...};
-    # each URL becomes one ClaimContext keyed on its synthetic key. The
-    # claim context is the paragraph containing the footnote, with the
-    # footnote body itself stripped by `_clean_latex` so the verifier
-    # sees only the host sentence.
+
+def _extract_footnote_url_claims(
+    body: str, *, line_offset: int = 0
+) -> list[ClaimContext]:
+    r"""Extract synthetic-key claim contexts from ``\footnote{...\url{URL}...}``.
+
+    Pure function. Each URL produces one ClaimContext keyed by the
+    deterministic synthetic key. The host paragraph is the claim
+    context with the footnote body stripped, so the verifier sees only
+    the surrounding sentence. ``line_offset`` translates body-relative
+    line numbers to absolute (full-file) lines.
+    """
+    from sciwrite_lint.footnote_urls import synthesize_footnote_key
+
+    paragraphs = _split_paragraphs(body)
+    results: list[ClaimContext] = []
     for fn_match in _FOOTNOTE_URL_CLAIM_RE.finditer(body):
         fn_body = fn_match.group(0)
         pos = fn_match.start()
-        line_no = body[:pos].count("\n") + 1
+        line_no = body[:pos].count("\n") + 1 + line_offset
 
-        para_idx = _find_paragraph(paragraphs, pos)
-        if para_idx is None:
+        window = _context_window(paragraphs, pos)
+        if window is None:
             continue
 
-        context_parts = []
-        if para_idx > 0:
-            context_parts.append(paragraphs[para_idx - 1][1])
-        context_parts.append(paragraphs[para_idx][1])
-        fn_offset = pos - paragraphs[para_idx][0]
-        para_len = len(paragraphs[para_idx][1])
-        if fn_offset > para_len * 0.8 and para_idx + 1 < len(paragraphs):
-            context_parts.append(paragraphs[para_idx + 1][1])
-
-        context_text = _clean_latex("\n\n".join(context_parts)).strip()
+        context_text = _clean_latex("\n\n".join(window)).strip()
         if not context_text:
             continue
 
@@ -238,7 +353,6 @@ def extract_claim_contexts(tex_path: Path) -> list[ClaimContext]:
                         line=line_no,
                     )
                 )
-
     return results
 
 
@@ -250,6 +364,15 @@ _FOOTNOTE_URL_CLAIM_RE = re.compile(
     r"\\footnote\{(?:[^{}]|\{[^{}]*\})*\\url\{[^}]+\}(?:[^{}]|\{[^{}]*\})*\}"
 )
 _URL_INSIDE_FOOTNOTE_RE = re.compile(r"\\url\{([^}]+)\}")
+
+# Single source of truth for matching every \cite variant the codebase
+# recognises (\cite, \citep, \citet, \citeyearpar, \citeunverified). Used
+# both for finding cite occurrences (with capture group 1 = comma-joined
+# keys) and for normalising them to ``[CITE]`` / ``[TARGET_CITE]`` in
+# ``_clean_latex``. Keep in lockstep with ``find_all_cite_keys`` in
+# tex_parser.py — divergence here causes query_vector cache misses
+# because ``sha256(context)`` is the lookup key.
+_CITE_RE = re.compile(r"\\cite(?:unverified|[tp]|yearpar)?\{([^}]+)\}")
 
 
 def _split_paragraphs(text: str) -> list[tuple[int, str]]:
@@ -293,11 +416,13 @@ def _clean_latex(text: str, target_key: str = "") -> str:
                 return "[TARGET_CITE]"
             return "[CITE]"
 
-        text = re.compile(r"\\cite(?:unverified|[tp]|yearpar)?\{([^}]+)\}").sub(
-            _replace_cite, text
-        )
+        text = _CITE_RE.sub(_replace_cite, text)
     else:
-        text = re.sub(r"\\cite[tp]?(?:yearpar)?\{[^}]+\}", "[CITE]", text)
+        # Same regex as the target_key branch — both must match every cite
+        # variant find_all_cite_keys recognises, otherwise \citeunverified
+        # leaks into context text and the resulting sha256(context) cache-
+        # misses against the ctx-aware path that does normalize it.
+        text = _CITE_RE.sub("[CITE]", text)
     text = re.sub(r"\\footnote\{[^}]*\}", "", text)
     text = re.sub(r"\\[a-zA-Z]+\{([^}]*)\}", r"\1", text)
     text = re.sub(r"[{}~]", " ", text)
@@ -367,8 +492,8 @@ def split_sections(text: str, max_section_chars: int = 4000) -> list[Section]:
 
     # Merge tiny sections into neighbors. GROBID sometimes promotes
     # pull-quotes, OCR artifacts, or sidebar text to headings, creating
-    # sections with only a few lines. Merge backward into predecessor;
-    # if the first section is tiny, merge forward into successor.
+    # sections with only a few lines. Merge into the previous section;
+    # if the first section is tiny, merge into the next section.
     merged: list[Section] = []
     for sec in sections:
         if merged and len(sec.text) < _MIN_SECTION_CHARS:
@@ -499,7 +624,10 @@ def _thinking_kwargs(preset_name: str) -> dict:
 
 
 async def _classify_citation_vllm(
-    claim: ClaimContext, client: Any, model_cfg: dict
+    claim: ClaimContext,
+    client: Any,
+    model_cfg: dict,
+    slot: SlotFactory,
 ) -> str:
     from sciwrite_lint.prompt_safety import wrap_untrusted
     from sciwrite_lint.usage import current as _usage_current
@@ -509,15 +637,9 @@ async def _classify_citation_vllm(
         f"> {wrap_untrusted(claim.context, 'claim_context')}"
     )
 
-    # Outer retry loop for invalid JSON. retry_on_empty handles
-    # empty-content retries inside each attempt; this outer loop adds
-    # JSON-parse retries for transient server-side glitches where the
-    # response is non-empty but malformed.
-    raw = ""
-    result: dict | None = None
-    for _attempt in range(_VLLM_RETRIES + 1):
-        completion = await retry_on_empty(
-            lambda: client.chat.completions.create(
+    async def _create() -> Any:
+        async with slot():
+            return await client.chat.completions.create(
                 model=model_cfg["model"],
                 messages=[
                     {"role": "system", "content": CLASSIFY_PROMPT},
@@ -535,9 +657,16 @@ async def _classify_citation_vllm(
                     },
                 },
                 **_thinking_kwargs("off"),
-            ),
-            label=claim.key,
-        )
+            )
+
+    # Outer retry loop for invalid JSON. retry_on_empty handles
+    # empty-content retries inside each attempt; this outer loop adds
+    # JSON-parse retries for transient server-side glitches where the
+    # response is non-empty but malformed.
+    raw = ""
+    result: dict | None = None
+    for _attempt in range(_VLLM_RETRIES + 1):
+        completion = await retry_on_empty(_create, label=claim.key)
         raw = completion.choices[0].message.content or ""
 
         run = _usage_current()
@@ -591,6 +720,7 @@ async def _verify_section_vllm(
     purpose: str,
     client: Any,
     model_cfg: dict,
+    slot: SlotFactory,
 ) -> dict:
     question = VERIFY_QUESTIONS.get(purpose, VERIFY_QUESTIONS["evidence"])
     section_text = section.text
@@ -607,7 +737,7 @@ async def _verify_section_vllm(
     # Claim context + question come before section text so that APC
     # caches the shared prefix across all sections of the same claim.
     user_prompt = (
-        f"## CLAIM (from our paper, line {claim.line})\n\n"
+        f"## CLAIM (from the manuscript, line {claim.line})\n\n"
         f"> {wrap_untrusted(claim.context, 'claim_context')}\n\n"
         f"## VERIFICATION QUESTION\n\n{question}\n\n---\n\n"
         f"## SOURCE SECTION: {section.title}\n\n"
@@ -635,14 +765,15 @@ async def _verify_section_vllm(
     }
     from sciwrite_lint.usage import current as _usage_current
 
+    async def _create() -> Any:
+        async with slot():
+            return await client.chat.completions.create(**_verify_kwargs)
+
     # Outer retry loop for invalid JSON (see _classify_citation_vllm).
     raw = ""
     result: dict | None = None
     for _attempt in range(_VLLM_RETRIES + 1):
-        completion = await retry_on_empty(
-            lambda: client.chat.completions.create(**_verify_kwargs),
-            label=claim.key,
-        )
+        completion = await retry_on_empty(_create, label=claim.key)
         raw = completion.choices[0].message.content or ""
 
         run = _usage_current()
@@ -680,6 +811,210 @@ async def _verify_section_vllm(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Escalation ladder for claim verification
+# ---------------------------------------------------------------------------
+# The chunk windows at sentence/paragraph levels already encode ±1 neighbor
+# context (see ``_chunk_text``: paragraph_half_window=1, sentence_half_window=1).
+# We ship those chunks directly instead of the parent section so easy claims
+# resolve on a ~200-token prompt instead of 5,000-token sections; the section
+# level is reached only when sub-section verdicts are non-conclusive.
+#
+# Concurrency: the ladder fans out top_n calls per level, but each individual
+# vLLM call acquires a slot from the shared ``SlotFactory`` (the dynamic
+# concurrency controller). So total in-flight LLM calls across all claims is
+# bounded by the controller's cap, not by an artificial per-claim semaphore.
+
+_SMALL_DOC_THRESHOLD = 5
+
+# Priority used when reducing per-unit verdicts to one (higher wins;
+# ties broken by confidence). Defined here so ``_aggregate_section_results``
+# is module-loaded before its first caller (``_verify_units_at_level``).
+_VERDICT_PRIORITY: dict[str, int] = {
+    "SUPPORTS": 3,
+    "PARTIALLY_SUPPORTS": 2,
+    "CANNOT_DETERMINE": 1,
+    "NOT_SUPPORTED": 0,
+}
+
+
+def _aggregate_section_results(
+    results: list[dict],
+    units: list[LevelUnit],
+) -> dict:
+    """Reduce per-unit verdicts to one. Each ``LevelUnit`` carries its
+    own ``locator``, so the aggregator picks the winning unit's locator
+    without a parallel list. ``results`` and ``units`` are parallel
+    lists from the same ``asyncio.gather`` call."""
+    best_verdict = "NOT_SUPPORTED"
+    best_confidence = 0.0
+    best_quote = ""
+    best_explanation = ""
+    best_section = ""
+    best_locator = ""
+
+    for result, unit in zip(results, units):
+        v = result.get("verdict", "CANNOT_DETERMINE")
+        c = result.get("confidence", 0.0)
+        if _VERDICT_PRIORITY.get(v, 0) > _VERDICT_PRIORITY.get(best_verdict, 0) or (
+            v == best_verdict and c > best_confidence
+        ):
+            best_verdict = v
+            best_confidence = c
+            best_quote = result.get("relevant_quote", "")
+            best_explanation = result.get("explanation", "")
+            best_section = unit.section.title
+            best_locator = unit.locator
+
+    return {
+        "verdict": best_verdict,
+        "confidence": best_confidence,
+        "relevant_quote": best_quote,
+        "explanation": best_explanation,
+        "source_section": best_section,
+        "evidence_locator": best_locator,
+        "sections_checked": len(results),
+    }
+
+
+def _ladder_levels(config: LintConfig) -> list[tuple[str, int]]:
+    """Build the ordered (level_name, top_n) sequence from config — one
+    place that maps the ladder level names to their per-level fan-out so
+    users can tune via ``LintConfig.ladder_top_n_*`` without code changes."""
+    return [
+        ("sentence", config.ladder_top_n_sentence),
+        ("paragraph", config.ladder_top_n_paragraph),
+        ("section", config.ladder_top_n_section),
+    ]
+
+
+def _ladder_should_stop(verdict: str, level_name: str) -> bool:
+    """SUPPORTS at any level halts the ladder. Below the section level a
+    NOT_SUPPORTED / PARTIALLY_SUPPORTS / CANNOT_DETERMINE may be a chunk
+    too narrow to see the supporting context — escalate. At the section
+    level (final) every verdict is terminal."""
+    if verdict == "SUPPORTS":
+        return True
+    return level_name == "section"
+
+
+def _chunk_unit(hit: ChunkHit, index: int) -> LevelUnit:
+    """Build a ``LevelUnit`` for a sentence/paragraph chunk hit. The
+    locator pairs the chunk's section title with its start_char so the
+    chunk can be re-located in the source after the run."""
+    return LevelUnit(
+        section=Section(title=hit.section_title, text=hit.text, index=index),
+        locator=f"{hit.section_title}:{hit.start_char}",
+    )
+
+
+def _section_unit(section: Section) -> LevelUnit:
+    """Build a ``LevelUnit`` for a whole-section ladder candidate.
+    Locator is the section title alone — no sub-section position
+    applies at this level."""
+    return LevelUnit(section=section, locator=section.title)
+
+
+def _fetch_level_units(
+    level_name: str,
+    claim: ClaimContext,
+    sections: list[Section],
+    references_dir: Path,
+    top_n: int,
+) -> list[LevelUnit] | None:
+    """Build the candidate ``LevelUnit`` list for one ladder level.
+
+    sentence/paragraph levels source candidates from
+    ``retrieve_top_chunks``; the section level uses
+    ``retrieve_relevant_sections`` (already includes ±1 neighbor
+    sections), capped at *top_n*. Returns ``None`` when embeddings are
+    unavailable for the reference (caller bails out)."""
+    from sciwrite_lint.references.reference_store import (
+        retrieve_relevant_sections,
+        retrieve_top_chunks,
+    )
+
+    if level_name in ("sentence", "paragraph"):
+        hits = retrieve_top_chunks(
+            claim.context, claim.key, references_dir, level_name, top_n
+        )
+        if hits is None:
+            return None
+        return [_chunk_unit(h, i) for i, h in enumerate(hits)]
+
+    if level_name == "section":
+        sects = retrieve_relevant_sections(
+            claim.context, claim.key, references_dir, sections
+        )
+        if sects is None:
+            return None
+        return [_section_unit(s) for s in sects[:top_n]]
+
+    raise ValueError(f"unknown ladder level: {level_name!r}")
+
+
+async def _verify_units_at_level(
+    claim: ClaimContext,
+    units: list[LevelUnit],
+    purpose: str,
+    client: Any,
+    model_cfg: dict,
+    slot: SlotFactory,
+) -> dict:
+    """Run ``_verify_section_vllm`` over each unit in parallel, aggregate
+    via ``_aggregate_section_results``. Sub-section and section levels
+    share this code path — only the units differ.
+
+    Each unit's vLLM call acquires its own slot from *slot*, so the total
+    in-flight calls across all claims and all levels is bounded by the
+    controller's dynamic cap — not by a per-claim semaphore."""
+
+    async def _one(unit: LevelUnit) -> dict:
+        return await _verify_section_vllm(
+            claim, unit.section, purpose, client, model_cfg, slot
+        )
+
+    results = await asyncio.gather(*[_one(u) for u in units])
+    return _aggregate_section_results(results, units)
+
+
+def _embeddings_unavailable_result(claim: ClaimContext, n_sections: int) -> dict:
+    """Standard CANNOT_DETERMINE response when embeddings are missing for
+    a reference — no level of the ladder can run without them."""
+    logger.warning(
+        "No embeddings for {} ({} sections) — cannot filter, "
+        "returning CANNOT_DETERMINE. Rebuild with: "
+        "sciwrite-lint parse --key {}",
+        claim.key,
+        n_sections,
+        claim.key,
+    )
+    return {
+        "verdict": "CANNOT_DETERMINE",
+        "explanation": f"No embeddings for {claim.key} — "
+        "cannot select relevant sections for verification",
+        "sections_checked": 0,
+    }
+
+
+def _no_retrieval_hits_result(claim: ClaimContext, n_sections: int) -> dict:
+    """CANNOT_DETERMINE response when the embedder ran but every ladder
+    level returned zero candidates — pathological retrieval state, not the
+    same as 'no embeddings'."""
+    logger.warning(
+        "Retrieval returned no hits for {} at any granularity ({} sections); "
+        "treating as CANNOT_DETERMINE",
+        claim.key,
+        n_sections,
+    )
+    return {
+        "verdict": "CANNOT_DETERMINE",
+        "explanation": f"No retrieval hits for {claim.key} at any granularity "
+        "— ladder could not select any candidate units to verify",
+        "sections_checked": 0,
+    }
+
+
 async def verify_claim_vllm(
     claim: ClaimContext,
     sections: list[Section],
@@ -687,17 +1022,31 @@ async def verify_claim_vllm(
     model_name: str = "",
     references_dir: Path | None = None,
     client: Any | None = None,
+    slot: SlotFactory | None = None,
 ) -> dict:
-    """Three-step verification: classify purpose, verify, optionally narrow.
+    """Cost-aware escalation-ladder verification.
 
-    1. Classify citation purpose (evidence, example, method, etc.)
-    2. Verify against source sections (embedding pre-filter → full scan)
-    3. If NOT_SUPPORTED or PARTIALLY_SUPPORTS: context narrowing via vLLM —
-       extract relevant sentence(s), fuzzy-match to source, re-verify with
-       narrowed context.  Flags result with ``context_narrowed`` if upgraded.
+    1. Classify citation purpose (evidence, example, method, etc.).
+    2. For large docs: run the ladder — sentence chunk → paragraph chunk →
+       whole section. Each level fans out top-N candidates in parallel,
+       aggregates, and stops on a conclusive verdict (SUPPORTS at any
+       level, or any verdict at the section level). The chunk windows at
+       L1/L2 already include ±1 neighbor context (see ``_chunk_text``),
+       so we avoid shipping 5–8 KB sections when a single matched
+       paragraph would do. For small docs (≤ ``_SMALL_DOC_THRESHOLD``)
+       skip retrieval and verify all sections at once.
+    3. After the section level: if the verdict is still NOT_SUPPORTED or
+       PARTIALLY_SUPPORTS for a non-``example`` citation, run the
+       claim-context narrowing path (``_retry_with_narrow_context``) as
+       a final upgrade attempt.
 
-    If *client* is provided, uses it (caller manages lifecycle).
-    Otherwise creates and closes its own AsyncOpenAI client.
+    Records ``resolved_at`` (sentence/paragraph/section) and
+    ``evidence_locator`` (section title or ``section_title:start_char``)
+    so the persisted ``claim_results`` row identifies which evidence
+    produced the verdict.
+
+    If *client* is provided, the caller owns its lifecycle; otherwise
+    this function creates and closes its own ``AsyncOpenAI``.
     """
     from openai import AsyncOpenAI
 
@@ -706,49 +1055,6 @@ async def verify_claim_vllm(
         model_name or config.llm_model or VLLM_DEFAULT_MODEL,
         VLLM_MODELS[VLLM_DEFAULT_MODEL],
     )
-
-    # Embedding-based pre-filtering — required for performance on large docs.
-    # Without embeddings, every section is sent to vLLM, overwhelming the
-    # server with 20-35 concurrent requests per claim and causing empty
-    # responses. Small documents (≤5 sections) skip retrieval — all sections
-    # fit in a single prompt, so filtering adds latency with no benefit.
-    _SMALL_DOC_THRESHOLD = 5
-
-    if len(sections) <= _SMALL_DOC_THRESHOLD:
-        target_sections = sections
-    else:
-        if not references_dir:
-            raise RuntimeError(
-                f"references_dir is required for claim verification of {claim.key}. "
-                "Embeddings cannot be loaded without it."
-            )
-
-        from sciwrite_lint.references.reference_store import (
-            retrieve_relevant_sections,
-        )
-
-        filtered = retrieve_relevant_sections(
-            claim.context,
-            claim.key,
-            references_dir,
-            sections,
-        )
-        if filtered is None:
-            logger.warning(
-                "No embeddings for {} ({} sections) — cannot filter, "
-                "returning CANNOT_DETERMINE. Rebuild with: "
-                "sciwrite-lint parse --key {}",
-                claim.key,
-                len(sections),
-                claim.key,
-            )
-            return {
-                "verdict": "CANNOT_DETERMINE",
-                "explanation": f"No embeddings for {claim.key} — "
-                "cannot select relevant sections for verification",
-                "sections_checked": 0,
-            }
-        target_sections = filtered
 
     own_client = client is None
     if own_client:
@@ -759,86 +1065,117 @@ async def verify_claim_vllm(
         )
     assert client is not None  # narrowing for mypy
 
-    _SECTION_CONCURRENCY = 50
-    sem = asyncio.Semaphore(_SECTION_CONCURRENCY)
+    # Stand-alone callers (CLI debug, tests) get a no-op slot so every
+    # LLM call goes through unthrottled. The pipeline orchestrator passes
+    # in the real ``SlotFactory`` from ``concurrency_slot``.
+    if slot is None:
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _noop_slot() -> Any:
+            yield
+
+        slot = _noop_slot
 
     try:
-        purpose = await _classify_citation_vllm(claim, client, model_cfg)
+        purpose = await _classify_citation_vllm(claim, client, model_cfg, slot)
 
-        async def _verify_with_sem(sec: Section) -> dict:
-            async with sem:
-                return await _verify_section_vllm(
-                    claim, sec, purpose, client, model_cfg
+        agg: dict
+        final_level: str
+
+        # Small-doc fast path: every section fits in flight, ladder
+        # filtering adds latency with no benefit.
+        if len(sections) <= _SMALL_DOC_THRESHOLD:
+            agg = await _verify_units_at_level(
+                claim,
+                [_section_unit(s) for s in sections],
+                purpose,
+                client,
+                model_cfg,
+                slot,
+            )
+            final_level = "section"
+        else:
+            if not references_dir:
+                raise RuntimeError(
+                    f"references_dir is required for claim verification of "
+                    f"{claim.key}. Embeddings cannot be loaded without it."
                 )
 
-        results = await asyncio.gather(
-            *[_verify_with_sem(sec) for sec in target_sections]
+            ladder_result: dict | None = None
+            ladder_level: str | None = None
+            for level_name, top_n in _ladder_levels(config):
+                units = _fetch_level_units(
+                    level_name, claim, sections, references_dir, top_n
+                )
+                if units is None:
+                    # Embeddings missing — same level-fetcher returns
+                    # None at every level, so bail out once.
+                    return _embeddings_unavailable_result(claim, len(sections))
+                if not units:
+                    continue  # nothing to verify at this level, escalate
+
+                ladder_result = await _verify_units_at_level(
+                    claim,
+                    units,
+                    purpose,
+                    client,
+                    model_cfg,
+                    slot,
+                )
+                ladder_level = level_name
+                if _ladder_should_stop(ladder_result["verdict"], level_name):
+                    break
+
+            if ladder_result is None or ladder_level is None:
+                # Embedder ran but every level returned [] — pathological
+                # but defensible to surface as CANNOT_DETERMINE rather than
+                # crash. Distinct from the embeddings-missing case above.
+                return _no_retrieval_hits_result(claim, len(sections))
+
+            agg = ladder_result
+            final_level = ladder_level
+
+        agg["resolved_at"] = final_level
+
+        agg["citation_purpose"] = purpose
+        agg["sections_total"] = len(sections)
+
+        # Final-level safety net: claim-context narrowing operates on the
+        # manuscript side (extracts the supporting sentence from the
+        # claim's paragraph) and re-verifies. Independent of the ladder
+        # — only runs when the section level still didn't give SUPPORTS.
+        if (
+            final_level == "section"
+            and agg["verdict"] in ("NOT_SUPPORTED", "PARTIALLY_SUPPORTS")
+            and purpose != "example"
+        ):
+            narrowed = await _retry_with_narrow_context(
+                claim, agg, sections, purpose, client, model_cfg, slot
+            )
+            if narrowed:
+                narrowed["citation_purpose"] = purpose
+                narrowed["sections_checked"] = agg.get("sections_checked", 0)
+                narrowed["sections_total"] = agg.get("sections_total", 0)
+                narrowed["resolved_at"] = "section"
+                narrowed["evidence_locator"] = agg.get("evidence_locator", "")
+                logger.info(
+                    f"{claim.key}: context narrowing upgraded "
+                    f"{agg['verdict']} → {narrowed['verdict']}"
+                )
+                agg = narrowed
+
+        logger.info(
+            "{}: resolved_at={} verdict={} locator={}",
+            claim.key,
+            agg.get("resolved_at", ""),
+            agg.get("verdict", ""),
+            agg.get("evidence_locator", ""),
         )
+        return agg
     finally:
         if own_client:
             await client.close()
-
-    agg = _aggregate_section_results(results, target_sections)
-    agg["citation_purpose"] = purpose
-    agg["sections_checked"] = len(target_sections)
-    agg["sections_total"] = len(sections)
-
-    # Context narrowing via vLLM: re-verify with sentence-level context
-    if (
-        agg["verdict"] in ("NOT_SUPPORTED", "PARTIALLY_SUPPORTS")
-        and purpose != "example"
-    ):
-        narrowed = await _retry_with_narrow_context(
-            claim, agg, sections, purpose, client, model_cfg
-        )
-
-        if narrowed:
-            narrowed["citation_purpose"] = purpose
-            narrowed["sections_checked"] = agg.get("sections_checked", 0)
-            narrowed["sections_total"] = agg.get("sections_total", 0)
-            logger.info(
-                f"{claim.key}: context narrowing upgraded "
-                f"{agg['verdict']} → {narrowed['verdict']}"
-            )
-            agg = narrowed
-
-    return agg
-
-
-def _aggregate_section_results(results: list[dict], sections: list[Section]) -> dict:
-    best_verdict = "NOT_SUPPORTED"
-    best_confidence = 0.0
-    best_quote = ""
-    best_explanation = ""
-    best_section = ""
-
-    priority = {
-        "SUPPORTS": 3,
-        "PARTIALLY_SUPPORTS": 2,
-        "CANNOT_DETERMINE": 1,
-        "NOT_SUPPORTED": 0,
-    }
-
-    for result, section in zip(results, sections):
-        v = result.get("verdict", "CANNOT_DETERMINE")
-        c = result.get("confidence", 0.0)
-        if priority.get(v, 0) > priority.get(best_verdict, 0) or (
-            v == best_verdict and c > best_confidence
-        ):
-            best_verdict = v
-            best_confidence = c
-            best_quote = result.get("relevant_quote", "")
-            best_explanation = result.get("explanation", "")
-            best_section = section.title
-
-    return {
-        "verdict": best_verdict,
-        "confidence": best_confidence,
-        "relevant_quote": best_quote,
-        "explanation": best_explanation,
-        "source_section": best_section,
-        "sections_checked": len(results),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -855,12 +1192,14 @@ If the citation appears in multiple sentences, copy all of them. \
 If you cannot identify the relevant sentence(s), return an empty string.
 
 Respond with ONLY a valid JSON object:
-{
+{{
   "sentences": "the exact sentence(s) copied from the paragraph"
-}
-"""
+}}
 
-NARROW_SCHEMA = vllm_schema(NarrowContext)
+Keep ``sentences`` under ~{sentences_max_words} words.
+""".format(sentences_max_words=_SENTENCES_MAX_WORDS)
+
+NARROW_SCHEMA = vllm_schema_unbounded(NarrowContext)
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 
@@ -870,6 +1209,7 @@ async def _extract_relevant_sentences(
     key: str,
     client: Any,
     model_cfg: dict,
+    slot: SlotFactory,
 ) -> str:
     """Ask vLLM to copy the sentence(s) for a specific citation from context."""
     from sciwrite_lint.prompt_safety import wrap_untrusted
@@ -878,12 +1218,9 @@ async def _extract_relevant_sentences(
         f"Citation key: {key}\n\nParagraph:\n{wrap_untrusted(context, 'paragraph')}"
     )
 
-    # Outer retry loop for invalid JSON (see _classify_citation_vllm).
-    raw = ""
-    result: dict | None = None
-    for _attempt in range(_VLLM_RETRIES + 1):
-        completion = await retry_on_empty(
-            lambda: client.chat.completions.create(
+    async def _create() -> Any:
+        async with slot():
+            return await client.chat.completions.create(
                 model=model_cfg["model"],
                 messages=[
                     {"role": "system", "content": NARROW_PROMPT},
@@ -901,9 +1238,13 @@ async def _extract_relevant_sentences(
                     },
                 },
                 **_thinking_kwargs("off"),
-            ),
-            label=key,
-        )
+            )
+
+    # Outer retry loop for invalid JSON (see _classify_citation_vllm).
+    raw = ""
+    result: dict | None = None
+    for _attempt in range(_VLLM_RETRIES + 1):
+        completion = await retry_on_empty(_create, label=key)
         raw = completion.choices[0].message.content or ""
         result = _extract_json(raw)
         if result and "sentences" in result:
@@ -969,13 +1310,14 @@ async def _retry_with_narrow_context(
     purpose: str,
     client: Any,
     model_cfg: dict,
+    slot: SlotFactory,
 ) -> dict | None:
     """Retry verification with narrowed context on failure.
 
     Returns an improved agg dict if narrowing helped, None otherwise.
     """
     llm_sentences = await _extract_relevant_sentences(
-        claim.context, claim.key, client, model_cfg
+        claim.context, claim.key, client, model_cfg, slot
     )
     if not llm_sentences:
         return None
@@ -1007,7 +1349,7 @@ async def _retry_with_narrow_context(
     )
 
     result = await _verify_section_vllm(
-        narrow_claim, best_section, purpose, client, model_cfg
+        narrow_claim, best_section, purpose, client, model_cfg, slot
     )
 
     priority = {
@@ -1136,7 +1478,14 @@ async def run_claim_verification(
             for ic in config.manuscript_context.inline_citations
         ]
     else:
-        claims = extract_claim_contexts(tex_path)
+        # For .tex, use the cached / freshly-built ManuscriptContext so
+        # extract_claim_contexts can read pre-populated cite contexts
+        # from inline_citations instead of re-parsing the body. Footnote
+        # URLs still require a body parse (they're not in inline_citations).
+        from sciwrite_lint.manuscript_store import get_or_create_manuscript_context
+
+        tex_ctx = get_or_create_manuscript_context(tex_path, config)
+        claims = extract_claim_contexts(tex_path, ctx=tex_ctx)
     logger.info(f"Found {len(claims)} citation contexts in {paper_name}")
 
     verifiable = [cl for cl in claims if cl.key in local_files]
@@ -1148,19 +1497,57 @@ async def run_claim_verification(
     if limit:
         verifiable = verifiable[:limit]
         logger.info(f"Limited to {limit} claims")
-    if not verifiable:
-        logger.info("No claims with local sources to verify")
-        return []
+
+    # Build SKIPPED rows for cites that never reach the verifier — every
+    # inline citation gets a row in claim_results so the table is the
+    # single source of truth (no JOIN against manuscript_citations
+    # required to find unverifiable cites).
+    verifiable_pks = {(cl.key, cl.line) for cl in verifiable}
+    skipped_results: list[dict] = []
+    for cl in claims:
+        if (cl.key, cl.line) in verifiable_pks:
+            continue
+        if cl.key not in local_files:
+            reason = SKIP_NO_LOCAL_SOURCE
+        elif key_filter and cl.key != key_filter:
+            reason = SKIP_KEY_FILTER_EXCLUDED
+        else:
+            reason = SKIP_LIMIT_TRUNCATED
+        skipped_results.append(
+            {
+                "key": cl.key,
+                "line": cl.line,
+                "context": cl.context,
+                "verdict": VERDICT_SKIPPED,
+                "skip_reason": reason,
+            }
+        )
+    if skipped_results:
+        logger.info(f"{len(skipped_results)} cites skipped (no_local_source / filter)")
 
     # Ensure claim query vectors exist. In the full pipeline, Stage 4b
     # pre-computes these; standalone callers (verify-claims, library use)
     # hit this path and spawn the embedding subprocess for missing ones.
+    # Persist the inline citations first so the subprocess can read
+    # contexts from workspace.db. The standalone path has no findings
+    # list to populate, so any build-warning Finding is logged and
+    # dropped — pipeline runs route it to system_issues correctly.
     if backend != "claude":
-        from sciwrite_lint.pipeline import ensure_claim_query_vectors
-
-        ensure_claim_query_vectors(
-            [cl.context for cl in verifiable], references_dir, config
+        from sciwrite_lint.pipeline import (
+            ensure_claim_query_vectors,
+            persist_manuscript_citations,
         )
+
+        _, build_finding = persist_manuscript_citations(
+            config, references_dir, tex_path=tex_path
+        )
+        if build_finding is not None:
+            logger.warning(
+                "Manuscript-context build warning surfaced (standalone "
+                "verify-claims; not surfaced as system issue): {}",
+                build_finding.context,
+            )
+        ensure_claim_query_vectors(references_dir, config)
 
     if backend == "claude":
         vllm_model = ""
@@ -1241,7 +1628,33 @@ async def run_claim_verification(
             ref_sections[claim.key] = split_sections(ref_text) if ref_text else []
 
     _CLAIM_CONCURRENCY = 5
-    sem = asyncio.Semaphore(_CLAIM_CONCURRENCY)
+    # Use the dynamic controller only when the vllm backend is active.
+    # Claude CLI has its own server-side admission, so a static
+    # semaphore is the right tool for it. ``concurrency_slot`` handles
+    # both branches uniformly so the loop body doesn't care which
+    # backend is in play.
+    from sciwrite_lint.llm.concurrency_optimizer import (
+        ControllerParams,
+        concurrency_slot,
+    )
+
+    _ctrl_params = ControllerParams(
+        target_kv_lo=config.concurrency_target_kv_lo,
+        target_kv_grow=config.concurrency_target_kv_grow,
+        target_kv_hi=config.concurrency_target_kv_hi,
+    )
+    _use_dynamic = backend == "vllm" and config.use_dynamic_concurrency
+    _slot_static_cap = (
+        config.llm_max_concurrency if _use_dynamic else _CLAIM_CONCURRENCY
+    )
+    if _use_dynamic:
+        # Never push past vLLM's admission ceiling — see effective_max_concurrency.
+        from sciwrite_lint.vllm.vllm_server import effective_max_concurrency
+
+        _slot_static_cap = effective_max_concurrency(
+            config, _slot_static_cap, label="claim-verify"
+        )
+
     completed = 0
 
     async def _verify_one(
@@ -1257,35 +1670,42 @@ async def run_claim_verification(
                 f"{ref_path.name} is a web page summary, not the actual paper"
             )
 
-        async with sem:
-            if backend == "claude":
+        if backend == "claude":
+            # Claude CLI has its own server-side admission; use the slot
+            # as an outer per-claim throttle.
+            async with _slot():
                 from sciwrite_lint.claude_backend import verify_claim_claude
 
                 logger.debug(f"Reference: {ref_path.name}")
                 logger.info("Sending to Claude CLI...")
                 project_dir = config.project_dir if config else None
                 verdict = verify_claim_claude(claim, ref_path, project_dir=project_dir)
-            else:
-                sections = ref_sections[claim.key]
-                if not sections:
-                    results[idx] = {
-                        "key": claim.key,
-                        "line": claim.line,
-                        "context": claim.context,
-                        "verdict": "CANNOT_DETERMINE",
-                        "explanation": "Could not read reference",
-                    }
-                    return
+        else:
+            # vLLM: the slot wraps each individual LLM call inside
+            # verify_claim_vllm, so the controller's dynamic cap bounds
+            # the actual vLLM request volume regardless of how many
+            # claims and ladder fan-outs run in parallel.
+            sections = ref_sections[claim.key]
+            if not sections:
+                results[idx] = {
+                    "key": claim.key,
+                    "line": claim.line,
+                    "context": claim.context,
+                    "verdict": "CANNOT_DETERMINE",
+                    "explanation": "Could not read reference",
+                }
+                return
 
-                logger.debug(f"Reference: {ref_path.name} ({len(sections)} sections)")
-                verdict = await verify_claim_vllm(
-                    claim,
-                    sections,
-                    config=config,
-                    model_name=vllm_model,
-                    references_dir=references_dir,
-                    client=vllm_client,
-                )
+            logger.debug(f"Reference: {ref_path.name} ({len(sections)} sections)")
+            verdict = await verify_claim_vllm(
+                claim,
+                sections,
+                config=config,
+                model_name=vllm_model,
+                references_dir=references_dir,
+                client=vllm_client,
+                slot=_slot,
+            )
 
         if verdict:
             verdict["key"] = claim.key
@@ -1314,29 +1734,40 @@ async def run_claim_verification(
             }
 
     if to_verify:
-        logger.info(
-            f"Verifying {len(to_verify)} claims ({_CLAIM_CONCURRENCY} concurrent)"
-        )
-        if backend == "claude":
-            await asyncio.gather(*[_verify_one(idx, c, None) for idx, c in to_verify])
-        else:
-            # Shared vLLM client for all claim verifications — avoids
-            # creating and tearing down a connection per claim.
-            from openai import AsyncOpenAI
-
-            async with AsyncOpenAI(
-                base_url=config.llm_endpoint,
-                api_key="dummy",
-                timeout=config.llm_timeout,
-            ) as vllm_client:
+        cap_label = "dynamic" if _use_dynamic else str(_CLAIM_CONCURRENCY)
+        logger.info(f"Verifying {len(to_verify)} claims ({cap_label} concurrent)")
+        async with concurrency_slot(
+            use_dynamic=_use_dynamic,
+            endpoint=config.llm_endpoint,
+            size_class="medium",
+            static_cap=_slot_static_cap,
+            label="claim-verify",
+            params=_ctrl_params,
+        ) as _slot:
+            if backend == "claude":
                 await asyncio.gather(
-                    *[_verify_one(idx, c, vllm_client) for idx, c in to_verify]
+                    *[_verify_one(idx, c, None) for idx, c in to_verify]
                 )
+            else:
+                # Shared vLLM client for all claim verifications — avoids
+                # creating and tearing down a connection per claim.
+                from openai import AsyncOpenAI
+
+                async with AsyncOpenAI(
+                    base_url=config.llm_endpoint,
+                    api_key="dummy",
+                    timeout=config.llm_timeout,
+                ) as vllm_client:
+                    await asyncio.gather(
+                        *[_verify_one(idx, c, vllm_client) for idx, c in to_verify]
+                    )
 
     # Flatten — any None slots are claims that fell through (shouldn't happen)
-    final_results = [r for r in results if r is not None]
+    verified_results = [r for r in results if r is not None]
 
-    # Re-apply dismissals
+    # Re-apply dismissals to verified rows. Skipped rows can also be
+    # dismissed by reviewers (e.g. "this cite intentionally has no source").
+    final_results: list[dict] = verified_results + skipped_results
     for r in final_results:
         pk = (r.get("key", ""), r.get("line", 0))
         if pk in dismissals:
@@ -1345,6 +1776,10 @@ async def run_claim_verification(
     # Save to workspace.db
     with get_db(references_dir) as _claims_conn:
         save_claim_results(_claims_conn, final_results)
-    logger.info("Claim results saved to workspace.db")
+    logger.info(
+        "Claim results saved to workspace.db ({} verified, {} skipped)",
+        len(verified_results),
+        len(skipped_results),
+    )
 
     return final_results

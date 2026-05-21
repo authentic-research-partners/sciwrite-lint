@@ -14,10 +14,13 @@ from __future__ import annotations
 import re
 from pydantic import BaseModel, Field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.eval_claims import Section
+
+if TYPE_CHECKING:
+    from sciwrite_lint.models import Finding
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +214,12 @@ class ManuscriptContext(BaseModel):
     GROBID-parsed PDF via ``from_grobid()``, or from stored GROBID
     markdown via ``from_markdown()``. All checks consume this
     interface — they never touch raw .tex or GrobidResult directly.
+
+    ``build_warnings`` carries non-fatal failures encountered while
+    building the context (e.g. cite-context attach raised). The
+    pipeline collects these and routes them to ``system_issues`` via
+    ``persist_inline_citations`` so the user sees a system-issue
+    Finding instead of a silent log line.
     """
 
     source_path: Path
@@ -222,8 +231,11 @@ class ManuscriptContext(BaseModel):
     inline_citations: list[InlineCitation] = Field(default_factory=list)
     parsed_references: list[ParsedReference] = Field(default_factory=list)
     embeddings_available: bool = False
+    build_warnings: list[str] = Field(default_factory=list)
 
-    # Backward compat — checks that still use ctx.tex_path
+    # ``tex_path`` reads more naturally than ``source_path`` in LaTeX-only
+    # code paths; both are the same Path. Use either name based on which
+    # reads clearer at the call site.
     @property
     def tex_path(self) -> Path:
         return self.source_path
@@ -312,6 +324,111 @@ def clear_cache() -> None:
     _cache.clear()
 
 
+def manuscript_ref_key(source_path: Path) -> str:
+    """Stable ref_key for the manuscript itself.
+
+    Used as the chunks/chunk_embeddings ``ref_key`` so the manuscript
+    sits in the same retrieval store as parsed references but never
+    collides with a real bib key (the ``_manuscript_`` prefix is
+    reserved). Both the embedding pipeline and consistency-pair
+    retrieval use this helper — keep them in sync.
+    """
+    return f"_manuscript_{source_path.stem}"
+
+
+def write_manuscript_markdown(
+    ctx: ManuscriptContext, references_dir: Path
+) -> Path | None:
+    """Serialize ``ctx`` to ``parsed/_manuscript_{stem}.md`` for embedding.
+
+    The embedding subprocess resolves keys to ``parsed/{key}.md`` and
+    runs ``compute_and_store_embeddings`` on the file. We feed the
+    manuscript through the same path: write the abstract + every section
+    as markdown headings, return the file path.
+
+    Returns the written path, or ``None`` if the context has no usable
+    text. The file is overwritten on each call — ``has_embeddings``
+    keys off ``ref_status`` (the embedding stage owns idempotency).
+    """
+    parts: list[str] = []
+    if ctx.abstract.strip():
+        parts.append("# Abstract\n\n" + ctx.abstract.strip())
+    for sec in ctx.sections:
+        body = (sec.clean_text or "").strip()
+        if not body:
+            continue
+        title = (sec.title or "Untitled").strip()
+        parts.append(f"# {title}\n\n{body}")
+    if not parts:
+        return None
+
+    out_dir = references_dir / "parsed"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{manuscript_ref_key(ctx.source_path)}.md"
+    out_path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+    return out_path
+
+
+def persist_inline_citations(
+    ctx: ManuscriptContext,
+    references_dir: Path,
+    source_hash: str = "",
+) -> "Finding | None":
+    """Persist ``ctx.inline_citations`` to ``workspace.db.manuscript_citations``.
+
+    Writes one row per citation occurrence so the embedding subprocess can
+    read claim contexts directly from the DB instead of receiving them
+    across the process boundary as JSON. The .tex path populates
+    ``InlineCitation.context`` during ``_build_context_latex`` (single
+    parse, single source of truth via ``_extract_cite_claims_from_body``),
+    so this function reads ``ic.context`` directly without re-parsing.
+    ``source_hash`` is recorded for traceability — empty string means
+    the caller had no hash to record.
+
+    Returns a system-issue ``Finding`` (rule_id ``internal-error``) when
+    ``ctx.build_warnings`` is non-empty — non-fatal build failures (e.g.
+    cite-context attach raised) are surfaced in the report's
+    ``system_issues`` bucket instead of being swallowed. Returns ``None``
+    on a clean build.
+    """
+    from sciwrite_lint.references.workspace_db import (
+        ManuscriptCitation,
+        get_db,
+        replace_manuscript_citations,
+    )
+
+    rows = [
+        ManuscriptCitation(
+            ref_key=ic.key,
+            line=ic.line,
+            section=ic.section,
+            context=ic.context,
+        )
+        for ic in ctx.inline_citations
+    ]
+
+    with get_db(references_dir) as conn:
+        replace_manuscript_citations(
+            conn,
+            source_type=ctx.source_type,
+            source_hash=source_hash,
+            citations=rows,
+        )
+
+    if ctx.build_warnings:
+        from sciwrite_lint.models import Finding
+
+        return Finding(
+            level="warning",
+            rule_id="internal-error",
+            message="manuscript-context build produced warnings; "
+            "claim retrieval may be degraded",
+            file=str(ctx.source_path),
+            context="; ".join(ctx.build_warnings)[:200],
+        )
+    return None
+
+
 def _build_context_latex(tex_path: Path, config: LintConfig) -> ManuscriptContext:
     """Parse manuscript from LaTeX, clean markup via pandoc, build context.
 
@@ -335,10 +452,13 @@ def _build_context_latex(tex_path: Path, config: LintConfig) -> ManuscriptContex
         strip_non_prose_environments_preserve_lines,
     )
 
+    # Read + strip_comments exactly once, then pass through to the
+    # section/abstract extractors. They each used to re-read the file
+    # and re-strip comments — three round trips for the same data.
     text = strip_comments(tex_path.read_text(encoding="utf-8"))
 
-    raw_sections = analyze_sections_with_text(tex_path)
-    abstract_raw = get_abstract_text(tex_path)
+    raw_sections = analyze_sections_with_text(tex_path, text=text)
+    abstract_raw = get_abstract_text(tex_path, text=text)
 
     # Collect every paragraph from abstract + sections into one flat list
     # so pandoc runs once. Each entry carries an owner tag so we can
@@ -398,9 +518,44 @@ def _build_context_latex(tex_path: Path, config: LintConfig) -> ManuscriptContex
 
     bibliography_raw = extract_bibliography(text)
 
+    # Attach paragraph context to each inline citation now, while we
+    # already have the body text in scope. Downstream consumers
+    # (manuscript_citations persist, claim verification) rely on
+    # InlineCitation.context being populated, and computing it here
+    # eliminates a second .tex parse later in the pipeline. The shared
+    # _extract_cite_claims_from_body helper is the single source of
+    # truth so this pre-population matches what extract_claim_contexts
+    # produces — query_vectors are keyed by sha256(context) and would
+    # cache-miss if the two paths diverged.
+    from sciwrite_lint.eval_claims import (
+        _extract_cite_claims_from_body,
+        _slice_tex_body,
+    )
+
     cite_keys = find_all_cite_keys(text)
+    build_warnings: list[str] = []
+    try:
+        body = _slice_tex_body(text, tex_path)
+        line_offset = text[: text.find("\\begin{document}")].count("\n")
+        ctx_by_keyline = {
+            (cl.key, cl.line): cl.context
+            for cl in _extract_cite_claims_from_body(body, line_offset=line_offset)
+        }
+    except Exception as e:
+        from loguru import logger as _logger
+
+        msg = f"Cite-context attach failed: {type(e).__name__}: {e}"
+        _logger.warning("{} ({}); citations persist with empty contexts", msg, tex_path)
+        build_warnings.append(msg)
+        ctx_by_keyline = {}
+
     inline_citations = [
-        InlineCitation(key=key, line=line_no, context="") for line_no, key in cite_keys
+        InlineCitation(
+            key=key,
+            line=line_no,
+            context=ctx_by_keyline.get((key, line_no), ""),
+        )
+        for line_no, key in cite_keys
     ]
 
     ctx = ManuscriptContext(
@@ -411,6 +566,7 @@ def _build_context_latex(tex_path: Path, config: LintConfig) -> ManuscriptContex
         abstract_raw=abstract_raw,
         bibliography_raw=bibliography_raw,
         inline_citations=inline_citations,
+        build_warnings=build_warnings,
     )
 
     # Embeddings are computed separately via `sciwrite-lint parse`.
@@ -595,7 +751,7 @@ def _generate_cite_key(
                 surname = re.sub(r"[^a-zA-Z]", "", parts[0])
         surname = re.sub(r"[^a-zA-Z]", "", surname).lower()
     else:
-        # Fallback: first word of title
+        # No author surname — use first word of title
         words = re.sub(r"[^a-zA-Z\s]", "", title).split()
         surname = words[0].lower() if words else "unknown"
 

@@ -24,7 +24,7 @@ from loguru import logger
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.models import CitationMetadata, Finding
 
-from evals.synthetic_types import (  # noqa: F401 — re-export for backward compat
+from evals.synthetic_types import (
     CaseResult,
     CheckMetrics,
     EvalResult,
@@ -328,7 +328,7 @@ def _match_findings(
                 found = True
                 used_findings.add(i)
                 break
-        # Fallback: if no context-specific match, any unmatched finding counts
+        # Next pass: if no context-specific match, any unmatched finding counts
         if not found and exp.context == "":
             for i, f in enumerate(check_findings):
                 if i not in used_findings:

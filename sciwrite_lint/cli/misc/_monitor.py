@@ -8,9 +8,12 @@ formatting helpers, and the main event loop.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from loguru import logger
 
 if TYPE_CHECKING:
     from rich.panel import Panel
@@ -46,6 +49,46 @@ def _fetch_vllm_metrics(endpoint: str) -> str | None:
     return fetch_metrics_summary(endpoint)
 
 
+def _read_vllm_server_args(runtime: str, container: str) -> dict[str, str]:
+    """Read scheduling-relevant launch args from a running vLLM container.
+
+    Returns a dict with ``max_num_batched_tokens`` and ``max_num_seqs`` (and
+    any future scheduler knobs we want to surface). vLLM does not expose
+    these through ``/metrics`` (only ``cache_config_info`` is published),
+    so we have to inspect the container's command-line. Args don't change
+    while the container is running, so the caller can cache the result.
+    Best-effort — any failure returns an empty dict so the monitor still
+    renders.
+    """
+    try:
+        import json as _json
+
+        result = subprocess.run(
+            [runtime, "inspect", container],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return {}
+        data = _json.loads(result.stdout)
+        if not data:
+            return {}
+        cmd: list[str] = data[0].get("Config", {}).get("Cmd", []) or []
+    except (OSError, subprocess.TimeoutExpired, _json.JSONDecodeError, IndexError) as e:
+        logger.debug(
+            "container inspect failed for {}: {}: {}", container, type(e).__name__, e
+        )
+        return {}
+
+    args: dict[str, str] = {}
+    keys = {"--max-num-batched-tokens", "--max-num-seqs"}
+    for i, tok in enumerate(cmd):
+        if tok in keys and i + 1 < len(cmd):
+            args[tok.lstrip("-").replace("-", "_")] = cmd[i + 1]
+    return args
+
+
 def _fetch_vllm_metrics_full(endpoint: str) -> dict[str, float | int | str]:
     """Full metrics dict for the live monitor."""
     from sciwrite_lint.vllm.metrics import fetch_metrics
@@ -76,6 +119,253 @@ def _bar_color(pct: float) -> str:
     return "red"
 
 
+def _read_recent_controller_samples(endpoint: str, limit: int = 10) -> list:
+    """Read the last ``limit`` controller telemetry rows for this endpoint.
+
+    Returns an empty list if the controller never ran or the table is
+    empty. Best-effort — never raises so monitor stays robust.
+    """
+    try:
+        from sciwrite_lint.llm.concurrency_optimizer import read_recent
+
+        return read_recent(endpoint=endpoint, limit=limit)
+    except (sqlite3.Error, OSError) as e:
+        logger.debug(
+            "controller-telemetry read failed for {}: {}: {}",
+            endpoint,
+            type(e).__name__,
+            e,
+        )
+        return []
+
+
+def _count_embed_keys_in_cmdline(cmd: str) -> int:
+    """Count how many ref_keys are passed to a running embedder subprocess.
+
+    The embedder is invoked as ``python -c "... _embed_keys('a,b,c', '/path')"``.
+    The first argument is a quoted, comma-separated CSV of citation keys.
+    We have to find the closing quote of that arg rather than splitting on
+    the first comma — the keys themselves are comma-separated, so naive
+    splitting truncates the count to 1.
+
+    Returns 0 if the cmdline doesn't contain the entry-point name or the
+    first arg can't be parsed as a quoted string.
+    """
+    if "_embed_keys(" not in cmd:
+        return 0
+    try:
+        after = cmd.split("_embed_keys(", 1)[1]
+        quote = after[:1]
+        if quote not in ("'", '"'):
+            return 0
+        keys_str = after[1:].split(quote, 1)[0]
+        return len([k for k in keys_str.split(",") if k])
+    except (IndexError, ValueError) as e:
+        logger.debug("embed-key count parse failed ({}: {})", type(e).__name__, e)
+        return 0
+
+
+def _detect_embedder_processes() -> list[tuple[int, float, int]]:
+    """Find sciwrite-lint embedder subprocesses currently running on this host.
+
+    Returns a list of ``(pid, age_seconds, n_keys)`` for each match. The
+    embedder is invoked via ``python -c "from sciwrite_lint.pipeline import
+    _embed_keys; ..."`` (or ``_batch_embed_entry`` in the staged pipeline);
+    we scan ``/proc/<pid>/cmdline`` for those entry-point names. ``n_keys``
+    is parsed from the comma-separated keys argument when available, else 0.
+    Best-effort — Linux only (no /proc on macOS), never raises.
+    """
+    import time as _time
+
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+
+    out: list[tuple[int, float, int]] = []
+    now = _time.time()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        cmd_path = entry / "cmdline"
+        try:
+            cmd = (
+                cmd_path.read_bytes()
+                .replace(b"\x00", b" ")
+                .decode("utf-8", errors="replace")
+            )
+        except OSError:
+            continue
+        if "_embed_keys(" not in cmd and "_batch_embed_entry(" not in cmd:
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            # field 22 is starttime in clock ticks since boot
+            after_comm = stat.rsplit(") ", 1)[-1].split()
+            starttime_ticks = int(after_comm[19])
+            import os as _os
+
+            hz = _os.sysconf("SC_CLK_TCK") or 100
+            with (Path("/proc/uptime")).open() as f:
+                uptime_s = float(f.read().split()[0])
+            boot = now - uptime_s
+            age_s = now - (boot + starttime_ticks / hz)
+        except (OSError, ValueError, IndexError):
+            age_s = 0.0
+        n_keys = _count_embed_keys_in_cmdline(cmd)
+        out.append((int(entry.name), max(0.0, age_s), n_keys))
+    return out
+
+
+_embedder_model_info_cache: tuple[str, int, int, int] | None = None
+
+
+def _resolve_embedder_model_info() -> tuple[str, int, int, int] | None:
+    """Resolve (model_name, hidden_size, num_layers, max_seq_len) for display.
+
+    Reads the configured embedding model name and probes its HuggingFace
+    config (config.json only — no weights download). Cached per monitor
+    process since the model name doesn't change at runtime. Returns
+    ``None`` if probing fails (no cache, network unreachable, weird
+    custom config), in which case the panel just omits the budget line.
+    """
+    global _embedder_model_info_cache
+    if _embedder_model_info_cache is not None:
+        return _embedder_model_info_cache
+    try:
+        from transformers import AutoConfig
+
+        from sciwrite_lint.references.reference_store import _get_embedding_config
+
+        model_name, _, _ = _get_embedding_config()
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        max_seq = getattr(cfg, "max_position_embeddings", None) or 8192
+        _embedder_model_info_cache = (
+            model_name,
+            int(cfg.hidden_size),
+            int(cfg.num_hidden_layers),
+            int(max_seq),
+        )
+    except (OSError, AttributeError, ValueError) as e:
+        # HF AutoConfig.from_pretrained surfaces OSError (download/IO),
+        # AttributeError (missing config field), or ValueError (parse).
+        logger.debug("embedder model info probe failed ({}: {})", type(e).__name__, e)
+        return None
+    return _embedder_model_info_cache
+
+
+def _embedder_panel_title(running: bool) -> str:
+    """Panel title with the configured embedder model name.
+
+    Reads the model name from the project config (cheap, always
+    available). Falls back to a generic title if config can't be read.
+    """
+    try:
+        from sciwrite_lint.references.reference_store import _get_embedding_config
+
+        model_name, _, _ = _get_embedding_config()
+        short = model_name.split("/")[-1]
+    except (OSError, FileNotFoundError, ValueError, AttributeError) as e:
+        # Config file may be missing or unparseable; fall back to the
+        # generic title. WARN-by-DEBUG so monitor stays robust.
+        logger.debug(
+            "embedder panel title — config probe failed ({}: {})",
+            type(e).__name__,
+            e,
+        )
+        return "Embedder (sentence-transformers subprocess)" if running else "Embedder"
+    suffix = " (sentence-transformers subprocess)" if running else ""
+    return f"Embedder · {short}{suffix}"
+
+
+def _build_embedder_panel(
+    infos: list[tuple[int, float, int]],
+) -> "Panel":
+    """Build the Embedder status panel — host-side subprocess view.
+
+    The embedder runs as a Python subprocess (not a container), so it's
+    invisible to ``podman ps``. This panel makes it visible by scanning
+    ``/proc`` for the entry-point match and showing per-process age and
+    key count when active. The configured model name appears in the
+    title regardless of run state. The estimated-peak-VRAM / budget
+    line is shown when the HF AutoConfig probe succeeds.
+    """
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    model_info = _resolve_embedder_model_info()
+    budget_line: Text | None = None
+    if model_info is not None:
+        from sciwrite_lint.references.embedding_store import _ENCODE_BATCH_SIZE
+        from sciwrite_lint.references.reference_store import (
+            _estimate_embedder_peak_vram_gb,
+            expected_embed_vram_budget_gb,
+        )
+
+        _, hidden, layers, max_seq = model_info
+        peak_gb = _estimate_embedder_peak_vram_gb(
+            hidden_size=hidden,
+            num_layers=layers,
+            max_seq_len=max_seq,
+            batch_size=_ENCODE_BATCH_SIZE,
+        )
+        # Use total VRAM × 0.85 (post-swap budget) so the displayed
+        # number reflects "what the embedder will have when its
+        # subprocess actually runs", not "what's free right now while
+        # text vLLM is hogging VRAM". The swap pattern guarantees the
+        # embedder always runs alone — the displayed budget should
+        # match that reality.
+        budget_gb = expected_embed_vram_budget_gb()
+        budget_line = Text()
+        budget_line.append(f"batch={_ENCODE_BATCH_SIZE}", style="dim")
+        budget_line.append("  ·  ", style="dim")
+        peak_style = "yellow" if peak_gb > budget_gb else "dim"
+        budget_line.append(f"est. peak {peak_gb:.1f} GiB", style=peak_style)
+        budget_line.append(f" / budget {budget_gb:.1f} GiB", style="dim")
+
+    if not infos:
+        msg = Text()
+        msg.append("idle", style="dim")
+        msg.append("  —  ", style="dim")
+        msg.append("starts as a subprocess during parse / ref_internal", style="dim")
+        title = _embedder_panel_title(running=False)
+        if budget_line is None:
+            return Panel(msg, title=title, border_style="dim", padding=(0, 2))
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column()
+        grid.add_row(msg)
+        grid.add_row(budget_line)
+        return Panel(grid, title=title, border_style="dim", padding=(0, 2))
+
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold cyan", min_width=12)
+    grid.add_column()
+
+    for pid, age_s, n_keys in infos:
+        line = Text()
+        line.append(f"running for {_fmt_duration(age_s)}", style="green")
+        if n_keys:
+            line.append(f"  ·  {n_keys} keys", style="dim")
+        line.append(f"  ·  pid {pid}", style="dim")
+        grid.add_row("Status", line)
+    grid.add_row(
+        "",
+        Text(
+            "owns GPU during embed; text vLLM is stopped to free VRAM",
+            style="dim italic",
+        ),
+    )
+    if budget_line is not None:
+        grid.add_row("", budget_line)
+
+    return Panel(
+        grid,
+        title=_embedder_panel_title(running=True),
+        border_style="green",
+        padding=(0, 2),
+    )
+
+
 def _build_monitor_table(
     *,
     model_name: str,
@@ -91,6 +381,7 @@ def _build_monitor_table(
     prompt_tok: float,
     gen_tok: float,
     preemption_rate: float,
+    server_args: dict[str, str] | None = None,
 ) -> "Table":
     """Build a rich Table with all monitor sections."""
     from rich.table import Table
@@ -104,6 +395,23 @@ def _build_monitor_table(
     max_seq = metrics.get("max_seq")
     max_seq_str = f"  max_seq: {max_seq:,}" if max_seq else ""
     grid.add_row("Model", f"{model_name}{max_seq_str}")
+
+    # vLLM scheduler knobs that don't show up in /metrics. We read them
+    # from the container's launch command (cached by the caller). They
+    # govern how many requests vLLM admits and how much per-step compute
+    # budget is split among prefill chunks + decode tokens — the levers
+    # the operator is most likely tuning when monitoring saturation.
+    # ``max_model_len`` is intentionally omitted: it's already shown as
+    # ``max_seq`` next to the Model row (vLLM publishes it in /metrics
+    # as ``cache_config_info``-derived ``max_seq``, same value).
+    if server_args:
+        knobs = []
+        if "max_num_seqs" in server_args:
+            knobs.append(f"max-num-seqs: {server_args['max_num_seqs']}")
+        if "max_num_batched_tokens" in server_args:
+            knobs.append(f"max-batched-tokens: {server_args['max_num_batched_tokens']}")
+        if knobs:
+            grid.add_row("Scheduler", "  ".join(knobs))
     if vram:
         vram_used, vram_total = vram
         vram_used_gb = vram_used / (1024**3)
@@ -115,6 +423,34 @@ def _build_monitor_table(
         vram_text.append(_bar(vram_pct), style=vram_color)
         vram_text.append(f"  {vram_used_gb:.1f}GB / {vram_total_gb:.1f}GB", style="dim")
         grid.add_row("VRAM", vram_text)
+
+        # Spillover-risk warning when free VRAM is tight. Windows
+        # ``\GPU Adapter Memory`` counters can't see NVIDIA's CUDA
+        # allocations (they bypass WDDM accounting), so we can't directly
+        # measure shared-memory usage from inside WSL2. The reliable
+        # leading indicator is dedicated VRAM free: when it drops below
+        # ~500 MB, the next consumer (embedder, second container) will
+        # either OOM (native Linux) or silently spill to system RAM via
+        # PCIe (WSL2). Surface it before that happens.
+        vram_free = vram_total - vram_used
+        free_mb = vram_free / (1024**2)
+        if free_mb < 500:
+            from sciwrite_lint.config import is_wsl2
+
+            warn_text = Text()
+            if free_mb < 200:
+                warn_text.append(f"only {free_mb:.0f} MB free", style="red bold")
+            else:
+                warn_text.append(f"{free_mb:.0f} MB free", style="yellow bold")
+            # Same trigger, different failure mode: WSL2 spills the
+            # overflow to shared sysmem (slow but succeeds); native
+            # Linux raises CUDA OOM (the new consumer crashes).
+            if is_wsl2():
+                hint = "  — new GPU work may spill to shared sysmem (slow)"
+            else:
+                hint = "  — new GPU work may hit CUDA OOM"
+            warn_text.append(hint, style="dim")
+            grid.add_row("VRAM pressure", warn_text)
     if gpu_util_pct is not None:
         gpu_pct = gpu_util_pct / 100
         # High GPU load is good (working), not a problem — use green/dim
@@ -150,7 +486,7 @@ def _build_monitor_table(
     swapped = int(metrics.get("requests_swapped", 0))
     req_text = Text()
     req_text.append(f"running: {running}", style="bold" if running else "dim")
-    req_text.append(f"   waiting: {waiting}", style="red bold" if waiting else "dim")
+    req_text.append(f"   queued: {waiting}", style="red bold" if waiting else "dim")
     req_text.append(f"   swapped: {swapped}", style="red bold" if swapped else "dim")
     grid.add_row("Requests", req_text)
 
@@ -257,6 +593,60 @@ def _build_monitor_table(
     tp.append(f"   total: {int(prompt_tok + gen_tok):,} tokens served", style="dim")
     grid.add_row("Throughput", tp)
 
+    # --- Concurrency controller ---
+    # When ``use_dynamic_concurrency`` is on, every controller tick
+    # writes to ``controller_samples`` in usage.db. Show the most recent
+    # state plus a tiny cap-trend so the operator sees what the
+    # controller is doing without having to grep logs.
+    ctrl_rows = _read_recent_controller_samples(endpoint, limit=10)
+    if ctrl_rows:
+        import time as _time
+
+        latest = ctrl_rows[0]
+        age_s = _time.time() - latest.ts
+        # The polling task writes every ~2s; older than ~10s means the
+        # controller has stopped (refcount→0 at end of stage), not just
+        # idle. Show a stopped-state line so stale ``awaiting`` /
+        # ``cap`` values don't read as live.
+        if age_s > 10:
+            mins = age_s / 60.0
+            age_str = f"{age_s:.0f}s ago" if age_s < 90 else f"{mins:.1f}m ago"
+            ctrl_text = Text()
+            ctrl_text.append("no active controller", style="dim")
+            ctrl_text.append(f"  (last row {age_str})", style="dim")
+            grid.add_row("Controller", ctrl_text)
+        else:
+            # Cap trend: oldest -> newest, deduped to changes only.
+            seen_caps: list[int] = []
+            for row in reversed(ctrl_rows):  # oldest first
+                if not seen_caps or seen_caps[-1] != row.current_cap:
+                    seen_caps.append(row.current_cap)
+            trend = " → ".join(str(c) for c in seen_caps[-5:])
+
+            reason_color = (
+                "yellow"
+                if latest.reason.startswith("shrink")
+                else "green"
+                if latest.reason.startswith("grow")
+                else "dim"
+            )
+            ctrl_text = Text()
+            ctrl_text.append(f"cap: {latest.current_cap}", style="bold cyan")
+            ctrl_text.append(
+                f"   awaiting: {latest.local_in_flight}",
+                style="dim" if latest.local_in_flight else "dim",
+            )
+            ctrl_text.append(f"   {latest.reason}", style=reason_color)
+            if len(seen_caps) > 1:
+                ctrl_text.append(f"   trend: {trend}", style="dim")
+            grid.add_row("Controller", ctrl_text)
+            legend = Text(
+                "cap = max we'll send · awaiting = sent, response not back "
+                "· running/queued = vLLM's view (above)",
+                style="dim italic",
+            )
+            grid.add_row("", legend)
+
     # --- Health assessment ---
     grid.add_row("", "")
     warnings: list[str] = []
@@ -294,6 +684,7 @@ def _build_grobid_panel(
     ram_used_bytes: int | None,
     ram_limit_bytes: int | None,
     config_limit: str,
+    cpu_cores: float | None = None,
 ) -> "Panel":
     """Build the GROBID status panel."""
     from rich.panel import Panel
@@ -312,6 +703,22 @@ def _build_grobid_panel(
     grid.add_column()
 
     grid.add_row("Status", Text("running", style="green"))
+
+    # Activity indicator instead of a raw CPU bar — for ~80% of a
+    # bench / pipeline run GROBID is genuinely idle (parse is the
+    # only stage that drives it), so a CPU bar reads as "stuck at
+    # zero" and looks like a broken metric. The CPU sample is still
+    # the underlying signal, just rendered semantically: any
+    # in-flight HTTP request pushes cores well above 0.1, so the
+    # threshold cleanly distinguishes "parsing" from "idle".
+    if cpu_cores is not None:
+        if cpu_cores > 0.1:
+            activity = Text()
+            activity.append("parsing", style="green")
+            activity.append(f"  ({cpu_cores:.1f} cores)", style="dim")
+        else:
+            activity = Text("idle", style="dim")
+        grid.add_row("Activity", activity)
 
     if ram_used_bytes is not None:
         used_gb = ram_used_bytes / (1024**3)
@@ -419,7 +826,13 @@ def _load_stages(workspace_root: Path) -> list[dict[str, str | float | None]] | 
     try:
         with get_db(workspace_root) as conn:
             stages = load_pipeline_stages(conn)
-    except Exception:
+    except sqlite3.Error as e:
+        logger.debug(
+            "pipeline-stages read failed for {}: {}: {}",
+            workspace_root,
+            type(e).__name__,
+            e,
+        )
         return None
     return stages or None
 
@@ -604,6 +1017,7 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
     from sciwrite_lint.pdf.grobid import (
         CONTAINER_NAME as GROBID_CONTAINER,
         CONTAINER_RUNTIME,
+        _read_cgroup_cpu_usage_usec,
         _read_cgroup_memory,
         _resolve_cgroup_dir,
         gpu_memory_status,
@@ -624,11 +1038,24 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
     vllm_text_port = _parsed_ep.port or 5001
     runtime = _detect_container_runtime()
     vllm_cname = vllm_container_name(config.llm_model)
+    # Cache server launch args per container — they don't change while
+    # the container runs, and ``podman inspect`` is too slow to call on
+    # every refresh tick. Refresh keys lazily on first sight of a
+    # container; ``--recreate`` produces a new container so the lookup
+    # naturally re-runs once for the new instance.
+    server_args_cache: dict[str, dict[str, str]] = {}
+
+    def _server_args_for(cname: str) -> dict[str, str]:
+        if cname not in server_args_cache and runtime:
+            server_args_cache[cname] = _read_vllm_server_args(runtime, cname)
+        return server_args_cache.get(cname, {})
 
     prev_prompt_tokens = 0.0
     prev_gen_tokens = 0.0
     prev_preemptions = 0.0
     prev_time = 0.0
+    grobid_prev_cpu_us: int | None = None
+    grobid_prev_cpu_time = 0.0
     vm_prev: dict[str, dict[str, float]] = {}
     runs_cache: list[dict] | None = None
     runs_cache_time = 0.0
@@ -654,32 +1081,101 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                 grobid_up = asyncio.run(is_grobid_running())
                 grobid_used: int | None = None
                 grobid_limit: int | None = None
+                grobid_cpu_cores: float | None = None
                 if grobid_up:
                     cgroup = _resolve_cgroup_dir(CONTAINER_RUNTIME, GROBID_CONTAINER)
                     if cgroup:
                         grobid_used, grobid_limit = _read_cgroup_memory(cgroup)
+                        cur_cpu_us = _read_cgroup_cpu_usage_usec(cgroup)
+                        if cur_cpu_us is not None:
+                            if (
+                                grobid_prev_cpu_us is not None
+                                and grobid_prev_cpu_time > 0
+                            ):
+                                dt = now - grobid_prev_cpu_time
+                                if dt > 0:
+                                    grobid_cpu_cores = max(
+                                        0.0,
+                                        (cur_cpu_us - grobid_prev_cpu_us)
+                                        / 1_000_000.0
+                                        / dt,
+                                    )
+                            grobid_prev_cpu_us = cur_cpu_us
+                            grobid_prev_cpu_time = now
+                else:
+                    # Container went down — invalidate previous sample so a
+                    # restart doesn't get attributed a huge first-tick rate.
+                    grobid_prev_cpu_us = None
+                    grobid_prev_cpu_time = 0.0
                 panels.append(
                     _build_grobid_panel(
                         grobid_up=grobid_up,
                         ram_used_bytes=grobid_used,
                         ram_limit_bytes=grobid_limit,
                         config_limit=config.grobid_memory,
+                        cpu_cores=grobid_cpu_cores,
                     )
                 )
+
+                # --- Embedder subprocess panel ---
+                # The embedder runs as a host-side Python subprocess (not a
+                # container). When it's active during parse / ref_internal,
+                # it owns the GPU and text vLLM is stopped (see
+                # ``pipeline/swap.py::_needs_embedding_swap``). The panel
+                # makes that visible so the operator doesn't read "vLLM
+                # not running" as a failure.
+                embedder_infos = _detect_embedder_processes()
+                panels.append(_build_embedder_panel(embedder_infos))
+
+                # --- Vision vLLM detection (lifted above text panel) ---
+                # Knowing whether a vision vLLM container is up lets the text
+                # panel distinguish "stopped because vision/embedder owns the
+                # GPU" (expected) from "no sibling running" (likely a real
+                # failure). The vision panel below reuses these results.
+                from sciwrite_lint.vllm.vllm_server import MODELS, VISION_MODELS
+
+                vision_health: dict[str, dict | None] = {}
+                for vm in VISION_MODELS:
+                    vm_port = MODELS[vm].get("port", 5002)
+                    vm_endpoint_check = f"http://localhost:{vm_port}/v1"
+                    vision_health[vm] = asyncio.run(
+                        _check_api_health(vm_endpoint_check)
+                    )
+                vision_running = [vm for vm, h in vision_health.items() if h]
 
                 # --- vLLM panel ---
                 health = asyncio.run(_check_api_health(endpoint))
 
                 if not health:
+                    # Text vLLM being down is *expected* whenever the embedder
+                    # subprocess or a vision vLLM container is up (the GPU is
+                    # spoken for). Only flag in red when neither sibling is
+                    # running. Describe observable state only — do not predict
+                    # when text vLLM will come back, since that depends on
+                    # pipeline wiring that may change.
                     msg = Text()
-                    msg.append("not running", style="red")
-                    msg.append("  —  ", style="dim")
-                    msg.append("sciwrite-lint vllm start", style="bold")
+                    expected = bool(embedder_infos or vision_running)
+                    if expected:
+                        msg.append("stopped", style="yellow")
+                        msg.append("  —  ", style="dim")
+                        if embedder_infos and vision_running:
+                            reason = "embedder + vision vLLM are running"
+                        elif embedder_infos:
+                            reason = "embedder is running"
+                        else:
+                            reason = "vision vLLM is running"
+                        msg.append(reason, style="dim italic")
+                        border = "yellow"
+                    else:
+                        msg.append("not running", style="red")
+                        msg.append("  —  ", style="dim")
+                        msg.append("sciwrite-lint vllm start", style="bold")
+                        border = "red"
                     panels.append(
                         Panel(
                             msg,
                             title=f"vLLM (text) — localhost:{vllm_text_port}",
-                            border_style="red",
+                            border_style=border,
                             padding=(0, 2),
                         )
                     )
@@ -728,6 +1224,7 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                         prompt_tok=prompt_tok,
                         gen_tok=gen_tok,
                         preemption_rate=preemption_rate,
+                        server_args=_server_args_for(vllm_cname),
                     )
                     panels.append(
                         Panel(
@@ -739,16 +1236,26 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                     )
 
                 # --- Vision vLLM panel ---
-                from sciwrite_lint.vllm.vllm_server import MODELS, VISION_MODELS
-
                 for vm in VISION_MODELS:
                     vm_profile = MODELS[vm]
                     vm_port = vm_profile.get("port", 5002)
                     vm_endpoint = f"http://localhost:{vm_port}/v1"
-                    vm_health = asyncio.run(_check_api_health(vm_endpoint))
+                    vm_health = vision_health[vm]
                     if not vm_health:
+                        # Vision vLLM is normally stopped — its dim border
+                        # already signals that. Surface whichever sibling is
+                        # currently holding the GPU. Describe observable state
+                        # only; do not predict when vision will come up.
                         msg = Text()
                         msg.append("not running", style="dim")
+                        msg.append("  —  ", style="dim")
+                        if embedder_infos:
+                            reason = "embedder is running"
+                        elif health:
+                            reason = "text vLLM is running"
+                        else:
+                            reason = "no GPU sibling running"
+                        msg.append(reason, style="dim italic")
                         panels.append(
                             Panel(
                                 msg,
@@ -812,6 +1319,7 @@ def _run_containers_monitor(config: LintConfig, interval: float) -> int:
                             prompt_tok=vm_pt,
                             gen_tok=vm_gt,
                             preemption_rate=vm_per,
+                            server_args=_server_args_for(vm_cname),
                         )
                         panels.append(
                             Panel(

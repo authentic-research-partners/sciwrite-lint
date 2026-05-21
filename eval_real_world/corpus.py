@@ -99,7 +99,7 @@ async def _search_arxiv(
             async with _arxiv_limiter:
                 pass
             resp = await retry_on_transient(
-                lambda: client.get(ARXIV_API, params=params),
+                lambda params=params: client.get(ARXIV_API, params=params),
                 label="arXiv search",
             )
             resp.raise_for_status()
@@ -221,7 +221,7 @@ async def _download_source(arxiv_id: str, workspace: Path) -> Path | None:
         except OSError:
             continue
 
-    # Fallback: largest .tex file
+    # No \begin{document} found — pick the largest .tex file
     return max(tex_files, key=lambda f: f.stat().st_size)
 
 
@@ -248,7 +248,7 @@ async def _search_biorxiv(
             async with _biorxiv_limiter:
                 pass
             resp = await retry_on_transient(
-                lambda: client.get(url),
+                lambda url=url: client.get(url),
                 label="bioRxiv search",
             )
             resp.raise_for_status()

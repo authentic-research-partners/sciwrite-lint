@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Regenerate requirements-pinned.txt from the active environment.
 
-Filters `pip freeze` output down to the top-level dependencies declared in
-pyproject.toml (runtime + all optional extras). Transitive dependencies are
-not pinned.
+Filters `pip freeze` output down to the **runtime** top-level dependencies
+declared in pyproject.toml ``[project] dependencies``. Optional extras
+(notably ``[project.optional-dependencies] dev``) are NOT pinned —
+those are dev tools that don't belong in the public pinned-deps file
+that ships to users. Transitive dependencies are also not pinned —
+pip resolves them within each top-level package's own constraints.
 
 Run this from the environment you actively develop and test in (e.g. the
 `sciwrite-lint` conda env) — that is the ground truth the pinned file
@@ -27,16 +30,18 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 OUTPUT = REPO_ROOT / "requirements-pinned.txt"
 
 HEADER = """\
-# Pinned versions of sciwrite-lint's top-level dependencies.
+# Pinned versions of sciwrite-lint's RUNTIME top-level dependencies.
 #
-# This file pins ONLY the packages declared in pyproject.toml (runtime + all
-# optional extras). Transitive dependencies are NOT pinned — pip will resolve
-# them within each top-level package's own constraints.
+# Only packages declared in pyproject.toml ``[project] dependencies`` are
+# pinned here — the optional-dependencies extras (``dev``) are dev-only
+# tooling that doesn't belong in the user-facing pinned file. Transitive
+# dependencies are also not pinned; pip resolves them within each
+# top-level package's own constraints.
 #
 # Purpose: reproduce the exact versions of packages that sciwrite-lint is
 # actively developed and tested against. Generated from the maintainer's
 # working `sciwrite-lint` conda env via `pip freeze`, filtered to declared
-# deps.
+# runtime deps.
 #
 # Regenerate with:
 #   python scripts/regenerate_pinned_requirements.py
@@ -57,14 +62,15 @@ def normalize(name: str) -> str:
 
 
 def load_declared_deps() -> set[str]:
+    """Return the set of normalized runtime dep names declared in pyproject.
+
+    Skips ``[project.optional-dependencies]`` entirely — those extras are
+    dev tooling that doesn't ship in the public pinned-deps file.
+    """
     with PYPROJECT.open("rb") as f:
         data = tomllib.load(f)
     project = data["project"]
     specs: list[str] = list(project.get("dependencies", []))
-    for extra_name, extra_specs in project.get("optional-dependencies", {}).items():
-        if extra_name == "all":
-            continue  # recursive self-reference
-        specs.extend(extra_specs)
     return {normalize(s) for s in specs}
 
 

@@ -28,7 +28,7 @@ from sciwrite_lint.claims import (
 )
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.llm_utils import llm_query
-from sciwrite_lint.schemas import LaudanProblemSolving, vllm_schema
+from sciwrite_lint.schemas import LaudanProblemSolving, vllm_schema_unbounded
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ LIMITATIONS / DISCUSSION:
 {limitations_text}
 </section>"""
 
-LAUDAN_SCHEMA = vllm_schema(LaudanProblemSolving)
+LAUDAN_SCHEMA = vllm_schema_unbounded(LaudanProblemSolving)
 
 
 async def compute_problem_solving_score(

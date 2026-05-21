@@ -163,9 +163,12 @@ CREATE TABLE IF NOT EXISTS claim_results (
     model TEXT NOT NULL DEFAULT '',
     ref_type TEXT NOT NULL DEFAULT '',
     cite_purpose TEXT NOT NULL DEFAULT '',
+    skip_reason TEXT NOT NULL DEFAULT '',
     dismissed INTEGER NOT NULL DEFAULT 0,
     reviewer_comment TEXT NOT NULL DEFAULT '',
-    dismissed_date TEXT NOT NULL DEFAULT ''
+    dismissed_date TEXT NOT NULL DEFAULT '',
+    resolved_at TEXT NOT NULL DEFAULT '',
+    evidence_locator TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_claims_key ON claim_results(ref_key);
 CREATE INDEX IF NOT EXISTS idx_claims_verdict ON claim_results(verdict);
@@ -220,6 +223,32 @@ CREATE TABLE IF NOT EXISTS query_vectors (
 """
 
 
+# ---------------------------------------------------------------------------
+# Manuscript inline citations (persisted contexts for query-vector encoding)
+# ---------------------------------------------------------------------------
+#
+# One row per inline citation occurrence in the manuscript. The same key may
+# appear multiple times (cited at several positions). ``line`` is NULL for
+# PDF-derived citations (no reliable line numbers from GROBID TEI). The
+# ``source_hash`` column lets us invalidate stale rows when the source file
+# changes — callers replace all rows whenever a fresh ManuscriptContext is
+# built, so the table reflects the current source state.
+_MANUSCRIPT_CITATIONS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS manuscript_citations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_key TEXT NOT NULL,
+    line INTEGER,
+    section TEXT NOT NULL DEFAULT '',
+    context TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL,
+    source_hash TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mc_ref_key ON manuscript_citations(ref_key);
+CREATE INDEX IF NOT EXISTS idx_mc_source_hash ON manuscript_citations(source_hash)
+    WHERE source_hash != '';
+"""
+
+
 _PIPELINE_STAGE_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS pipeline_stage (
     stage TEXT PRIMARY KEY,
@@ -229,6 +258,27 @@ CREATE TABLE IF NOT EXISTS pipeline_stage (
     detail TEXT NOT NULL DEFAULT ''
 );
 """
+
+
+def _migrate_claim_results(conn: sqlite3.Connection) -> None:
+    """Migrate ``claim_results`` to the current schema.
+
+    Adds new columns to existing DBs in-place (ALTER TABLE ADD COLUMN is
+    fast and non-destructive). Each column is tried independently so a
+    partial-upgrade DB (some new columns, some missing) converges
+    correctly.
+    """
+    for col, default in [
+        ("skip_reason", "''"),
+        ("resolved_at", "''"),
+        ("evidence_locator", "''"),
+    ]:
+        try:
+            conn.execute(
+                f"ALTER TABLE claim_results ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 def _migrate_vision_cache(conn: sqlite3.Connection) -> None:
@@ -241,8 +291,8 @@ def _migrate_vision_cache(conn: sqlite3.Connection) -> None:
     Also adds structured output columns if missing from older DBs:
     - ``figure_type`` (v2 onwards)
     - ``readability_issues_json`` (v3 onwards — structured list; the
-      legacy ``readability_issues`` TEXT column from v2, if present, is
-      left alone because v2 rows are ignored by cache_version filter).
+      v2-era ``readability_issues`` TEXT column, if present, is left
+      alone because v2 rows are ignored by cache_version filter).
     """
     cols = {
         row[1] for row in conn.execute("PRAGMA table_info(vision_cache)").fetchall()
@@ -296,10 +346,12 @@ def open_db(references_dir: Path) -> sqlite3.Connection:
     conn.executescript(_PARSE_CACHE_SCHEMA)
     conn.executescript(_REF_INTERNAL_CACHE_SCHEMA)
     conn.executescript(_CLAIM_RESULTS_SCHEMA)
+    _migrate_claim_results(conn)
     conn.executescript(_CITATION_METADATA_SCHEMA)
     conn.executescript(_VISION_CACHE_SCHEMA)
     _migrate_vision_cache(conn)
     conn.executescript(_QUERY_VECTORS_SCHEMA)
+    conn.executescript(_MANUSCRIPT_CITATIONS_SCHEMA)
     conn.executescript(_PIPELINE_STAGE_SCHEMA)
 
     return conn

@@ -37,6 +37,7 @@ from sciwrite_lint.references.workspace_db.citation_metadata import (
 )
 from sciwrite_lint.references.workspace_db.claim_results import (
     clear_claim_dismissal,
+    count_by_verdict,
     dismiss_claim,
     find_claim,
     list_claims_for_key,
@@ -55,6 +56,13 @@ from sciwrite_lint.references.workspace_db.pipeline_stage import (
     init_pipeline_stages,
     load_pipeline_stages,
     update_pipeline_stage,
+)
+from sciwrite_lint.references.workspace_db.manuscript_citations import (
+    ManuscriptCitation,
+    count_manuscript_citations,
+    find_unembedded_contexts,
+    load_unique_contexts,
+    replace_manuscript_citations,
 )
 from sciwrite_lint.references.workspace_db.query_vectors import (
     load_query_vector,
@@ -113,6 +121,7 @@ __all__ = [
     "save_ref_internal_cache",
     # Claim results
     "clear_claim_dismissal",
+    "count_by_verdict",
     "dismiss_claim",
     "find_claim",
     "list_claims_for_key",
@@ -131,4 +140,10 @@ __all__ = [
     # Query vector cache
     "load_query_vector",
     "save_query_vector",
+    # Manuscript inline citations
+    "ManuscriptCitation",
+    "count_manuscript_citations",
+    "find_unembedded_contexts",
+    "load_unique_contexts",
+    "replace_manuscript_citations",
 ]

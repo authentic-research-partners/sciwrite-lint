@@ -10,6 +10,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -163,7 +164,7 @@ class PaperConfig(BaseModel):
     # (browser-saved web archives for JS-rendered pages).
     local_web_dir: Path | None = None
 
-    def resolve_local_pdfs_dir(self, fallback: Path) -> Path:
+    def resolve_local_pdfs_dir(self, default_dir: Path) -> Path:
         """Return the effective academic-source directory for this paper.
 
         Resolution order:
@@ -171,16 +172,16 @@ class PaperConfig(BaseModel):
         1. ``self.local_pdfs_dir`` if explicitly configured.
         2. ``<file_path.parent>/Sources/full_text`` if it exists on disk
            (per-paper curated archive convention).
-        3. ``fallback`` — typically ``LintConfig.local_pdfs_dir``.
+        3. ``default_dir`` — typically ``LintConfig.local_pdfs_dir``.
         """
         if self.local_pdfs_dir is not None:
             return self.local_pdfs_dir
         auto = self.file_path.parent / "Sources" / "full_text"
         if auto.is_dir():
             return auto
-        return fallback
+        return default_dir
 
-    def resolve_local_web_dir(self, fallback: Path) -> Path:
+    def resolve_local_web_dir(self, default_dir: Path) -> Path:
         """Return the effective web-capture directory for this paper.
 
         Resolution order mirrors :meth:`resolve_local_pdfs_dir`:
@@ -188,14 +189,24 @@ class PaperConfig(BaseModel):
         1. ``self.local_web_dir`` if explicitly configured.
         2. ``<file_path.parent>/Sources/full_text_web`` if it exists on
            disk (per-paper web-capture archive convention).
-        3. ``fallback`` — typically ``LintConfig.local_web_dir``.
+        3. ``default_dir`` — typically ``LintConfig.local_web_dir``.
         """
         if self.local_web_dir is not None:
             return self.local_web_dir
         auto = self.file_path.parent / "Sources" / "full_text_web"
         if auto.is_dir():
             return auto
-        return fallback
+        return default_dir
+
+
+#: Conservative client-side concurrency ceilings for the static
+#: (controller-off) regime. Above these, ``asyncio.Semaphore`` driving
+#: vLLM directly triggers API-server connection bursts. At static
+#: cap=128 the validated soft-fail rate is ~35 % (see CHANGELOG);
+#: 32 / 16 leave meaningful parallelism while staying well below that
+#: knee. Used by ``LintConfig._clamp_static_caps``.
+_STATIC_TEXT_CAP = 32
+_STATIC_VISION_CAP = 16
 
 
 class LintConfig(BaseModel):
@@ -235,6 +246,39 @@ class LintConfig(BaseModel):
         if data.get("local_web_dir") is None:
             data["local_web_dir"] = (project_dir / "local_web").resolve()
         return data
+
+    @model_validator(mode="after")
+    def _clamp_static_caps(self) -> "LintConfig":
+        """Cap text/vision concurrency to safe ceilings when the dynamic
+        controller is off. Under the controller a raised cap is just a
+        ceiling for the throttle path, but in the static regime it's the
+        raw ``asyncio.Semaphore`` driving vLLM directly — at high N the
+        API server falls over to connection bursts (35 % soft-fail
+        observed at static cap=128). Logs a WARNING when clamping
+        actually fires (i.e. user explicitly raised the cap and then
+        opted out of dynamic concurrency)."""
+        if self.use_dynamic_concurrency:
+            return self
+        if self.llm_max_concurrency > _STATIC_TEXT_CAP:
+            logger.warning(
+                "Clamping llm_max_concurrency {} -> {} because "
+                "[vision] dynamic_concurrency = false. Above {} the "
+                "static asyncio.Semaphore triggers vLLM API connection "
+                "bursts. Enable the controller to use a higher cap.",
+                self.llm_max_concurrency,
+                _STATIC_TEXT_CAP,
+                _STATIC_TEXT_CAP,
+            )
+            self.llm_max_concurrency = _STATIC_TEXT_CAP
+        if self.vision_max_concurrency > _STATIC_VISION_CAP:
+            logger.warning(
+                "Clamping vision_max_concurrency {} -> {} because "
+                "[vision] dynamic_concurrency = false.",
+                self.vision_max_concurrency,
+                _STATIC_VISION_CAP,
+            )
+            self.vision_max_concurrency = _STATIC_VISION_CAP
+        return self
 
     # Papers
     papers: list[PaperConfig] = Field(default_factory=list)
@@ -283,7 +327,63 @@ class LintConfig(BaseModel):
     # LLM (required — fail if not available)
     llm_endpoint: str = "http://localhost:5001/v1"
     llm_model: str = "qwen3"
-    llm_timeout: float = 300.0  # per-request timeout; batches queue in vLLM
+    # Per-request openai-client timeout. Wall-clock from request
+    # submission, not from start of execution — vLLM's OpenAI surface
+    # exposes no per-request "scheduled" event, so this clock covers
+    # queue + prefill + decode.
+    #
+    # Pair with concurrency control to keep the queue portion bounded:
+    # - Static path (``llm_max_concurrency``) sizes the application
+    #   semaphore conservatively so vLLM rarely queues.
+    # - Dynamic path (``use_dynamic_concurrency``) actively maintains
+    #   ``requests_waiting ≈ 0`` by reading vLLM ``/metrics`` and
+    #   shrinking when queue grows past tolerance. With the dynamic
+    #   controller running, submit time ≈ vLLM start time, so this
+    #   clock effectively covers only prefill + decode (both bounded).
+    llm_timeout: float = 300.0
+    # Server-side admission ceiling — passed to the text vLLM container
+    # as ``--max-num-seqs`` (see ``vllm/vllm_server.py``). Controls how
+    # many sequences vLLM is willing to schedule concurrently; the KV
+    # block pool is paged across active sequences. Empirically the pool
+    # itself is unaffected by this value in the 16–256 range on a 20 GB
+    # GPU, so set it as high as the controller might ever need to grow.
+    # This is the **server**-side knob — independent from the
+    # **client**-side ``llm_max_concurrency`` (which sizes the
+    # controller's upper bound / static semaphore cap). The two are
+    # often set to the same value but their roles are distinct, hence
+    # separate fields.
+    llm_server_max_seqs: int = 256
+
+    # Client-side cap on concurrent in-flight vLLM requests inside one
+    # ``llm_query_batch``. Under the dynamic regime (default), this is
+    # the controller's hard ``upper_bound`` — the controller drives the
+    # actual in-flight count from observed KV pressure. Under the static
+    # regime (``use_dynamic_concurrency=false``) it is the raw
+    # ``asyncio.Semaphore`` cap and the ``_clamp_static_caps`` validator
+    # enforces ``≤ _STATIC_TEXT_CAP`` (CHANGELOG documents the 35 %
+    # soft-fail rate at static cap=128 that drives this ceiling).
+    llm_max_concurrency: int = 256
+
+    # Verify-claim escalation ladder fan-out per level. Each level
+    # verifies its top-N candidates in parallel before deciding whether
+    # to escalate. Defaults bias toward casting a wide net where it's
+    # cheap (sentence chunks ~200 tok each) and narrowing where it's
+    # expensive (whole sections ~5k tok each), since most claims should
+    # resolve at the sentence level — escalation to section is the
+    # expensive minority.
+    #
+    # L2 is set to match L1 breadth (10 paragraphs vs 10 sentences).
+    # Lower L2 fan-out causes L2 to cover only the same source region
+    # L1 already searched (since the most-similar paragraph is the
+    # parent of the most-similar sentence) — so a smaller L2 fan-out
+    # gives the layer no breadth advantage and L2 ends up rubber-stamping
+    # L1's verdict. Top-10 paragraphs reach into source regions whose
+    # individual sentences didn't make L1's top 10, giving L2 a real
+    # chance to find paragraph-cumulative evidence L1 missed.
+    # See ``eval_claims.py::verify_claim_vllm``.
+    ladder_top_n_sentence: int = 10
+    ladder_top_n_paragraph: int = 10
+    ladder_top_n_section: int = 3
 
     # Embeddings (for reference store semantic retrieval)
     embedding_model: str = "Snowflake/snowflake-arctic-embed-m-v2.0"
@@ -295,6 +395,59 @@ class LintConfig(BaseModel):
         "vllm"  # "vllm" (8B FP8 container, default) or "transformers" (2B subprocess)
     )
     vision_device: str = "auto"  # "auto", "cpu", "cuda" (transformers backend only)
+    # Server admission ceiling for the vision-vLLM container. Passed as
+    # Server-side admission ceiling — passed to the vision vLLM
+    # container as ``--max-num-seqs``. See the matching docstring on
+    # ``llm_server_max_seqs`` for the role split; the same KV-pool
+    # invariance holds for the vision profile on a 20 GB GPU.
+    vision_server_max_seqs: int = 128
+
+    # Client-side cap. Under the dynamic regime (default), the
+    # ``DynamicConcurrencyController`` upper bound; under the static
+    # regime, the raw ``asyncio.Semaphore`` cap (clamped to
+    # ``_STATIC_VISION_CAP`` by ``_clamp_static_caps``).
+    vision_max_concurrency: int = 128
+    # Per-request httpx timeout for the vision-vLLM HTTP call. Same
+    # semantics as llm_timeout (covers queue + prefill + decode); the
+    # retry harness in vision/describe.py converts a single timeout
+    # into a per-image soft-fail rather than a subprocess crash.
+    vision_request_timeout: float = 120.0
+    # Per-image wall-clock budget for the cited-vision subprocess. The
+    # subprocess timeout is computed as ``60 + N * per_image_timeout``
+    # (60s baseline covers model load / container handshake). Override
+    # via the ``[vision]`` TOML key ``subprocess_per_image_timeout``
+    # when running on slower hardware or with larger reference sets.
+    vision_subprocess_per_image_timeout_s: float = 10.0
+    # When True, replace the static client-side ``asyncio.Semaphore`` at
+    # all three vLLM call sites (vision describe, ``llm_query_batch``,
+    # claim verification) with a ``DynamicConcurrencyController`` that
+    # polls vLLM ``/metrics`` and resizes its cap based on observed KV
+    # utilization + queue depth. ``vision_max_concurrency`` and
+    # ``llm_max_concurrency`` become the controller's hard upper bounds
+    # rather than its working point.
+    #
+    # Default on. The controller is validated against a 300-image
+    # cache-cold vision workload at vLLM cap=128: a static client cap
+    # completed 194/300 in 638 s with 106 soft-fails; the dynamic
+    # controller completed 299/300 in 473 s with 1 soft-fail (~26 %
+    # faster, ~100× fewer soft-fails). Static caps cannot adapt to the
+    # connection-burst regime on vLLM's API server; the controller's
+    # gradual ramp + adaptive shrink avoids it. Opt out with
+    # ``[vision] dynamic_concurrency = false`` (the TOML key is
+    # vision-scoped for historical reasons but governs all three call
+    # sites).
+    use_dynamic_concurrency: bool = True
+    # Dynamic-controller tuning band. Defaults match
+    # ``ControllerParams`` in
+    # ``sciwrite_lint/llm/concurrency_optimizer/decide.py``: grow when
+    # smoothed KV is below ``concurrency_target_kv_lo``, predictively
+    # aim at ``concurrency_target_kv_grow`` from the cap-from-observed-KV
+    # math, shrink when KV crosses ``concurrency_target_kv_hi``. The
+    # gap above the grow aim is the dead band where the controller
+    # holds steady. Override via ``[concurrency]`` TOML section.
+    concurrency_target_kv_lo: float = 0.60
+    concurrency_target_kv_grow: float = 0.70
+    concurrency_target_kv_hi: float = 0.80
 
     # Runtime context — set by pipeline before running checks.
     # Registered checks only receive (tex_path, config), so this is
@@ -317,7 +470,23 @@ class LintConfig(BaseModel):
 
     # Container config
     grobid_version: str = "0.8.2.1-crf"
-    grobid_memory: str = "8g"
+    # GROBID JVM heap + parser working memory. Bumped from 8g → 12g
+    # because the largest cited PDFs in real corpora (10-20 MB book
+    # scans and heavy reports) brushed the 8g ceiling under concurrent
+    # parse load — symptom: 73% RAM in monitor + the adaptive throttle
+    # kicking in at 70%. 12g leaves clear headroom at
+    # ``grobid_max_concurrency=4`` (~3 GB / slot) and remains within
+    # the project's documented 16 GB system minimum.
+    grobid_memory: str = "12g"
+    # How many PDFs to send to GROBID concurrently. GROBID's server-side
+    # pool is configured at ``concurrency: 10`` so we always have
+    # headroom; the bound is JVM heap pressure rather than the parser
+    # pool. Default 4 = ~3 GB/slot at the 12g default. Operators with
+    # more RAM can bump this in ``.sciwrite-lint.toml`` —
+    # ``[containers] grobid_max_concurrency = N`` — and bump
+    # ``grobid_memory`` proportionally (rule of thumb: 2-3 GB per slot
+    # for typical PDFs, more for book-length scans).
+    grobid_max_concurrency: int = 4
     vllm_version: str = "v0.18.0"
     vllm_memory: str = "4g"
 
@@ -332,10 +501,6 @@ class LintConfig(BaseModel):
     def is_check_enabled(self, check_id: str) -> bool:
         """Check if a check is enabled."""
         return check_id not in self.disabled_rules
-
-    def is_rule_enabled(self, check_id: str) -> bool:
-        """Legacy alias for is_check_enabled."""
-        return self.is_check_enabled(check_id)
 
     def effective_severity(self, check_id: str, default: str) -> str:
         """Return overridden severity or the check's default."""
@@ -516,6 +681,17 @@ def load_config(path: Path | None = None) -> LintConfig:
         config.llm_endpoint = llm["endpoint"]
     if "model" in llm:
         config.llm_model = llm["model"]
+    if "max_concurrency" in llm:
+        config.llm_max_concurrency = int(llm["max_concurrency"])
+    if "server_max_seqs" in llm:
+        config.llm_server_max_seqs = int(llm["server_max_seqs"])
+    ladder = llm.get("ladder", {})
+    if "top_n_sentence" in ladder:
+        config.ladder_top_n_sentence = int(ladder["top_n_sentence"])
+    if "top_n_paragraph" in ladder:
+        config.ladder_top_n_paragraph = int(ladder["top_n_paragraph"])
+    if "top_n_section" in ladder:
+        config.ladder_top_n_section = int(ladder["top_n_section"])
 
     # Embeddings section
     _EMBEDDING_PRESETS = {
@@ -542,6 +718,28 @@ def load_config(path: Path | None = None) -> LintConfig:
         config.vision_backend = vision["backend"]
     if "device" in vision:
         config.vision_device = vision["device"]
+    if "max_concurrency" in vision:
+        config.vision_max_concurrency = int(vision["max_concurrency"])
+    if "server_max_seqs" in vision:
+        config.vision_server_max_seqs = int(vision["server_max_seqs"])
+    if "request_timeout" in vision:
+        config.vision_request_timeout = float(vision["request_timeout"])
+    if "subprocess_per_image_timeout" in vision:
+        config.vision_subprocess_per_image_timeout_s = float(
+            vision["subprocess_per_image_timeout"]
+        )
+    if "dynamic_concurrency" in vision:
+        config.use_dynamic_concurrency = bool(vision["dynamic_concurrency"])
+
+    # Concurrency-controller tuning section (applies to all wired call
+    # sites — vision describe, llm_query_batch, run_claim_verification).
+    concurrency = data.get("concurrency", {})
+    if "target_kv_lo" in concurrency:
+        config.concurrency_target_kv_lo = float(concurrency["target_kv_lo"])
+    if "target_kv_grow" in concurrency:
+        config.concurrency_target_kv_grow = float(concurrency["target_kv_grow"])
+    if "target_kv_hi" in concurrency:
+        config.concurrency_target_kv_hi = float(concurrency["target_kv_hi"])
 
     # Containers section
     containers = data.get("containers", {})
@@ -549,6 +747,8 @@ def load_config(path: Path | None = None) -> LintConfig:
         config.grobid_version = containers["grobid_version"]
     if "grobid_memory" in containers:
         config.grobid_memory = containers["grobid_memory"]
+    if "grobid_max_concurrency" in containers:
+        config.grobid_max_concurrency = int(containers["grobid_max_concurrency"])
     if "vllm_version" in containers:
         config.vllm_version = containers["vllm_version"]
     if "vllm_memory" in containers:
@@ -630,6 +830,12 @@ def generate_default_toml(papers: list[dict[str, str]] | None = None) -> str:
             "[llm]",
             'endpoint = "http://localhost:5001/v1"',
             'model = "qwen3"                 # or "gemma3"',
+            "# max_concurrency = 8           # cap on in-flight requests per llm_query_batch",
+            "",
+            "# [llm.ladder]                    # verify-claim escalation top-N per level",
+            "# top_n_sentence = 10             # parallel sentence-chunk verifications (wide cheap net)",
+            "# top_n_paragraph = 5             # parallel paragraph-chunk verifications",
+            "# top_n_section = 3               # parallel section verifications (narrow expensive escalation)",
             "",
             "[api]",
             '# polite_email = ""             # recommended for CrossRef/Unpaywall polite pool',
@@ -647,6 +853,8 @@ def generate_default_toml(papers: list[dict[str, str]] | None = None) -> str:
             "[vision]",
             '# backend = "vllm"              # "vllm" (8B FP8, default) or "transformers" (2B, no container)',
             '# device = "auto"              # "auto", "cpu", "cuda" (transformers backend only)',
+            "# max_concurrency = 8           # cap on in-flight vision-vLLM requests",
+            "# request_timeout = 120.0      # per-request httpx timeout (seconds)",
             "",
             "[output]",
             'format = "terminal"             # "terminal" or "json"',

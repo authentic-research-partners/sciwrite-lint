@@ -17,43 +17,34 @@ from sciwrite_lint.models import Citation, CitationMetadata
 def load_metadata(key: str, references_dir: Path) -> CitationMetadata | None:
     """Load metadata for a citation key from workspace.db."""
     from sciwrite_lint.references.workspace_db import (
+        get_db,
         load_citation_metadata,
-        open_db,
     )
 
-    conn = open_db(references_dir)
-    try:
+    with get_db(references_dir) as conn:
         return load_citation_metadata(conn, key)
-    finally:
-        conn.close()
 
 
 def load_all_metadata(references_dir: Path) -> dict[str, CitationMetadata]:
     """Load all metadata from workspace.db."""
     from sciwrite_lint.references.workspace_db import (
+        get_db,
         load_all_citation_metadata,
-        open_db,
     )
 
-    conn = open_db(references_dir)
-    try:
+    with get_db(references_dir) as conn:
         return load_all_citation_metadata(conn)
-    finally:
-        conn.close()
 
 
 def save_metadata(meta: CitationMetadata, references_dir: Path) -> None:
     """Save metadata to workspace.db."""
     from sciwrite_lint.references.workspace_db import (
-        open_db,
+        get_db,
         save_citation_metadata,
     )
 
-    conn = open_db(references_dir)
-    try:
+    with get_db(references_dir) as conn:
         save_citation_metadata(conn, meta)
-    finally:
-        conn.close()
 
 
 def compute_tier(meta: CitationMetadata) -> str:

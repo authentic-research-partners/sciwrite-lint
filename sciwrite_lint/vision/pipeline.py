@@ -112,6 +112,7 @@ def run_vision_pipeline(
         device=device,
         fresh=fresh,
         backend=effective_backend,
+        config=config,
     )
 
     elapsed = time.monotonic() - t0

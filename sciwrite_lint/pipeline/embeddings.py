@@ -8,84 +8,144 @@ directly and only reuses the claim-text extractor here.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from sciwrite_lint.config import LintConfig
-from sciwrite_lint.pipeline.runners import _run_embeddings_subprocess
+from sciwrite_lint.pipeline.runners import EmbedderWarmer, _run_embeddings_subprocess
 from sciwrite_lint.pipeline.swap import (
     _needs_embedding_swap,
     _restart_vllm_after_embedding,
     _stop_vllm_for_embedding,
 )
 
+if TYPE_CHECKING:
+    from sciwrite_lint.models import Finding
 
-def _extract_claim_texts(config: LintConfig, tex_path: Path | None = None) -> list[str]:
-    """Extract unique claim context strings for query vector pre-computation.
 
-    Works for both LaTeX (.tex) and PDF input (ManuscriptContext).
-    Returns deduplicated list of claim context strings.
+def _resolve_manuscript_context(
+    config: LintConfig,
+    tex_path: Path | None,
+) -> tuple["Any | None", "Finding | None"]:
+    """Resolve a ManuscriptContext for the current run.
+
+    Returns ``(ctx, system_issue_or_None)``. ``ctx`` is ``None`` when
+    the run has nothing to embed (no PDF context preset, no .tex on
+    disk). The system-issue finding is non-``None`` only when LaTeX
+    parsing raised.
     """
-    try:
-        if config.is_pdf and config.manuscript_context:
-            texts = list(
-                {ic.context for ic in config.manuscript_context.inline_citations}
-            )
-            logger.debug(
-                "Extracted {} claim texts from PDF ManuscriptContext", len(texts)
-            )
-            return texts
-        if tex_path and tex_path.suffix.lower() == ".tex":
-            from sciwrite_lint.eval_claims import extract_claim_contexts
+    from sciwrite_lint.manuscript_store import ManuscriptContext
 
-            claims = extract_claim_contexts(tex_path)
-            texts = list({c.context for c in claims})
-            logger.debug("Extracted {} claim texts from .tex", len(texts))
-            return texts
+    if config.is_pdf and config.manuscript_context:
+        return config.manuscript_context, None
+    if tex_path and tex_path.suffix.lower() == ".tex":
+        try:
+            return ManuscriptContext.from_latex(tex_path, config), None
+        except Exception as e:
+            from sciwrite_lint.checks._diagnostics import internal_error_finding
+
+            logger.warning("Manuscript context build failed: {}", e)
+            return None, internal_error_finding("manuscript-context", e)
+    return None, None
+
+
+def persist_manuscript_citations(
+    config: LintConfig,
+    references_dir: Path,
+    tex_path: Path | None = None,
+) -> tuple[int, "Finding | None"]:
+    """Persist the manuscript's inline citations to ``manuscript_citations``.
+
+    Idempotent: replaces any prior rows for this workspace. Both .tex
+    and PDF paths converge on the same persisted shape so the embedding
+    subprocess can read claim contexts directly from the DB instead of
+    receiving them as JSON.
+
+    Returns ``(n_citations_persisted, system_issue_or_None)``. The
+    ``Finding`` is non-``None`` when the manuscript build produced
+    non-fatal warnings (e.g. cite-context attach raised) — callers in
+    the pipeline append it to the per-paper findings list so it routes
+    into the report's ``system_issues`` bucket via ``split_findings``.
+    """
+    from sciwrite_lint.manuscript_store import persist_inline_citations
+
+    ctx, build_failure = _resolve_manuscript_context(config, tex_path)
+    if build_failure is not None:
+        return 0, build_failure
+    if ctx is None:
         logger.debug(
-            "No claim texts: is_pdf={}, has_ctx={}, tex_path={}",
+            "No manuscript context to persist: is_pdf={}, has_ctx={}, tex_path={}",
             config.is_pdf,
             config.manuscript_context is not None,
             tex_path,
         )
-    except Exception as e:
-        logger.debug("Claim text extraction failed: {}", e)
-        pass
-    return []
+        return 0, None
+
+    finding = persist_inline_citations(ctx, references_dir)
+    return len(ctx.inline_citations), finding
+
+
+def prepare_manuscript_for_embedding(
+    config: LintConfig,
+    references_dir: Path,
+    tex_path: Path | None,
+    model_name: str,
+) -> str | None:
+    """Write ``parsed/_manuscript_{stem}.md`` and return its embedding key.
+
+    The embedding subprocess resolves keys to ``parsed/{key}.md`` files,
+    so dropping a manuscript markdown there is the cheapest way to put
+    the manuscript through the same chunking + embedding code path used
+    for parsed references — no extra subprocess entry point needed.
+
+    Skips work entirely when embeddings already exist for the key
+    (idempotent on re-runs without ``--fresh``).
+
+    Returns the manuscript ref key, or ``None`` if nothing was prepared
+    (no usable context, no text, or embeddings already up to date).
+    """
+    from sciwrite_lint.manuscript_store import (
+        manuscript_ref_key,
+        write_manuscript_markdown,
+    )
+    from sciwrite_lint.references.embedding_store import has_embeddings
+
+    ctx, _ = _resolve_manuscript_context(config, tex_path)
+    if ctx is None:
+        return None
+    ms_key = manuscript_ref_key(ctx.source_path)
+    if has_embeddings(ms_key, references_dir, model_name=model_name):
+        return None
+    written = write_manuscript_markdown(ctx, references_dir)
+    if written is None:
+        return None
+    return ms_key
 
 
 def ensure_claim_query_vectors(
-    claim_texts: list[str],
     references_dir: Path,
     config: LintConfig,
 ) -> None:
-    """Ensure pre-computed query vectors exist for each unique claim context.
+    """Ensure pre-computed query vectors exist for each persisted citation context.
 
     In the full pipeline, Stage 4b populates ``query_vectors`` so Stage 5's
     ``retrieve_similar()`` never has to load the embedding model in the
     parent process. Standalone entry points (``sciwrite-lint verify-claims``,
     library callers of ``run_claim_verification``) skip Stage 4b, so this
-    helper spawns the same embedding subprocess for any missing vectors.
+    helper spawns the same embedding subprocess. The subprocess reads
+    contexts from ``manuscript_citations`` and encodes only those whose
+    hash isn't already in ``query_vectors``.
     """
-    import hashlib
-
     from sciwrite_lint.references.reference_store import _get_embedding_config
-    from sciwrite_lint.references.workspace_db import get_db, load_query_vector
-
-    unique_texts = sorted({t for t in claim_texts if t})
-    if not unique_texts:
-        return
+    from sciwrite_lint.references.workspace_db import (
+        find_unembedded_contexts,
+        get_db,
+    )
 
     model_name, _, _ = _get_embedding_config()
     with get_db(references_dir) as conn:
-        missing = [
-            t
-            for t in unique_texts
-            if load_query_vector(
-                conn, hashlib.sha256(t.encode()).hexdigest(), model_name
-            )
-            is None
-        ]
+        missing = find_unembedded_contexts(conn, model_name)
     if not missing:
         return
 
@@ -96,7 +156,6 @@ def ensure_claim_query_vectors(
         keys=[],
         references_dir=references_dir,
         config=config,
-        claim_texts=missing,
     )
     if err:
         logger.warning(
@@ -111,58 +170,62 @@ def _run_embeddings_for_paper(
     references_dir: Path,
     config: LintConfig,
     tex_path: Path | None = None,
-) -> None:
-    """Run embedding subprocesses for one paper's parsed + web keys.
+    warmer: EmbedderWarmer | None = None,
+) -> "Finding | None":
+    """Run a single embedding subprocess for one paper's parsed + web keys.
 
     Also pre-computes claim query vectors in the same subprocess so
     Stage 5 never loads the embedding model in the parent process.
 
+    Two paths:
+
+    * ``warmer is None`` (direct): stop text vLLM here, launch a fresh
+      one-shot subprocess via ``_run_embeddings_subprocess``, restart
+      vLLM. Used by callers that don't pre-warm.
+    * ``warmer is not None`` (pipelined): the caller already stopped
+      text vLLM and launched the warming subprocess at parse start, so
+      its model load overlapped with GROBID parse. Submit all keys to
+      the warmer in one call and wait. The caller is responsible for
+      restarting vLLM afterwards.
+
+    Returns a system-issue ``Finding`` when ``persist_manuscript_citations``
+    surfaces a non-fatal build warning; ``None`` otherwise. Callers should
+    append the Finding to their per-paper findings list so it routes into
+    the report's ``system_issues`` bucket.
+
     Raises ``RuntimeError`` if the embedding subprocess fails to actually
-    produce embeddings for any requested key. ``_run_embeddings_subprocess``
-    swallows all subprocess failures (non-zero exit, timeout, exception)
-    with just a warning log, so we verify by re-checking has_embeddings()
-    against the DB afterwards — the authoritative source of truth. Failing
-    loudly here avoids a cryptic "no embeddings found" crash 20+ minutes
-    later during claim verification.
+    produce embeddings for any requested key — verified by re-checking
+    ``has_embeddings()`` against the DB afterwards (the authoritative
+    source of truth). Failing loudly here avoids a cryptic "no
+    embeddings found" crash later during claim verification.
     """
     from sciwrite_lint.references.embedding_store import has_embeddings
+    from sciwrite_lint.references.metadata import load_all_metadata
     from sciwrite_lint.references.reference_store import _get_embedding_config
+    from sciwrite_lint.references.workspace_db import (
+        count_manuscript_citations,
+        get_db,
+    )
 
-    # Extract claim texts for query vector pre-computation
-    claim_texts = _extract_claim_texts(config, tex_path)
+    _, build_finding = persist_manuscript_citations(
+        config, references_dir, tex_path=tex_path
+    )
+    with get_db(references_dir) as conn:
+        n_citations = count_manuscript_citations(conn)
 
     model_name, _, _ = _get_embedding_config()
-    keys_to_embed = []
+
+    # Collect parsed-ref keys that need embedding.
+    parsed_keys = []
     for key, status in parse_results.items():
         if status == "parsed":
-            keys_to_embed.append(key)
+            parsed_keys.append(key)
         elif status == "cached" and not has_embeddings(
             key, references_dir, model_name=model_name
         ):
-            keys_to_embed.append(key)
+            parsed_keys.append(key)
 
-    # Run embedding in a subprocess to isolate the CUDA context.
-    # On native Linux (no CUDA overcommit), stop text vLLM first to free
-    # GPU, then force CUDA device for ~50x speedup over CPU.
-    embed_swap = False
-    if keys_to_embed or claim_texts:
-        if _needs_embedding_swap(config):
-            embed_swap = True
-            _stop_vllm_for_embedding(config)
-        diag = _run_embeddings_subprocess(
-            keys_to_embed, references_dir, config, claim_texts=claim_texts
-        )
-        _verify_embeddings_or_raise(
-            keys_to_embed,
-            references_dir,
-            model_name,
-            kind="parsed",
-            subprocess_diag=diag,
-        )
-
-    # Embed web summaries ({key}_web.md) that lack embeddings.
-    from sciwrite_lint.references.metadata import load_all_metadata
-
+    # Collect web-summary keys that need embedding.
     all_meta = load_all_metadata(references_dir)
     web_keys = []
     for key, meta in all_meta.items():
@@ -175,11 +238,48 @@ def _run_embeddings_for_paper(
         if web_path.exists():
             web_keys.append(key)
 
+    # Manuscript itself: write parsed/_manuscript_{stem}.md and add to
+    # the keys list so the subprocess chunks + embeds it the same way it
+    # handles parsed references. Idempotent — skipped when the key
+    # already has embeddings.
+    ms_key = prepare_manuscript_for_embedding(
+        config, references_dir, tex_path, model_name
+    )
+    manuscript_keys = [ms_key] if ms_key else []
+
+    all_keys = parsed_keys + web_keys + manuscript_keys
+
+    if not all_keys and not n_citations:
+        return build_finding
+
+    # Stop vLLM if needed (warmer path: caller already did it; fresh
+    # path: do it here).
+    embed_swap = False
+    if warmer is None and _needs_embedding_swap(config):
+        embed_swap = True
+        _stop_vllm_for_embedding(config)
+
+    # Run the subprocess (warming or fresh).
+    if warmer is not None:
+        diag = warmer.submit_and_wait(all_keys)
+    else:
+        diag = _run_embeddings_subprocess(all_keys, references_dir, config)
+
+    # Verify *before* restart so a real subprocess failure surfaces
+    # via _verify_embeddings_or_raise instead of being masked by a
+    # follow-on vLLM restart error. On verify failure the caller is
+    # responsible for restart cleanup (warmer path: _stage_parse's
+    # finally; fresh path: leak the stopped state, the next pipeline
+    # invocation will restart vLLM).
+    if parsed_keys:
+        _verify_embeddings_or_raise(
+            parsed_keys,
+            references_dir,
+            model_name,
+            kind="parsed",
+            subprocess_diag=diag,
+        )
     if web_keys:
-        if not embed_swap and _needs_embedding_swap(config):
-            embed_swap = True
-            _stop_vllm_for_embedding(config)
-        diag = _run_embeddings_subprocess(web_keys, references_dir, config)
         _verify_embeddings_or_raise(
             web_keys,
             references_dir,
@@ -187,9 +287,25 @@ def _run_embeddings_for_paper(
             kind="web summary",
             subprocess_diag=diag,
         )
+    if manuscript_keys:
+        # Manuscript embeddings are advisory: the consistency-pairs
+        # check no-ops when they're missing, so a partial subprocess
+        # failure on the manuscript shouldn't take the whole pipeline
+        # down with it.
+        from sciwrite_lint.references.embedding_store import has_embeddings
+
+        for k in manuscript_keys:
+            if not has_embeddings(k, references_dir, model_name=model_name):
+                logger.warning(
+                    "Manuscript embedding missing for {} — "
+                    "internal-consistency-pairs will skip this run",
+                    k,
+                )
 
     if embed_swap:
         _restart_vllm_after_embedding(config)
+
+    return build_finding
 
 
 def _verify_embeddings_or_raise(

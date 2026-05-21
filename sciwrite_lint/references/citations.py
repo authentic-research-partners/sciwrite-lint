@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import bibtexparser
 from loguru import logger
 
 from sciwrite_lint.models import Citation, Finding
@@ -142,11 +143,6 @@ def _find_bib_file(tex_path: Path, text: str) -> Path | None:
 
 def _extract_from_bib(bib_path: Path, source_paper: str) -> list[Citation]:
     """Parse a .bib file into Citation objects using bibtexparser."""
-    try:
-        import bibtexparser
-    except ImportError:
-        return []
-
     text = bib_path.read_text(encoding="utf-8")
     db = bibtexparser.loads(text)
 
@@ -591,63 +587,69 @@ def check_local_sources(
     citations: list[Citation],
     refs_dir: Path,
 ) -> None:
-    """Check which citations have local PDFs or markdown summaries."""
+    """Check which citations have local PDFs or markdown summaries.
+
+    Match rule: the filename's leading alphanumeric token (everything up
+    to the first ``_``, ``-``, ``.``, or whitespace) must equal the
+    citekey, case-insensitive. So ``smith2020.pdf``,
+    ``smith2020_v2.pdf``, and ``Smith2020_paper.pdf`` all match key
+    ``smith2020``, while ``smith2020rm.pdf`` does NOT match
+    ``smith2020opening`` — its leading token is a different citekey.
+
+    The historical ``'2' → '_2'`` insertion (``smith2020`` →
+    ``smith_2020.pdf``) is preserved via a full-stem equality check:
+    the filename stem must equal the citekey with an underscore
+    inserted before the first ``2``. Extended variants like
+    ``smith_2020_v2.pdf`` are not accepted under this convention —
+    use the leading-token form instead.
+
+    There is no author-only or author+year fuzzy match: that path
+    silently misassigned PDFs across references that share an author
+    and year (e.g. several ``smith2020*`` keys all picking up the
+    first matching file from ``iterdir()``). Files that don't follow
+    the citekey-leading-token convention are not considered local
+    sources here; users can drop them into ``local_pdfs/`` instead,
+    which has a fuzzy title matcher with a similarity threshold.
+    """
     if not refs_dir.exists():
         return
 
-    local_files = {f.name.lower(): f for f in refs_dir.iterdir() if f.is_file()}
+    from sciwrite_lint.local_sources import leading_token
+
+    suffixes = (".pdf", ".md")
+    by_token: dict[str, Path] = {}
+    by_stem: dict[str, Path] = {}
+    for f in refs_dir.iterdir():
+        if not f.is_file() or f.suffix.lower() not in suffixes:
+            continue
+        by_stem.setdefault(f.stem.lower(), f)
+        token = leading_token(f.name).lower()
+        # Last-write wins on collision, but a real workspace has at
+        # most one academic source per citekey so collisions imply a
+        # stray file the user should clean up.
+        if token:
+            by_token.setdefault(token, f)
 
     for c in citations:
         key_lower = c.key.lower()
-        found = False
+        underscore_variant = key_lower.replace("2", "_2", 1)
+        match = by_token.get(key_lower) or by_stem.get(underscore_variant)
 
-        for suffix in [".pdf", ".md"]:
-            for pattern in [
-                f"{key_lower}{suffix}",
-                f"{key_lower.replace('2', '_2', 1)}{suffix}",
-            ]:
-                if pattern in local_files:
-                    fpath = local_files[pattern]
-                    if suffix == ".pdf" and not _is_valid_local_pdf(fpath):
-                        logger.warning(
-                            "{}: local file {} is not a valid PDF, skipping",
-                            c.key,
-                            fpath.name,
-                        )
-                        continue
-                    c.local_status = "pdf" if suffix == ".pdf" else "md"
-                    c.local_path = str(fpath)
-                    found = True
-                    break
-            if found:
-                break
-
-        if not found:
-            author_part = re.match(r"[a-z]+", key_lower)
-            year_in_key = re.search(r"\d{4}", key_lower)
-            if author_part and year_in_key:
-                author = author_part.group(0)
-                year = year_in_key.group(0)
-                for fname, fpath in local_files.items():
-                    if (
-                        fname.startswith(author)
-                        and year in fname
-                        and (fname.endswith(".pdf") or fname.endswith(".md"))
-                    ):
-                        if fname.endswith(".pdf") and not _is_valid_local_pdf(fpath):
-                            logger.warning(
-                                "{}: local file {} is not a valid PDF, skipping",
-                                c.key,
-                                fname,
-                            )
-                            continue
-                        c.local_status = "pdf" if fname.endswith(".pdf") else "md"
-                        c.local_path = str(fpath)
-                        found = True
-                        break
-
-        if not found:
+        if match is None:
             c.local_status = "none"
+            continue
+
+        suffix = match.suffix.lower()
+        if suffix == ".pdf" and not _is_valid_local_pdf(match):
+            logger.warning(
+                "{}: local file {} is not a valid PDF, skipping",
+                c.key,
+                match.name,
+            )
+            c.local_status = "none"
+            continue
+        c.local_status = "pdf" if suffix == ".pdf" else "md"
+        c.local_path = str(match)
 
 
 # ---------------------------------------------------------------------------

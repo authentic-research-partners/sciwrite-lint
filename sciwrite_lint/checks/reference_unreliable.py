@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from sciwrite_lint.models import CheckMeta, CitationMetadata, Finding
 
 if TYPE_CHECKING:
-    from sciwrite_lint.scoring.chain import RefBibCheck
+    from sciwrite_lint.references.chain import RefBibCheck
 
 # ---------------------------------------------------------------------------
 # Threshold
@@ -76,10 +76,16 @@ def _score_from_metadata(meta: CitationMetadata) -> float:
 
 
 def _score_from_claims(claims: list[dict[str, Any]]) -> float:
-    """Compute verification score from claim verdicts."""
+    """Compute verification score from claim verdicts.
+
+    SKIPPED rows (cite extracted but never verified) carry no LLM judgment
+    and are excluded — the score reflects only LLM-evaluated claims.
+    """
     from sciwrite_lint.scoring.scilint_score import VERDICT_SCORES
 
-    active = [c for c in claims if not c.get("dismissed")]
+    active = [
+        c for c in claims if not c.get("dismissed") and c.get("verdict") != "SKIPPED"
+    ]
     if not active:
         return 1.0  # no claims to verify — no negative signal
     total = sum(

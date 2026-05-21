@@ -4,7 +4,7 @@ Provides model configuration, a single-query async helper for rules that
 use the local vLLM server, and a permissive JSON extractor (``extract_json``)
 retained for eval pipelines. Production ``llm_query`` calls use vLLM's
 constrained decoding (``response_format=json_schema`` + ``strict=True``)
-and parse the result with ``json.loads`` directly — no regex fallback
+and parse the result with ``json.loads`` directly — no regex extraction
 needed, since the decoder guarantees a valid JSON object that matches the
 Pydantic schema bounds.
 """
@@ -19,27 +19,66 @@ from typing import Any, Literal, overload
 from loguru import logger
 
 from sciwrite_lint.config import LintConfig
+from sciwrite_lint.vllm.vllm_server import MODELS as _SERVED_MODELS
 
 # ---------------------------------------------------------------------------
 # vLLM model presets
 # ---------------------------------------------------------------------------
+#
+# Sampling parameters per model. Served names (``model``) come from the
+# canonical registry in ``vllm.vllm_server.MODELS``, so a model rename
+# in one place propagates here automatically.
+#
+# ``max_tokens`` notes (qwen3 / gemma3): response reserve. ``llm_query``
+# sends ``max_tokens + active_thinking_budget`` to vLLM, so the actual
+# per-call cap is 4096 + 1024 = 5120 at thinking=medium. The
+# ``FullPaperIssueList`` / ``ConsistencyResult`` worst-case responses are
+# ~1100-1700 tokens — well within the response half — and the thinking
+# phase gets a generous 4096-token slack (Qwen3's chain-of-thought
+# routinely overshoots its declared 1024-token budget on heavy 30K-token
+# full-paper prompts, which used to fire the length-truncation retry
+# ladder repeatedly).
+_SAMPLING: dict[str, dict[str, Any]] = {
+    "qwen3": {"temperature": 0.6, "top_p": 0.95, "max_tokens": 4096},
+    "gemma3": {"temperature": 0.3, "top_p": 0.95, "max_tokens": 4096},
+}
 
 VLLM_MODELS: dict[str, dict[str, Any]] = {
-    "qwen3": {
-        "model": "qwen3-8b-fp8",  # matches --served-model-name
-        "temperature": 0.6,
-        "top_p": 0.95,
-        "max_tokens": 2048,
-    },
-    "gemma3": {
-        "model": "gemma3-12b-fp8",  # matches --served-model-name
-        "temperature": 0.3,
-        "top_p": 0.95,
-        "max_tokens": 2048,
-    },
+    key: {"model": _SERVED_MODELS[key]["served_name"], **sampling}
+    for key, sampling in _SAMPLING.items()
 }
 
 VLLM_DEFAULT_MODEL = "qwen3"
+
+
+# ---------------------------------------------------------------------------
+# Per-caller concurrency size classes for ``llm_query_batch(concurrency=…)``
+# ---------------------------------------------------------------------------
+#
+# The global default ``config.llm_max_concurrency`` is sized for the
+# heaviest caller in the codebase: ``ref_internal_checks`` full-paper
+# queries with ~30K-token prompts. Lighter callers can pass an explicit
+# ``concurrency=`` higher because KV-cache pressure scales with
+# ``concurrency × per-request KV tokens``, not request count alone.
+#
+# These constants name the size classes so call sites read intent ("this
+# is a small-prompt batch") rather than a bare number, and so a single
+# retune updates every caller in the same class. The two thresholds
+# reflect whether the caller runs concurrently with the heavy batch
+# (which dominates KV pressure in ``ref_internal_checks``):
+#
+# - SMALL_PROMPT — short prompts, manuscript LLM checks. Runs in
+#   isolation (rules stage, no concurrent batch), so the cap is set
+#   above the throughput plateau to reduce wait-time variance.
+# - MEDIUM_PROMPT — medium prompts, claim taxonomy and ref-internal
+#   pairwise. Set at the throughput plateau, not above, because this
+#   call site runs concurrently with the heavy fullpaper batch and the
+#   combined KV budget needs headroom.
+# - HEAVY_PROMPT — long prompts (ref-internal full-paper). Inherits
+#   ``config.llm_max_concurrency`` from TOML; pass ``concurrency=None``
+#   at the call site.
+SMALL_PROMPT_CONCURRENCY = 100
+MEDIUM_PROMPT_CONCURRENCY = 50
 
 
 def get_model_config(config: LintConfig | None = None, model_name: str = "") -> dict:
@@ -54,11 +93,15 @@ def get_model_config(config: LintConfig | None = None, model_name: str = "") -> 
 # ---------------------------------------------------------------------------
 
 
-def extract_json(text: str | None) -> dict | None:
-    """Parse JSON from LLM output, handling <think> tags, code fences, etc."""
+def extract_json(text: str | None) -> dict[str, Any] | None:
+    """Parse JSON from LLM output, handling thinking tags, code fences, etc.
+
+    Strips both ``<think>...</think>`` (vLLM convention) and
+    ``<thinking>...</thinking>`` (Claude CLI convention).
+    """
     if text is None:
         return None
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL)
     text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip(), flags=re.MULTILINE)
     text = re.sub(r"\n?```\s*$", "", text.strip(), flags=re.MULTILINE)
     text = text.strip()
@@ -106,10 +149,19 @@ async def retry_on_empty(
     for attempt in range(1 + retries):
         completion = await create_call()
         content = completion.choices[0].message.content
-        if content is not None:
+        finish = getattr(completion.choices[0], "finish_reason", "unknown")
+        # "Usable" requires both: content channel emitted something AND
+        # the model didn't get cut off at max_tokens. Without the
+        # finish-reason check, vLLM's constrained-JSON decoder emitting
+        # *partial* JSON before max_tokens hits would short-circuit
+        # this retry and return a partial completion that the caller's
+        # outer JSON-parse loop then re-retries at a different layer.
+        # Same conflation as the one fixed in ``_parse_choices``;
+        # decouple it here too so all helpers agree on what "usable"
+        # means.
+        if content is not None and finish != "length":
             return completion
 
-        finish = getattr(completion.choices[0], "finish_reason", "unknown")
         comp_tokens = 0
         if hasattr(completion, "usage") and completion.usage:
             comp_tokens = getattr(completion.usage, "completion_tokens", 0) or 0
@@ -118,7 +170,7 @@ async def retry_on_empty(
         if attempt < retries:
             delay = 0.5 * (attempt + 1)
             logger.warning(
-                "vLLM returned empty response for {} (attempt {}/{}, "
+                "vLLM returned bad response for {} (attempt {}/{}, "
                 "finish_reason={}, comp_tokens={}), retrying in {:.1f}s",
                 label,
                 attempt + 1,
@@ -130,7 +182,7 @@ async def retry_on_empty(
             await asyncio.sleep(delay)
         else:
             logger.warning(
-                "vLLM returned empty response for {} after {} attempts "
+                "vLLM returned bad response for {} after {} attempts "
                 "(finish_reason={}, comp_tokens={}), giving up",
                 label,
                 1 + retries,
@@ -291,6 +343,42 @@ async def llm_query(
         )
     assert client is not None  # narrowing for mypy
 
+    # Transient network/server errors (server stall, mid-request timeout,
+    # dropped connection, vLLM saturation 5xx/429) flow through one path:
+    # retry up to _VLLM_RETRIES times in the loop below, then raise
+    # LLMConnectionError. The outer ``except Exception`` only catches
+    # non-transient unexpected errors — see below.
+    #
+    # Catch list rationale:
+    # - ``APIConnectionError`` (openai-SDK parent of APITimeoutError) and
+    #   ``httpx.TimeoutException`` / ``httpx.ConnectError`` match the
+    #   project pattern in ``rate_limiter._fetch_with_retry`` and
+    #   ``web._classify_http_exception``.
+    # - ``InternalServerError`` (5xx) and ``RateLimitError`` (429) are
+    #   how vLLM signals queue / scheduler / admission backpressure.
+    #   Without retrying these, a saturated vLLM silently demotes
+    #   responses to None — a counter-only error that never surfaces in
+    #   logs (the source of the "144 errors / 7 warnings" discrepancy
+    #   in the v10 saturation run).
+    # 4xx errors (BadRequestError, NotFoundError, AuthenticationError,
+    # …) are programmer errors and intentionally NOT retried.
+    import httpx as _httpx
+    from openai import (
+        APIConnectionError as _APIConnectionError,
+        InternalServerError as _InternalServerError,
+        RateLimitError as _RateLimitError,
+    )
+
+    from sciwrite_lint.exceptions import LLMConnectionError
+
+    _TRANSIENT_NET_ERRS: tuple[type[BaseException], ...] = (
+        _APIConnectionError,
+        _InternalServerError,
+        _RateLimitError,
+        _httpx.TimeoutException,
+        _httpx.ConnectError,
+    )
+
     try:
         from sciwrite_lint.usage import current as _usage_current
 
@@ -397,10 +485,20 @@ async def llm_query(
             for choice in completion.choices:
                 raw = choice.message.content
                 finish = getattr(choice, "finish_reason", "unknown")
+                # Mark length-truncation regardless of whether ``raw`` is
+                # None or partial. vLLM with constrained-JSON decoding
+                # often emits a *partial* JSON before hitting max_tokens
+                # — raw is non-empty, ``json.loads`` fails, but the
+                # underlying problem is still "no room for the answer."
+                # Treating those as plain JSONDecodeError used to skip
+                # the thinking-ladder step-down and waste a retry on the
+                # same prompt at the same thinking budget (observed in
+                # FullPaperIssue give-ups: medium → backoff at medium
+                # → step to low → length again → give up at low).
+                if finish == "length":
+                    any_length_truncation = True
                 if raw is None:
                     parsed_list.append(None)
-                    if finish == "length":
-                        any_length_truncation = True
                     continue
                 try:
                     parsed_list.append(json.loads(raw))
@@ -409,9 +507,38 @@ async def llm_query(
                     parsed_list.append(None)
             return parsed_list, any_length_truncation, valid_count
 
+        # Network-level transient errors share the same retry budget as
+        # content errors. On the final attempt we convert directly to
+        # LLMConnectionError — no re-raise into the outer except, no
+        # double-counting in usage stats, no second isinstance check.
         for attempt in range(_VLLM_RETRIES + 1):
             kwargs = _build_kwargs(current_thinking)
-            completion = await client.chat.completions.create(**kwargs)
+            try:
+                completion = await client.chat.completions.create(**kwargs)
+            except _TRANSIENT_NET_ERRS as net_err:
+                run = _usage_current()
+                if run:
+                    run.vllm.record(0.0, error=True, error_type=type(net_err).__name__)
+                if attempt < _VLLM_RETRIES:
+                    delay = 2.0 * (attempt + 1)
+                    logger.warning(
+                        "vLLM transient network error for {} (attempt {}/{}, "
+                        "thinking={}): {}: {} — retrying in {:.1f}s",
+                        schema_name,
+                        attempt + 1,
+                        _VLLM_RETRIES + 1,
+                        current_thinking,
+                        type(net_err).__name__,
+                        net_err,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise LLMConnectionError(
+                    f"vLLM at {config.llm_endpoint} became unreachable mid-request: "
+                    f"{type(net_err).__name__}: {net_err}\n"
+                    "Check server: sciwrite-lint containers status"
+                ) from net_err
             parsed_list, any_length, valid_count = _parse_choices(completion)
 
             if valid_count > 0:
@@ -419,6 +546,21 @@ async def llm_query(
                 # the same as before. For n>1, failed choices stay as
                 # None in the returned list.
                 _record_call(completion)
+                if attempt > 0:
+                    # Auditable record that the retry harness actually
+                    # produced a usable answer — without this, the log
+                    # only shows failures and the operator can't tell
+                    # which retried calls recovered vs. were dropped.
+                    logger.info(
+                        "vLLM call for {} recovered on attempt {}/{} "
+                        "(thinking={}, valid_choices={}/{})",
+                        schema_name,
+                        attempt + 1,
+                        _VLLM_RETRIES + 1,
+                        current_thinking,
+                        valid_count,
+                        n,
+                    )
                 if n == 1:
                     return parsed_list[0]
                 return parsed_list
@@ -475,23 +617,27 @@ async def llm_query(
         if n == 1:
             return None
         return [None] * n
+    except LLMConnectionError:
+        # Already shaped above; let it propagate to the caller.
+        raise
     except Exception as e:
-        import httpx
-        from openai import APIConnectionError, APITimeoutError
-
-        from sciwrite_lint.exceptions import LLMConnectionError
+        # Non-transient unexpected error — record once, log loudly, and
+        # swallow (callers tolerate a None / [None]*n result). Logged at
+        # WARNING (not DEBUG) so any error that increments
+        # ``run.vllm.errors`` is also visible in the log stream — the
+        # invariant is "every counted error is also a logged event." 4xx
+        # programmer errors and unexpected exceptions land here.
         from sciwrite_lint.usage import current as _usage_current
 
         run = _usage_current()
         if run:
             run.vllm.record(0.0, error=True, error_type=type(e).__name__)
-        if isinstance(e, (APIConnectionError, APITimeoutError, httpx.ConnectError)):
-            raise LLMConnectionError(
-                f"vLLM at {config.llm_endpoint} became unreachable mid-request: "
-                f"{type(e).__name__}: {e}\n"
-                "Check server: sciwrite-lint containers status"
-            ) from e
-        logger.debug("LLM query failed: {}", e)
+        logger.warning(
+            "vLLM call for {} failed with non-transient error {}: {}",
+            schema_name,
+            type(e).__name__,
+            e,
+        )
         if n == 1:
             return None
         return [None] * n
@@ -508,6 +654,8 @@ async def llm_query_batch(
     thinking: str = "off",
     temperature: float | None = None,
     n: int = 1,
+    concurrency: int | None = None,
+    size_class: str = "heavy",
 ) -> list[dict | None]:
     """Run multiple LLM queries in parallel, sharing one client.
 
@@ -523,6 +671,29 @@ async def llm_query_batch(
     generated from a single vLLM completion (one prefill, n decodes), and
     the output list is flattened so query i contributes results
     ``[i*n : (i+1)*n]``. The callers downstream slice by n to vote.
+
+    Concurrency. In-flight HTTP requests are capped to keep vLLM's
+    queue near-empty so the openai client's blind read timeout
+    (``config.llm_timeout``) only spans prefill + decode (both
+    bounded) and not queue wait. Two paths:
+
+    - Static (default): ``asyncio.Semaphore`` at
+      ``concurrency`` if provided, else ``config.llm_max_concurrency``.
+    - Dynamic (``config.use_dynamic_concurrency``): a
+      ``DynamicConcurrencyController`` resizes the cap from observed
+      ``/metrics`` so submission rate matches vLLM's admission rate
+      (``requests_waiting`` stays under tolerance). See
+      ``sciwrite_lint/llm/concurrency_optimizer/`` for the implementation.
+
+    Per-caller hint. The default is sized for the heaviest caller
+    (``ref_internal_checks`` full-paper queries at ~30K-token prompts).
+    Lighter callers (small-prompt LLM checks, claim taxonomy) can pass
+    ``concurrency=`` higher to amortize wall-time, since KV-cache
+    pressure scales with ``concurrency × per-request KV tokens`` —
+    not request count alone.
+
+    The cap is per-batch, not process-global. The ``max(1, …)`` clamp
+    prevents a misconfigured 0 / negative value from deadlocking.
     """
     from openai import AsyncOpenAI
 
@@ -533,45 +704,94 @@ async def llm_query_batch(
         timeout=config.llm_timeout,
     )
 
-    try:
-        tasks = [
-            llm_query(
-                sys,
-                usr,
-                sch,
-                name,
-                config,
-                model_name,
-                max_tokens,
-                client,
-                thinking=thinking,
-                temperature=temperature,
-                n=n,
-            )
-            for sys, usr, sch, name in queries
-        ]
-        raw_results = await asyncio.gather(*tasks)
-        # For n=1, each element is dict|None → append as-is. For n>1,
-        # each element is list[dict|None] of length n → extend. Output
-        # is always a flat list[dict|None] of length len(queries) * n,
-        # so downstream can slice uniformly.
-        flat: list[dict | None] = []
-        for r in raw_results:
-            if isinstance(r, list):
-                if len(r) == n:
-                    flat.extend(r)
+    # Cap concurrent in-flight requests so vLLM's queue never sees the
+    # full batch at once. Per-caller ``concurrency`` argument wins over
+    # ``config.llm_max_concurrency`` so callers with small prompts can
+    # opt into higher concurrency (the global default is sized for the
+    # heaviest caller).
+    effective_cap = (
+        concurrency if concurrency is not None else config.llm_max_concurrency
+    )
+    effective_cap = max(1, effective_cap)
+
+    # Never push past vLLM's admission ceiling — see effective_max_concurrency.
+    from sciwrite_lint.vllm.vllm_server import effective_max_concurrency
+
+    effective_cap = effective_max_concurrency(
+        config, effective_cap, label=f"text-{size_class}"
+    )
+
+    from sciwrite_lint.llm.concurrency_optimizer import (
+        ControllerParams,
+        concurrency_slot,
+    )
+
+    ctrl_params = ControllerParams(
+        target_kv_lo=config.concurrency_target_kv_lo,
+        target_kv_grow=config.concurrency_target_kv_grow,
+        target_kv_hi=config.concurrency_target_kv_hi,
+    )
+
+    # ``size_class`` keys the dynamic-controller registry (one shared
+    # controller per partition). The default "heavy" matches the original
+    # full-paper caller; lighter callers pass "medium" / "small" so they
+    # share a controller with other lighter callers and don't fight over
+    # the same KV-pressure model as the 30K-token batch.
+    from sciwrite_lint.llm.concurrency_optimizer import SizeClass as _SizeClass
+
+    typed_size_class: _SizeClass = size_class  # type: ignore[assignment]
+
+    async with concurrency_slot(
+        use_dynamic=config.use_dynamic_concurrency,
+        endpoint=config.llm_endpoint,
+        size_class=typed_size_class,
+        static_cap=effective_cap,
+        label=f"text-{size_class}",
+        params=ctrl_params,
+    ) as _slot:
+
+        async def _bounded(
+            sys: str, usr: str, sch: dict, name: str
+        ) -> dict | None | list[dict | None]:
+            async with _slot():
+                return await llm_query(
+                    sys,
+                    usr,
+                    sch,
+                    name,
+                    config,
+                    model_name,
+                    max_tokens,
+                    client,
+                    thinking=thinking,
+                    temperature=temperature,
+                    n=n,
+                )
+
+        try:
+            tasks = [_bounded(sys, usr, sch, name) for sys, usr, sch, name in queries]
+            raw_results = await asyncio.gather(*tasks)
+            # For n=1, each element is dict|None → append as-is. For n>1,
+            # each element is list[dict|None] of length n → extend. Output
+            # is always a flat list[dict|None] of length len(queries) * n,
+            # so downstream can slice uniformly.
+            flat: list[dict | None] = []
+            for r in raw_results:
+                if isinstance(r, list):
+                    if len(r) == n:
+                        flat.extend(r)
+                    else:
+                        # llm_query normalises length, but be defensive.
+                        flat.extend(list(r) + [None] * (n - len(r)))
                 else:
-                    # llm_query normalises length, but be defensive.
-                    flat.extend(list(r) + [None] * (n - len(r)))
-            else:
-                if n == 1:
-                    flat.append(r)
-                else:
-                    # Single dict/None returned despite n>1 — pad.
-                    flat.extend([r] + [None] * (n - 1))
-        return flat
-    finally:
-        await client.close()
+                    if n == 1:
+                        flat.append(r)
+                    else:
+                        # Single dict/None returned despite n>1 — pad.
+                        flat.extend([r] + [None] * (n - 1))
+            return flat
+        finally:
+            await client.close()
 
 
 # ---------------------------------------------------------------------------

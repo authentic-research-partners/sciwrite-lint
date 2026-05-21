@@ -54,7 +54,7 @@ async def _stage_bib_verify(
         load_bib_checks as load_bib_checks_db,
         save_bib_checks,
     )
-    from sciwrite_lint.scoring.chain import RefBibCheck
+    from sciwrite_lint.references.chain import RefBibCheck
 
     with get_db(references_dir) as conn:
         # Compute parse hashes for cache invalidation
@@ -66,7 +66,7 @@ async def _stage_bib_verify(
                 logger.info("Bibliography verification: {} cached results", len(cached))
                 return [RefBibCheck(**c) for c in cached]
 
-        from sciwrite_lint.scoring.chain import run_bib_verification
+        from sciwrite_lint.references.chain import run_bib_verification
 
         results = await run_bib_verification(references_dir, config)
 

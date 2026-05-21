@@ -46,7 +46,7 @@ from sciwrite_lint.pipeline.vision import _stage_cited_vision, _stage_vision
 
 async def preflight(config: LintConfig) -> list[str]:
     """Check vLLM, GROBID, network, and API configuration. Return list of errors."""
-    from sciwrite_lint.cli.config import check_api_config
+    from sciwrite_lint.api_keys import check_api_config
 
     errors: list[str] = check_api_config(config, needs_email=True)
 
@@ -314,13 +314,14 @@ async def run_full_check(
         # reference-accuracy check exists for standalone use (sciwrite-lint check).
 
         # Stage 3: fetch + Stage 4: parse (monitor GROBID memory)
-        from sciwrite_lint.pdf.grobid import (
-            MAX_PARSE_CONCURRENCY,
-            monitor_container_memory,
-        )
+        from sciwrite_lint.pdf.grobid import monitor_container_memory
 
-        parse_sem = asyncio.Semaphore(MAX_PARSE_CONCURRENCY)
-        mem_monitor = asyncio.create_task(monitor_container_memory(parse_sem))
+        parse_sem = asyncio.Semaphore(config.grobid_max_concurrency)
+        mem_monitor = asyncio.create_task(
+            monitor_container_memory(
+                parse_sem, max_concurrency=config.grobid_max_concurrency
+            )
+        )
         try:
             t1 = time.monotonic()
             with _stage_tracking(refs_dir, "fetch") as st:
@@ -330,9 +331,20 @@ async def run_full_check(
 
             t2 = time.monotonic()
             with _stage_tracking(refs_dir, "parse") as st:
-                parsed, cached = await _stage_parse(
-                    config, refs_dir, parse_sem=parse_sem, tex_path=tex_path
+                # ``_stage_parse`` decides for itself whether to restart
+                # text vLLM after embed: if ``_cited_needs_inference``
+                # (computed AFTER parse, when parsed .md files exist)
+                # returns True, it skips the restart and reports
+                # ``text_vllm_stopped=True``. Pre-parse the predicate
+                # always returns False on fresh workspaces, so the
+                # decision must live inside the stage.
+                parsed, cached, parse_findings, text_vllm_stopped = await _stage_parse(
+                    config,
+                    refs_dir,
+                    parse_sem=parse_sem,
+                    tex_path=tex_path,
                 )
+                all_findings.extend(parse_findings)
                 st.detail = f"{parsed} new, {cached} cached"
             run.stage_parse_s = time.monotonic() - t2
         finally:
@@ -351,13 +363,27 @@ async def run_full_check(
             vllm_vision_up = True
 
         with _stage_tracking(refs_dir, "cited_vision"):
-            ref_figure_descs = _stage_cited_vision(
-                refs_dir, fresh=False, backend=config.vision_backend
+            ref_figure_descs, vision_findings = _stage_cited_vision(
+                refs_dir,
+                fresh=False,
+                backend=config.vision_backend,
+                per_image_timeout_s=config.vision_subprocess_per_image_timeout_s,
             )
 
         if vllm_vision_up:
             await _swap_to_text_vllm(config)
             vllm_vision_up = False
+        elif text_vllm_stopped:
+            # ``_stage_parse`` left text vLLM stopped because its
+            # post-parse ``_cited_needs_inference`` returned True. But
+            # the cited-vision swap just decided not to fire — state
+            # changed between the two calls (rare; e.g. the figure
+            # cache got populated by a concurrent process between
+            # parse end and now). Restart text vLLM here so the next
+            # stage (ref_internal) finds it running.
+            from sciwrite_lint.pipeline.swap import _restart_vllm_after_embedding
+
+            _restart_vllm_after_embedding(config)
 
         # Stage 4.5: ref internal checks (vLLM, thinking=low/medium)
         t3 = time.monotonic()
@@ -398,6 +424,7 @@ async def run_full_check(
             + verify_findings
             + claim_findings
             + unreliable_findings
+            + vision_findings
         )
 
     finally:

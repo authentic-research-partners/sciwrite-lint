@@ -10,7 +10,7 @@ from loguru import logger
 
 def run_parse(args: argparse.Namespace) -> int:
     """Parse PDFs via GROBID and store results + embeddings."""
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
     from sciwrite_lint.references.reference_store import (
         parse_all_missing,
         parse_and_embed,
@@ -70,24 +70,19 @@ def run_parse(args: argparse.Namespace) -> int:
     failed = sum(1 for v in results.values() if v == "failed")
 
     if embed and parsed:
+        from sciwrite_lint.references.reference_store import (
+            compute_and_store_embeddings,
+        )
+
         logger.info(f"Computing embeddings for {parsed} newly parsed references...")
         for key, status in results.items():
             if status == "parsed":
                 md_path = refs_dir / "parsed" / f"{key}.md"
                 if md_path.exists():
                     try:
-                        from sciwrite_lint.references.reference_store import (
-                            compute_and_store_embeddings,
-                        )
-
                         text = md_path.read_text(encoding="utf-8")
                         n = compute_and_store_embeddings(key, text, refs_dir)
                         print(f"    {key}: {n} chunks")
-                    except ImportError:
-                        print(
-                            "    Embeddings skipped (pip install sentence-transformers)"
-                        )
-                        break
                     except Exception as e:
                         print(f"    {key}: error — {e}")
 

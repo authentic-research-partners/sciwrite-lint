@@ -19,10 +19,14 @@ from pydantic import BaseModel
 from loguru import logger
 
 from sciwrite_lint.config import LintConfig
-from sciwrite_lint.llm_utils import llm_query, llm_query_batch
+from sciwrite_lint.llm_utils import (
+    MEDIUM_PROMPT_CONCURRENCY,
+    llm_query,
+    llm_query_batch,
+)
 from sciwrite_lint.schemas import (
     ClaimClassification as ClaimClassificationSchema,
-    vllm_schema,
+    vllm_schema_unbounded,
 )
 
 
@@ -135,7 +139,7 @@ CLAIM TO CLASSIFY:
 </claim>
 CITATION KEY: {key}"""
 
-CLASSIFY_SCHEMA = vllm_schema(ClaimClassificationSchema)
+CLASSIFY_SCHEMA = vllm_schema_unbounded(ClaimClassificationSchema)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +238,12 @@ async def classify_claims_batch(
         queries.append((CLASSIFY_SYSTEM, user, CLASSIFY_SCHEMA, "ClaimClassification"))
 
     results = await llm_query_batch(
-        queries, config=config, model_name=model_name, thinking="medium"
+        queries,
+        config=config,
+        model_name=model_name,
+        thinking="medium",
+        concurrency=MEDIUM_PROMPT_CONCURRENCY,
+        size_class="medium",
     )
 
     classified: list[ClaimClassification] = []

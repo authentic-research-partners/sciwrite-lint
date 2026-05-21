@@ -94,6 +94,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode
 
 import rfc3986
+import rfc3986.exceptions
 from loguru import logger
 
 from sciwrite_lint.models import Citation
@@ -194,7 +195,10 @@ def normalize_url(url: str) -> str:
         return ""
     try:
         ref = rfc3986.uri_reference(raw).normalize()
-    except Exception:
+    except rfc3986.exceptions.RFC3986Exception as e:
+        logger.debug(
+            "URL normalize failed ({}: {}); using raw {}", type(e).__name__, e, raw
+        )
         return raw
 
     scheme = ref.scheme or ""

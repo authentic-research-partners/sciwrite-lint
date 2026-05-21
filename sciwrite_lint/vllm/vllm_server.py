@@ -43,6 +43,30 @@ MODELS: dict[str, dict] = {
         "port": 5002,
         "max_model_len": 8192,
         "memory": "8g",  # vision models need more host RAM for image preprocessing
+        # Match text vLLM (0.85) instead of the 0.9 default. At 0.9 on
+        # a 20 GB card the engine reserves 18 GB, leaving only ~2 GB
+        # headroom for prefill activations + PyTorch caching allocator
+        # drift. Under high-concurrency vision (50+ image requests
+        # arriving together) the activations spill into shared GPU
+        # memory via PCIe, which is 30-100× slower than dedicated VRAM.
+        # 0.85 = 17 GB reservation + 3 GB headroom keeps activations
+        # on-device during the heaviest concurrent prefill bursts.
+        "gpu_memory_utilization": 0.85,
+        # ``--max-num-seqs`` for the vision container is derived from
+        # ``config.vision_server_max_seqs`` at start-time (see
+        # ``start_container``). The client-side cap
+        # (``vision_max_concurrency`` — controller upper_bound or static
+        # semaphore) is a separate field; they're usually set to the
+        # same value but have distinct roles.
+        #
+        # Empirically (Qwen3-VL-8B-FP8, 20GB card, max_model_len=8192),
+        # varying ``--max-num-seqs`` from 16 → 64 → 256 leaves
+        # ``num_gpu_blocks`` unchanged at 4986. So the activation-slot
+        # budget does NOT measurably steal from the KV pool in this
+        # configuration. Set this as high as the workload demands; the
+        # dynamic concurrency controller (see
+        # ``sciwrite_lint/llm/concurrency_optimizer/``) decides the
+        # actual in-flight count from observed KV utilization.
     },
 }
 
@@ -204,12 +228,171 @@ def _container_running(runtime: str, name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _container_cmd_args(runtime: str, name: str) -> list[str]:
+    """Return the ``Config.Cmd`` of an existing container, or [] on error.
+
+    Used by the start-time drift detector — args are baked at
+    container creation, so a config bump doesn't propagate to a
+    container that's merely restarted.
+    """
+    import json as _json
+
+    result = subprocess.run(
+        [runtime, "inspect", name, "--format", "{{json .Config.Cmd}}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        parsed = _json.loads(result.stdout.strip())
+        return list(parsed) if parsed else []
+    except (_json.JSONDecodeError, TypeError):
+        return []
+
+
+def _expected_max_num_seqs(config: "LintConfig", profile: dict) -> int:
+    """Mirror of the value passed to ``--max-num-seqs`` at create time."""
+    if profile.get("kind") == "vision":
+        return int(config.vision_server_max_seqs)
+    return int(config.llm_server_max_seqs)
+
+
+def _parse_max_num_seqs(args: list[str]) -> int | None:
+    """Extract the integer value of ``--max-num-seqs`` from Cmd args.
+
+    Returns ``None`` when the flag is absent or its value isn't a
+    base-10 int. The single source of truth for both the start-time
+    drift detector and the runtime-clamp helper.
+    """
+    for i, a in enumerate(args):
+        if a == "--max-num-seqs" and i + 1 < len(args):
+            try:
+                return int(args[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def get_running_max_num_seqs(
+    config: LintConfig, model: str | None = None
+) -> int | None:
+    """Read ``--max-num-seqs`` from the running vLLM container.
+
+    Returns the integer cap baked at ``podman run`` time, or ``None``
+    when nothing can be probed (no runtime, container isn't running,
+    inspect fails, arg missing or unparseable). Best-effort — callers
+    treat ``None`` as "couldn't determine" and skip the clamp.
+    """
+    runtime = _detect_container_runtime()
+    if not runtime:
+        return None
+    name = _container_name(model or config.llm_model)
+    if not _container_running(runtime, name):
+        return None
+    return _parse_max_num_seqs(_container_cmd_args(runtime, name))
+
+
+def effective_max_concurrency(
+    config: LintConfig,
+    requested_cap: int,
+    *,
+    model: str | None = None,
+    label: str = "text",
+) -> int:
+    """Clamp ``requested_cap`` to the running container's ``--max-num-seqs``.
+
+    The controller's effective upper bound is the smaller of the
+    application-side cap (``requested_cap`` from
+    ``llm_max_concurrency`` / ``vision_max_concurrency``) and the
+    server-side admission ceiling (``--max-num-seqs`` baked into the
+    running container). Pushing past the server cap is silent —
+    requests pile up in vLLM's waiting queue, latency degrades, and
+    the engine has been observed to crash under sustained pressure
+    (see ``_check_container_arg_drift`` for the related drift signal).
+
+    On drift the function logs at ERROR (the operator must recreate
+    the container to lift the cap) and returns ``server_cap`` so the
+    controller's ``upper_bound`` tracks reality. When the server cap
+    can't be determined returns ``requested_cap`` unchanged — drift
+    detection then moves to the next sanctioned ``start_container``
+    call.
+    """
+    server_cap = get_running_max_num_seqs(config, model=model)
+    if server_cap is None or server_cap >= requested_cap:
+        return requested_cap
+    logger.error(
+        "vLLM container --max-num-seqs={} below client cap={} for {}. "
+        "Capping client at server limit so the controller never pushes "
+        "past it; recreate the container with `sciwrite-lint containers "
+        "start` to apply current config.",
+        server_cap,
+        requested_cap,
+        label,
+    )
+    return server_cap
+
+
+def _check_container_arg_drift(
+    runtime: str,
+    name: str,
+    config: "LintConfig",
+    profile: dict,
+) -> bool:
+    """Detect drift between the container's baked args and current config.
+
+    Args are baked at ``podman run`` time. ``podman start`` of an
+    existing stopped container reuses the original args silently. So
+    bumping a config value (e.g. ``llm_max_concurrency`` 12 → 256) and
+    just restarting yields a container that *looks* healthy but
+    silently throttles at the old value, which has caused observable
+    overload-induced engine crashes mid-run.
+
+    Returns True when drift is detected (caller is expected to recreate
+    the container). Returns False when args match or detection itself
+    fails (e.g. ``podman inspect`` errors out for an unrelated reason —
+    not the right place to abort the whole call). Logs an ERROR on
+    drift so the recreate is loud rather than silent.
+    """
+    args = _container_cmd_args(runtime, name)
+    if not args:
+        return False
+
+    drifts: list[str] = []
+    actual = _parse_max_num_seqs(args)
+    expected = _expected_max_num_seqs(config, profile)
+    if actual is not None and actual != expected:
+        drifts.append(f"--max-num-seqs: container={actual}, config={expected}")
+
+    if drifts:
+        logger.error(
+            "Container '{}' has stale args from a previous create — "
+            "config bumps did not apply:\n  {}\n"
+            "Auto-recreating to apply current config (running with stale "
+            "args caused silent overload crashes; recreating is mandatory).",
+            name,
+            "\n  ".join(drifts),
+        )
+        return True
+    return False
+
+
 def start_container(
     config: LintConfig,
     model: str | None = None,
     pull: bool = False,
+    replace: bool = False,
 ) -> int:
-    """Start vLLM in a container (podman/docker)."""
+    """Start vLLM in a container (podman/docker).
+
+    With another vLLM model's container already running, both end up
+    fighting for VRAM: each launches with ``--gpu-memory-utilization
+    0.85`` but vLLM scales the second one down to whatever's free at
+    startup, leaving both with crippled KV cache budgets. To prevent
+    that silent degradation, this function refuses to start when a
+    different vLLM model is running unless ``replace=True``, in which
+    case the conflicting container(s) are stopped first.
+    """
     runtime = _detect_container_runtime()
     if not runtime:
         logger.error("Neither podman nor docker found on PATH")
@@ -224,27 +407,85 @@ def start_container(
     name = _container_name(model_name)
     serve_port = _resolve_port(config, model_name)
 
-    # Already running?
-    if _container_running(runtime, name):
-        logger.info(f"Container '{name}' is already running")
-        logger.info("Use 'sciwrite-lint vllm restart' to restart")
-        return 0
+    # Probe state once and reuse — each helper shells out to the
+    # container runtime, so collapsing the calls saves both wall time
+    # and avoids the logic-split that comes with re-asking the runtime
+    # in every branch.
+    target_running = _container_running(runtime, name)
+    target_exists = target_running or _container_exists(runtime, name)
+    drift = target_exists and _check_container_arg_drift(runtime, name, config, profile)
+
+    # Conflict check: refuse to coexist with another vLLM model unless
+    # ``replace=True``. Skipped on the idempotent path (target already
+    # running with matching args) — a no-op rerun shouldn't error out.
+    if not (target_running and not drift):
+        conflicting = [
+            (other_model, _container_name(other_model))
+            for other_model in MODELS
+            if other_model != model_name
+            and _container_running(runtime, _container_name(other_model))
+        ]
+        if conflicting:
+            if replace:
+                for other_model, other_name in conflicting:
+                    logger.info(
+                        "Stopping vLLM '{}' to free GPU for '{}'",
+                        other_name,
+                        name,
+                    )
+                    subprocess.run([runtime, "stop", other_name], capture_output=True)
+            else:
+                others_models = ", ".join(om for om, _ in conflicting)
+                first_other = conflicting[0][0]
+                logger.error(
+                    f"Cannot start vLLM '{model_name}': another vLLM is "
+                    f"already running ({others_models}). Two vLLM containers "
+                    f"can't share the GPU safely — both end up with crippled "
+                    f"KV cache.\n"
+                    f"  - Swap automatically: "
+                    f"sciwrite-lint vllm start --model {model_name} --replace\n"
+                    f"  - Or stop the other manually: "
+                    f"sciwrite-lint vllm stop --model {first_other}"
+                )
+                return 1
+
+    if target_running:
+        if drift:
+            logger.info(
+                f"Stopping running container '{name}' to recreate with current args"
+            )
+            subprocess.run([runtime, "stop", name], capture_output=True)
+            subprocess.run([runtime, "rm", "-f", name], capture_output=True)
+            # fall through to recreate with current config args
+        else:
+            logger.info(f"Container '{name}' is already running")
+            logger.info("Use 'sciwrite-lint vllm restart' to restart")
+            return 0
 
     # Restart stopped container (fast — weights cached in page cache)
-    if _container_exists(runtime, name) and not pull:
-        logger.info(f"Restarting stopped container '{name}'")
-        result = subprocess.run(
-            [runtime, "start", name], capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            logger.info(f"Container restarted: {name}")
-            logger.info(f"API will be available at http://localhost:{serve_port}/v1")
-            port_key = "vllm-vision" if profile.get("kind") == "vision" else "vllm"
-            _save_last_port(port_key, serve_port)
-            return 0
-        # Start failed (e.g. config changed) — fall through to rm + run
-        logger.info(f"Restart failed, recreating container '{name}'")
-        subprocess.run([runtime, "rm", "-f", name], capture_output=True)
+    elif target_exists and not pull:
+        if drift:
+            logger.info(
+                f"Removing stopped container '{name}' to recreate with current args"
+            )
+            subprocess.run([runtime, "rm", "-f", name], capture_output=True)
+            # fall through to recreate with current config args
+        else:
+            logger.info(f"Restarting stopped container '{name}'")
+            result = subprocess.run(
+                [runtime, "start", name], capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                logger.info(f"Container restarted: {name}")
+                logger.info(
+                    f"API will be available at http://localhost:{serve_port}/v1"
+                )
+                port_key = "vllm-vision" if profile.get("kind") == "vision" else "vllm"
+                _save_last_port(port_key, serve_port)
+                return 0
+            # Start failed (e.g. config changed) — fall through to rm + run
+            logger.info(f"Restart failed, recreating container '{name}'")
+            subprocess.run([runtime, "rm", "-f", name], capture_output=True)
 
     # Check port is free before attempting to start
     if not _port_available("0.0.0.0", serve_port):
@@ -301,7 +542,35 @@ def start_container(
         "--kv-cache-dtype",
         "fp8",
         "--enable-chunked-prefill",
+        # Per-step compute budget for prefill chunks + decode tokens
+        # combined. 8192 because:
+        #   1. ``full_paper_consistency`` sends ~26k-token system
+        #      prompts. With prefix caching (default-on in v0.18+),
+        #      only the first check pays the cold prefill; subsequent
+        #      checks hit cached KV. 8192 keeps that cold prefill at
+        #      ~3 iterations rather than ~13 at budget=2048.
+        #   2. KV pool is unaffected at our VRAM reservation;
+        #      activation headroom stays comfortable.
+        #   3. Headroom against longer prompts running concurrently
+        #      with short ones, where prefill could starve decode
+        #      under a tighter budget.
+        # Sizing for the full 26k case (e.g. 32768) burns ~4× iter
+        # latency for no measured win and tightens activation memory
+        # headroom inside ``--gpu-memory-utilization=0.85``.
+        "--max-num-batched-tokens",
+        "8192",
     ]
+
+    # ``--max-num-seqs`` is the server-side admission ceiling. It is
+    # the **server-side** knob ``*_server_max_seqs``, distinct from the
+    # **client-side** ``*_max_concurrency`` that drives the controller's
+    # ``upper_bound`` / static semaphore cap. The two are usually set to
+    # the same value but their roles are different, hence separate
+    # fields — see ``LintConfig`` docstrings.
+    if profile["kind"] == "vision":
+        cmd.extend(["--max-num-seqs", str(config.vision_server_max_seqs)])
+    else:
+        cmd.extend(["--max-num-seqs", str(config.llm_server_max_seqs)])
 
     # Server-side reasoning parser for thinking models (Qwen3)
     if profile.get("reasoning_parser"):

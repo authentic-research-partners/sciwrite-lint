@@ -13,7 +13,7 @@ Design rationale:
 - GROBID parsing is 5-15 s per PDF — deterministic output, cache it.
 - Embeddings are ~500 ms per reference on CPU — no GPU contention.
 - Hash-based invalidation: re-parse only if PDF content changes.
-- Fallback: if cache missing/stale, parse on demand (requires GROBID).
+- On-demand parse: if cache is missing or stale, parse afresh (requires GROBID).
 """
 
 from __future__ import annotations
@@ -21,14 +21,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
+from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from sciwrite_lint.pdf.grobid import GrobidReference, GrobidResult
+    from sciwrite_lint.references.embedding_store import ChunkHit
 
 # Re-export Section for convenience (canonical definition in eval_claims)
 from sciwrite_lint.eval_claims import Section
@@ -44,32 +45,26 @@ _BOOK_ENTRY_TYPES = {"book", "inbook", "incollection", "manual", "proceedings"}
 
 
 def _pdf_page_count(pdf_path: Path) -> int | None:
-    """Return the number of pages in a PDF, or None if unreadable."""
+    """Return the number of pages in a PDF, or None if unreadable.
+
+    pdfplumber wraps pdfminer's parsing errors plus its own; the bare
+    ``Exception`` catch is intentional — pdfminer doesn't expose a stable
+    public exception hierarchy, and a malformed PDF can surface as many
+    things. The failure is logged at DEBUG so it's still discoverable.
+    """
     try:
         import pdfplumber
 
         with pdfplumber.open(pdf_path) as pdf:
             return len(pdf.pages)
-    except Exception:
+    except Exception as e:
+        logger.debug(
+            "PDF page count failed for {}: {}: {}", pdf_path.name, type(e).__name__, e
+        )
         return None
 
 
 _FORMAL_MIN_REFERENCES = 10
-
-
-@dataclass
-class ParseMeta:
-    """Metadata sidecar for a cached parse."""
-
-    pdf_hash: str
-    parse_date: str
-    parser: str  # "grobid"
-    sections_count: int
-    char_count: int
-    is_formal: bool = False
-    has_embeddings: bool = False
-    embedding_model: str = ""
-    chunks_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +394,22 @@ async def parse_all_missing(
                     logger.error("Failed to parse {}: {}", key, exc)
                     results[key] = "error"
                     return
+                except Exception as exc:  # noqa: BLE001
+                    # Last-resort catch so one pathological PDF doesn't kill
+                    # the whole batch. ``process_pdf`` converts httpx
+                    # timeouts/transport errors into RuntimeError after
+                    # retries, so this branch should be rare — but if any
+                    # other library raises (sqlite, pdfplumber, etc.), we
+                    # log loudly per-key and continue. The error is recorded
+                    # in ``results[key] = "error"``; callers can surface it.
+                    logger.error(
+                        "Unexpected error parsing {} ({}): {}",
+                        key,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    results[key] = "error"
+                    return
             results[key] = "parsed" if text else "failed"
 
         await asyncio.gather(*[_parse_one(k, p, et) for k, p, et in to_parse])
@@ -420,6 +431,123 @@ EMBEDDING_DIM = 768
 # window with margin for non-English text.
 MAX_CHUNK_CHARS = 30_000
 
+# Default VRAM budget when CUDA isn't queryable. Used as a final
+# resort by ``resolve_embed_vram_budget_gb``; on CUDA the budget is
+# computed dynamically from currently-free VRAM (see that function's
+# docstring).
+_EMBED_VRAM_BUDGET_DEFAULT_GB = 12.0
+
+
+def expected_embed_vram_budget_gb() -> float:
+    """Budget the embedder *will* see when it runs (post-swap reality).
+
+    Used by display surfaces (monitor's embedder panel) where the
+    operator wants to know "is the configured embedder going to fit on
+    this GPU when it runs", not "would it fit if it tried to coexist
+    with whatever else is currently loaded".
+
+    The swap pattern (``pipeline/swap.py``) guarantees the embedder
+    runs alone — text vLLM and vision vLLM are stopped before its
+    subprocess starts. So the right denominator for a *predicted*
+    budget is total VRAM, not currently-free VRAM (which fluctuates
+    with whichever container is currently resident).
+
+    Resolution order:
+
+    1. ``SCIWRITE_EMBED_VRAM_BUDGET_GB`` env var (override)
+    2. 85 % of CUDA ``total_memory`` (the 15 % reserve covers CUDA
+       runtime context + PyTorch caching-allocator drift)
+    3. ``_EMBED_VRAM_BUDGET_DEFAULT_GB`` constant
+
+    For the load-time check (where the embedder *is* currently
+    loading and current free reflects what it actually has), use
+    ``resolve_embed_vram_budget_gb`` instead.
+    """
+    import os
+
+    override = os.environ.get("SCIWRITE_EMBED_VRAM_BUDGET_GB")
+    if override:
+        return float(override)
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            total_bytes = torch.cuda.get_device_properties(0).total_memory
+            return 0.85 * total_bytes / (1024**3)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"VRAM total-memory query failed ({type(e).__name__}: {e})")
+    return _EMBED_VRAM_BUDGET_DEFAULT_GB
+
+
+def resolve_embed_vram_budget_gb() -> float:
+    """Resolve the soft VRAM budget for the embedder load-time check.
+
+    Resolution order:
+
+    1. ``SCIWRITE_EMBED_VRAM_BUDGET_GB`` env var (for tests / overrides)
+    2. 85 % of currently-free CUDA memory at call time
+    3. ``_EMBED_VRAM_BUDGET_DEFAULT_GB`` constant (≈ 75 % of the 16 GB
+       hardware minimum documented in ``docs/services.md``)
+
+    Querying free VRAM at the moment the embedder loads gives the right
+    answer regardless of hardware: the swap pattern guarantees text
+    vLLM is already stopped by the time ``_get_embedding_model`` runs,
+    so ``mem_get_info()`` reflects exactly what the embedder can claim.
+    The 15 % reserve absorbs PyTorch caching-allocator drift, kernel
+    scratch, and the small slice of free VRAM consumed by the
+    just-loaded model weights themselves.
+
+    On the 16 GB-minimum hardware the project supports, free VRAM at
+    embedder-load time is typically ~14-15 GB → budget ~12-13 GB,
+    which fits Arctic Embed M v2.0 (~9 GB peak at batch=32) but
+    correctly warns for L v2.0 (~24 GB peak).
+
+    Returns the budget in GiB.
+    """
+    import os
+
+    override = os.environ.get("SCIWRITE_EMBED_VRAM_BUDGET_GB")
+    if override:
+        return float(override)
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            free_bytes, _total = torch.cuda.mem_get_info()
+            return 0.85 * free_bytes / (1024**3)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"VRAM budget auto-detect failed ({type(e).__name__}: {e})")
+    return _EMBED_VRAM_BUDGET_DEFAULT_GB
+
+
+def _estimate_embedder_peak_vram_gb(
+    hidden_size: int,
+    num_layers: int,
+    max_seq_len: int,
+    batch_size: int,
+) -> float:
+    """Estimate worst-case peak VRAM (bf16) for the embedder forward pass.
+
+    Lower-bound activation memory is
+    ``batch × max_seq × hidden × num_layers × 2 bytes``. Empirically on
+    Arctic Embed M v2.0 the actual peak runs ~2× that — accounting for
+    sentence-transformers internal padding, attention scratch, weight
+    storage, and PyTorch caching-allocator overhead. Sweep data point:
+    batch=32 seq=6002 hidden=768 layers=12 predicted 3.4 GB; measured
+    peak was 6.6 GB. The 2× factor is a conservative envelope.
+
+    Returns the estimate in GiB. Used by ``_get_embedding_model`` for a
+    load-time budget warning and by the monitor's embedder panel to
+    surface the same number to the operator.
+    """
+    overhead = 2.0
+    bf16_bytes = 2
+    return (
+        overhead * batch_size * max_seq_len * hidden_size * num_layers * bf16_bytes
+    ) / (1024**3)
+
 
 def _get_embedding_config() -> tuple[str, int, str]:
     """Return (model_name, dimension, device) from config, or defaults."""
@@ -433,8 +561,7 @@ def _get_embedding_config() -> tuple[str, int, str]:
         return EMBEDDING_MODEL, EMBEDDING_DIM, "auto"
 
 
-@dataclass
-class Chunk:
+class Chunk(BaseModel):
     """A text chunk with its position in the original document."""
 
     text: str
@@ -445,57 +572,92 @@ class Chunk:
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 
+# Largest a single "paragraph" can be before we treat the source's
+# paragraph delimiters as unreliable and skip the L2 layer for that
+# section. Auto-fetched web archives and OCR'd PDFs sometimes produce
+# one giant ``\n\n``-free blob; synthesizing fake paragraph chunks
+# would lie about structure that isn't there.
+_MAX_PARAGRAPH_CHARS = 10_000
+
+
+def _centered_window(items: list[str], center: int, half: int) -> list[str]:
+    """Symmetric window around *center*: ``[center-half, center+half]``,
+    clipped at sequence ends. With half=1 this is the matched item plus
+    one neighbor on each side (the ±1 windowing the chunking strategy
+    promises). Edge clipping means first/last items get an asymmetric
+    window naturally (no synthetic padding)."""
+    start = max(0, center - half)
+    end = min(len(items), center + half + 1)
+    return items[start:end]
+
 
 def _chunk_text(
     text: str,
     section_title: str = "",
     paragraph_only: bool = False,
-    paragraph_window: int = 3,
-    sentence_window: int = 3,
+    paragraph_half_window: int = 1,
+    sentence_half_window: int = 1,
 ) -> list[Chunk]:
-    """Split text into overlapping chunks at paragraph and sentence level.
+    """Split *text* into overlapping symmetric chunks at paragraph and
+    sentence granularity.
 
-    Two granularities, both using sliding windows:
-    - **Paragraph**: 3-paragraph window, stride 1. Each chunk is 1-3 real
-      paragraphs as the author wrote them. Captures thematic ideas.
-    - **Sentence**: 3-sentence window, stride 1, within each paragraph.
-      Captures precise facts (numbers, definitions).
+    Two granularities, both centered ±half-window sliding windows:
+    - **Paragraph**: ±1 paragraph window (3 paragraphs total when in the
+      interior; 2 at edges). Captures thematic context around each
+      author paragraph.
+    - **Sentence**: ±1 sentence window within each paragraph (3 sentences
+      total when in the interior). Captures precise facts (numbers,
+      definitions) with their immediately surrounding context.
 
     Args:
         paragraph_only: skip sentence-level splitting entirely.
-        paragraph_window: paragraphs per paragraph-level chunk (default 3).
-        sentence_window: sentences per sentence-level chunk (default 3).
+        paragraph_half_window: half-width of paragraph window (default 1
+            ⇒ ±1 ⇒ 3-paragraph window).
+        sentence_half_window: half-width of sentence window (default 1
+            ⇒ ±1 ⇒ 3-sentence window).
     """
     chunks: list[Chunk] = []
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
-    # Paragraph-level chunks: sliding window of real paragraphs
-    for i in range(len(paragraphs)):
-        window = paragraphs[i : i + paragraph_window]
-        window_text = "\n\n".join(window)
-        if len(window_text) > MAX_CHUNK_CHARS:
-            window_text = window_text[:MAX_CHUNK_CHARS]
+    # Detect unreliable paragraph structure: auto-fetched web archives
+    # and OCR'd PDFs sometimes lose ``\n\n`` separators entirely, so
+    # ``text.split("\n\n")`` returns one giant blob. Emitting a single
+    # 30-KB "paragraph" chunk would lie about the source's structure
+    # and defeat the L2 layer of the verify-claim ladder (L2 ends up
+    # the same size as L3). Skip paragraph chunks for this section
+    # when the largest paragraph exceeds ``_MAX_PARAGRAPH_CHARS``;
+    # ``retrieve_top_chunks`` will return zero hits at the paragraph
+    # level for this section, and the ladder escalates L1 → L3
+    # naturally via ``if not units: continue``.
+    has_reliable_paragraphs = paragraphs and all(
+        len(p) <= _MAX_PARAGRAPH_CHARS for p in paragraphs
+    )
 
-        # Find position of first paragraph in window
-        start = text.find(paragraphs[i])
-        if start == -1:
-            start = 0
+    if has_reliable_paragraphs:
+        for i, center_para in enumerate(paragraphs):
+            window = _centered_window(paragraphs, i, paragraph_half_window)
+            window_text = "\n\n".join(window)
+            if len(window_text) > MAX_CHUNK_CHARS:
+                window_text = window_text[:MAX_CHUNK_CHARS]
 
-        chunks.append(
-            Chunk(
-                text=window_text,
-                start_char=start,
-                section_title=section_title,
-                granularity="paragraph",
+            # Locator points at the matched paragraph (the center), so
+            # the chunk's evidence_locator can re-find it in the source.
+            start = text.find(center_para)
+            if start == -1:
+                start = 0
+
+            chunks.append(
+                Chunk(
+                    text=window_text,
+                    start_char=start,
+                    section_title=section_title,
+                    granularity="paragraph",
+                )
             )
-        )
-        if i + paragraph_window >= len(paragraphs):
-            break
 
     if paragraph_only:
         return chunks
 
-    # Sentence-level chunks: sliding window within each paragraph
     for para in paragraphs:
         para_start = text.find(para)
         if para_start == -1:
@@ -506,21 +668,28 @@ def _chunk_text(
         if not sentences:
             continue
 
-        for i in range(len(sentences)):
-            window = sentences[i : i + sentence_window]
+        for i, center_sent in enumerate(sentences):
+            window = _centered_window(sentences, i, sentence_half_window)
             window_text = " ".join(window)
             if len(window_text) > MAX_CHUNK_CHARS:
                 window_text = window_text[:MAX_CHUNK_CHARS]
+            # Locator points at the matched sentence in the source (not
+            # the parent paragraph) so evidence_locator can identify the
+            # specific sentence within the chunk. Search starts at
+            # ``para_start`` to avoid matching an identical sentence
+            # elsewhere in the document; falls back to the paragraph's
+            # start if the sentence-as-stripped doesn't match verbatim.
+            sent_start = text.find(center_sent, para_start)
+            if sent_start == -1:
+                sent_start = para_start
             chunks.append(
                 Chunk(
                     text=window_text,
-                    start_char=para_start,
+                    start_char=sent_start,
                     section_title=section_title,
                     granularity="sentence",
                 )
             )
-            if i + sentence_window >= len(sentences):
-                break
 
     return chunks
 
@@ -537,15 +706,38 @@ def _resolve_embedding_device(device_cfg: str) -> str:
     stops vLLM before embedding to free VRAM, so GPU is safe in both cases.
     """
     if device_cfg == "auto":
-        try:
-            import torch
+        import torch
 
-            if torch.cuda.is_available():
-                return "cuda"
-            return "cpu"
-        except ImportError:
-            return "cpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
     return device_cfg
+
+
+def _embedder_config_kwargs(model_name: str) -> dict[str, object]:
+    """Return ``config_kwargs`` to load ``model_name`` under SDPA attention.
+
+    SDPA (PyTorch's native scaled_dot_product_attention dispatcher) is
+    O(N) in sequence length and works for any modern HuggingFace
+    transformer encoder, so it is the universal default. Some model
+    families need extra config flags to actually honor that choice — this
+    helper encodes the per-family quirks so swapping ``EMBEDDING_MODEL``
+    does not require remembering them.
+
+    Quirks:
+
+    * **Alibaba GTE family** (incl. ``Snowflake/snowflake-arctic-embed-m``,
+      ``Snowflake/snowflake-arctic-embed-l``, ``Alibaba-NLP/gte-*``):
+      the custom modeling code's ``use_memory_efficient_attention`` flag
+      defaults to True, which silently overrides ``attn_implementation``
+      back to its xformers path. Without xformers installed this raises
+      ``AssertionError: please install xformers``. We pin the flag False
+      so SDPA actually takes effect.
+    """
+    kwargs: dict[str, object] = {"attn_implementation": "sdpa"}
+    if model_name.startswith(("Snowflake/", "Alibaba-NLP/")):
+        kwargs["use_memory_efficient_attention"] = False
+    return kwargs
 
 
 def _get_embedding_model():
@@ -568,21 +760,73 @@ def _get_embedding_model():
 
     from sentence_transformers import SentenceTransformer
 
-    # Arctic Embed's custom attention code requires xformers for "sdpa" mode.
-    # Force "eager" attention to avoid that dependency on GPU. Also disable
-    # memory_efficient_attention (xformers assertion guard).
     _embedding_model = SentenceTransformer(
         model_name,
         device=device,
         trust_remote_code=True,
-        config_kwargs={
-            "use_memory_efficient_attention": False,
-            "attn_implementation": "eager",
-        },
+        config_kwargs=_embedder_config_kwargs(model_name),
     )
+    # Cast weights to bf16 on CUDA. Ada-Lovelace / Ampere class GPUs
+    # have bf16 tensor cores; matmul throughput rises ~3.5x over fp32
+    # cuda cores and peak VRAM halves. bf16 embeddings match fp32 to
+    # cosine ≥ 0.9998 — well within retrieval noise. bf16 is preferred
+    # over fp16 because its exponent range matches fp32, avoiding NaN
+    # risk in attention scores. CPU stays fp32: most x86 CPUs have no
+    # native bf16 path and would run slower. Cast happens post-load to
+    # sidestep the ``torch_dtype`` kwarg path, which conflicts with
+    # Arctic Embed's custom ``__init__``.
+    if device == "cuda":
+        _embedding_model = _embedding_model.bfloat16()
+        _warn_if_over_vram_budget(_embedding_model, model_name)
     _embedding_model_name = model_name
     logger.info("Embedding model loaded on {} ({})", device, model_name)
     return _embedding_model
+
+
+def _warn_if_over_vram_budget(model: object, model_name: str) -> None:
+    """Log a warning if the loaded model's worst-case peak exceeds the budget.
+
+    Soft guard — does not raise. Computed at load time so a switch to a
+    larger model (e.g. ``Snowflake/snowflake-arctic-embed-l-v2.0``) is
+    surfaced before the first ``model.encode`` call rather than as a
+    surprise OOM mid-pipeline. Budget is auto-resolved from current
+    free VRAM by ``resolve_embed_vram_budget_gb``.
+    """
+    from sciwrite_lint.references.embedding_store import _ENCODE_BATCH_SIZE
+
+    cfg = model[0].auto_model.config  # type: ignore[index,attr-defined]
+    max_seq = (
+        getattr(model, "max_seq_length", None)
+        or getattr(cfg, "max_position_embeddings", None)
+        or 8192
+    )
+    peak_gb = _estimate_embedder_peak_vram_gb(
+        hidden_size=cfg.hidden_size,
+        num_layers=cfg.num_hidden_layers,
+        max_seq_len=int(max_seq),
+        batch_size=_ENCODE_BATCH_SIZE,
+    )
+    budget_gb = resolve_embed_vram_budget_gb()
+    if peak_gb > budget_gb:
+        logger.warning(
+            "Embedder peak VRAM estimate {:.1f} GB exceeds budget {:.1f} GB "
+            "(model={}, batch={}, max_seq={}, hidden={}, layers={}). "
+            "Consider lowering _ENCODE_BATCH_SIZE in embedding_store.py "
+            "or switching to a smaller embedder.",
+            peak_gb,
+            budget_gb,
+            model_name,
+            _ENCODE_BATCH_SIZE,
+            int(max_seq),
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+        )
+    else:
+        logger.info(
+            "Embedder peak VRAM estimate {:.1f} GB (within {:.1f} GB budget)",
+            peak_gb,
+            budget_gb,
+        )
 
 
 def release_embedding_model() -> None:
@@ -603,13 +847,10 @@ def release_embedding_model() -> None:
     _embedding_model_name = ""
 
     if "cuda" in device:
-        try:
-            import torch
+        import torch
 
-            torch.cuda.empty_cache()
-            logger.debug("GPU memory released after embedding")
-        except ImportError:
-            pass
+        torch.cuda.empty_cache()
+        logger.debug("GPU memory released after embedding")
 
 
 def compute_and_store_embeddings(
@@ -629,15 +870,40 @@ def compute_and_store_embeddings(
     Returns chunk count.
     """
     from sciwrite_lint.eval_claims import split_sections
+    from sciwrite_lint.references._embed_timing import time_phase
     from sciwrite_lint.references.embedding_store import store_embeddings
 
-    sections = split_sections(text)
+    with time_phase("split_sections"):
+        sections = split_sections(text)
     all_chunks: list[Chunk] = []
-    for sec in sections:
-        all_chunks.extend(_chunk_text(sec.text, section_title=sec.title))
+    sections_with_paragraph_chunks: set[str] = set()
+    with time_phase("chunk_text"):
+        for sec in sections:
+            sec_chunks = _chunk_text(sec.text, section_title=sec.title)
+            all_chunks.extend(sec_chunks)
+            if any(c.granularity == "paragraph" for c in sec_chunks):
+                sections_with_paragraph_chunks.add(sec.title)
 
     if not all_chunks:
         return 0
+
+    # L2 coverage diagnostic: ratio of sections that emitted paragraph
+    # chunks to sections we tried to chunk. < 100% means some sections
+    # tripped the ``_MAX_PARAGRAPH_CHARS`` reliability gate (oversized
+    # paragraph → unreliable structure → L2 honestly skipped). One INFO
+    # line per ref so the user can spot bad apples (web archives where
+    # trafilatura emits one ``<p>`` per section, OCR'd PDFs that lost
+    # paragraph structure) without per-section log spam.
+    sections_attempted = sum(1 for s in sections if s.text.strip())
+    if sections_attempted:
+        l2_pct = 100 * len(sections_with_paragraph_chunks) / sections_attempted
+        logger.info(
+            "Chunked {}: {}/{} sections L2-covered ({:.0f}%)",
+            key,
+            len(sections_with_paragraph_chunks),
+            sections_attempted,
+            l2_pct,
+        )
 
     model_name, dim, _ = _get_embedding_config()
 
@@ -659,14 +925,15 @@ def compute_and_store_embeddings(
         update_parse_cache_embeddings,
     )
 
-    with get_db(references_dir) as conn:
-        update_parse_cache_embeddings(
-            conn,
-            key,
-            has_embeddings=True,
-            embedding_model=model_name,
-            chunks_count=count,
-        )
+    with time_phase("update_parse_cache"):
+        with get_db(references_dir) as conn:
+            update_parse_cache_embeddings(
+                conn,
+                key,
+                has_embeddings=True,
+                embedding_model=model_name,
+                chunks_count=count,
+            )
 
     return count
 
@@ -686,8 +953,11 @@ def retrieve_relevant_sections(
 ) -> list[Section] | None:
     """Find sections most relevant to a claim using sqlite-vec KNN.
 
-    Returns a filtered list of sections, or None if embeddings unavailable
-    (caller should use full scan instead).
+    Used at the section level (L3) of the verify-claim ladder. Returns
+    a filtered list of sections, or ``None`` if embeddings are
+    unavailable for *key* — the ladder cannot run without embeddings,
+    so the caller surfaces the claim as ``CANNOT_DETERMINE`` rather
+    than falling back to an unfiltered scan.
 
     Strategy:
     1. KNN query against sqlite-vec for this reference's chunks.
@@ -695,7 +965,9 @@ def retrieve_relevant_sections(
     3. Map chunk hits back to sections (expand ±1 neighbor for context).
     4. Return deduplicated sections ordered by original position.
 
-    Returns None if embeddings are not available (caller uses full scan).
+    When the filter would select ≥70% of the document's sections,
+    returns ``all_sections`` instead (the claim is broadly relevant —
+    no filter is selective enough to be useful).
     """
     from sciwrite_lint.references.embedding_store import (
         has_embeddings,
@@ -721,16 +993,16 @@ def retrieve_relevant_sections(
         return None
 
     # Apply relative scoring cutoff
-    best_score = hits[0]["score"]
+    best_score = hits[0].score
     cutoff = best_score * min_score_ratio
-    hits = [h for h in hits if h["score"] >= cutoff]
+    hits = [h for h in hits if h.score >= cutoff]
 
     # Map chunk hits to sections (deduplicate, include ±1 neighbors)
     seen_titles: set[str] = set()
     matched_sections: list[Section] = []
 
     for hit in hits:
-        title = hit["section_title"]
+        title = hit.section_title
         if title in seen_titles:
             continue
         seen_titles.add(title)
@@ -778,6 +1050,56 @@ def retrieve_relevant_sections(
     return matched_sections
 
 
+def retrieve_top_chunks(
+    claim_text: str,
+    key: str,
+    references_dir: Path,
+    granularity: str,
+    top_n: int = 3,
+) -> list["ChunkHit"] | None:
+    """Find top-N chunks of a specific granularity for a claim.
+
+    Used by the verify-claim escalation ladder
+    (``sciwrite_lint/eval_claims.py``) to ship matched sentence ±1 or
+    paragraph ±1 chunks directly to the LLM instead of the parent
+    section. The chunk windows themselves already encode neighbor
+    context (see ``_chunk_text``: ``paragraph_half_window=1``,
+    ``sentence_half_window=1`` ⇒ ±1 symmetric).
+
+    The KNN is scoped to *granularity* via a rowid pre-filter, so the
+    returned hits are the genuine top-N for that level — they are not
+    competing with the other granularity's chunks for ranking slots
+    (mixed-granularity KNN lets sentence chunks out-rank paragraph
+    chunks because shorter, denser chunks score higher on focused
+    queries; per-level scoping fixes that).
+
+    Returns:
+      - ``None`` only when embeddings are unavailable for *key* — the
+        ladder cannot run, caller bails with CANNOT_DETERMINE.
+      - ``[]`` when embeddings exist but no chunks of this granularity
+        do (e.g. the chunker's reliability gate skipped paragraph
+        chunks for every section). Ladder escalates to the next level.
+      - non-empty list otherwise, capped at *top_n*.
+    """
+    if granularity not in ("sentence", "paragraph"):
+        raise ValueError(
+            f"granularity must be 'sentence' or 'paragraph', got {granularity!r}"
+        )
+
+    from sciwrite_lint.references.embedding_store import (
+        has_embeddings,
+        retrieve_similar,
+    )
+
+    model_name, _, _ = _get_embedding_config()
+    if not has_embeddings(key, references_dir, model_name=model_name):
+        return None
+
+    return retrieve_similar(
+        claim_text, key, references_dir, top_k=top_n, granularity=granularity
+    )
+
+
 # ---------------------------------------------------------------------------
 # Convenience: parse + embed in one call
 # ---------------------------------------------------------------------------
@@ -792,8 +1114,7 @@ async def parse_and_embed(
 ) -> tuple[str | None, int]:
     """Parse a PDF and optionally compute embeddings.
 
-    Returns (markdown_text, chunk_count). chunk_count is 0 if embed=False
-    or if sentence-transformers is not installed.
+    Returns (markdown_text, chunk_count). chunk_count is 0 if embed=False.
     """
     text = await parse_and_store(key, pdf_path, references_dir, force=force)
     if not text:
@@ -801,9 +1122,6 @@ async def parse_and_embed(
 
     chunk_count = 0
     if embed:
-        try:
-            chunk_count = compute_and_store_embeddings(key, text, references_dir)
-        except ImportError:
-            pass  # sentence-transformers not installed — skip embeddings
+        chunk_count = compute_and_store_embeddings(key, text, references_dir)
 
     return text, chunk_count

@@ -27,7 +27,12 @@ def run_vllm(args: argparse.Namespace) -> int:
     if action == "status":
         return status(config)
     elif action == "start":
-        return start_container(config, model=args.model, pull=args.update)
+        return start_container(
+            config,
+            model=args.model,
+            pull=args.update,
+            replace=getattr(args, "replace", False),
+        )
     elif action == "stop":
         return stop_container(config, model=args.model)
     elif action == "logs":

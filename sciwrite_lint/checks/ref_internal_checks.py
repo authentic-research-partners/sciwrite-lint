@@ -21,6 +21,7 @@ from typing import Any
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from sciwrite_lint.checks._diagnostics import llm_unavailable_finding
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.models import Finding
 
@@ -163,8 +164,9 @@ def _build_full_paper_queries(
         _CHECK_DEFS,
         _ISSUE_SCHEMA,
         _REFERENCES_HEADINGS,
-        _SYSTEM_TEMPLATE,
+        _RESERVED_TOKENS,
         _estimate_tokens,
+        _get_max_model_len,
     )
 
     # Build paper body from the cited paper's ManuscriptContext
@@ -185,21 +187,25 @@ def _build_full_paper_queries(
     figure_section = figure_descriptions or "Not available."
     body_tokens = _estimate_tokens(body) + _estimate_tokens(figure_section)
 
-    # Size check against max_model_len
-    from sciwrite_lint.checks.full_paper_consistency import _get_max_model_len
-
+    # Reservation budget shared with the manuscript path: overhead +
+    # worst-case thinking + output reserve, see ``_RESERVED_TOKENS`` in
+    # ``full_paper_consistency``. The previous local literal of 3500 was
+    # ~2K shy of this budget — papers that squeezed through this gate
+    # would then exhaust the LLM's output room and trigger the
+    # thinking-ladder retries (and occasionally a give-up at thinking=low
+    # / comp_tokens=2248). One source of truth keeps the two paths
+    # honest.
     max_model_len = _get_max_model_len(config)
-    if body_tokens > max_model_len - 3500:  # overhead + min output
+    if body_tokens > max_model_len - _RESERVED_TOKENS:
         logger.debug(
             "Ref paper body ~{}K tokens, skipping full-paper checks",
             body_tokens // 1000,
         )
         return []
 
-    system = _SYSTEM_TEMPLATE.format(
-        paper_body=body,
-        figure_section=figure_section,
-    )
+    from sciwrite_lint.checks.full_paper_consistency import format_system_prompt
+
+    system = format_system_prompt(body, figure_section)
 
     queries: list[tuple[str, str, dict, str]] = []
     has_figures = figure_section != "Not available."
@@ -226,8 +232,26 @@ def _process_consistency_results(
     findings: list[Finding] = []
     seen_keys: set[str] = set()
     for pair_desc, result in zip(pair_descs, results):
+        # ``None`` means the LLM exhausted its retry ladder. Emit a
+        # diagnostic finding so the JSON report records that this
+        # specific section pair was not actually checked.
+        if result is None:
+            findings.append(
+                llm_unavailable_finding(
+                    f"cross-section-consistency ({pair_desc})",
+                    file=md_name,
+                    ref_key=ref_key,
+                )
+            )
+            continue
         if not result:
             continue
+        # Clip to the Pydantic caps — wire schema is unbounded
+        # (vllm_schema_unbounded). Same pattern as
+        # cross_section_consistency.py and full_paper_consistency.py.
+        from sciwrite_lint.schemas import ConsistencyResult, truncate_to_model
+
+        result = truncate_to_model(ConsistencyResult, result)
         for item in result.get("contradictions", []):
             if not item.get("is_genuine", False):
                 continue
@@ -272,8 +296,19 @@ def _process_full_paper_results(
 
     findings: list[Finding] = []
     for (_check_id, _desc, _question, _thinking), result in zip(queried, results):
+        # ``None`` => LLM gave up after the retry ladder; emit a
+        # diagnostic finding tied to this specific check so the gap is
+        # visible in the JSON report.
+        if result is None:
+            findings.append(
+                llm_unavailable_finding(_check_id, file=md_name, ref_key=ref_key)
+            )
+            continue
         if not result:
             continue
+        from sciwrite_lint.schemas import FullPaperIssueList, truncate_to_model
+
+        result = truncate_to_model(FullPaperIssueList, result)
         for item in result.get("issues", []):
             if not item.get("is_genuine", False):
                 continue
@@ -410,7 +445,7 @@ async def _compute_ref_contributions(
     per-ref contribution scores.
     """
     from sciwrite_lint.claims import classify_claims_batch
-    from sciwrite_lint.scoring.chain import extract_citations_from_markdown
+    from sciwrite_lint.references.chain import extract_citations_from_markdown
     from sciwrite_lint.scoring.contribution import compute_all_contribution_axes
 
     # Phase 1: extract inline citations from each ref, build claim dicts
@@ -595,9 +630,15 @@ def _describe_cited_figures_vl(
     if not keys:
         return
 
+    from sciwrite_lint.config import load_config
     from sciwrite_lint.vision.describe import describe_figures_by_source
     from sciwrite_lint.vision.image_extraction import collect_cited_images
 
+    # Subprocess inherits parent's CWD, so load_config() walks up and
+    # picks up the same .sciwrite-lint.toml the parent used. Without
+    # this, [vision] max_concurrency / request_timeout overrides would
+    # silently apply only to the parent's manuscript-vision pass.
+    sub_config = load_config()
     all_images, ref_image_ranges = collect_cited_images(keys, references_dir)
     if all_images:
         describe_figures_by_source(
@@ -606,6 +647,7 @@ def _describe_cited_figures_vl(
             references_dir,
             fresh=fresh,
             backend=backend,
+            config=sub_config,
         )
 
 
@@ -642,7 +684,7 @@ async def run_ref_internal_checks(
     Returns:
         Mapping of ref key -> RefInternalResult.
     """
-    from sciwrite_lint.llm_utils import llm_query_batch
+    from sciwrite_lint.llm_utils import MEDIUM_PROMPT_CONCURRENCY, llm_query_batch
     from sciwrite_lint.manuscript_store import ManuscriptContext
     from sciwrite_lint.references.workspace_db import get_db
 
@@ -683,14 +725,18 @@ async def run_ref_internal_checks(
         all_queries: list[tuple[str, str, dict, str]] = []
         query_map: list[tuple[str, str, int]] = []  # (key, check, count)
         ref_contexts: dict[str, Any] = {}  # key → ManuscriptContext (for contribution)
+        # Surface refs excluded from LLM checks at INFO level (was DEBUG —
+        # silently excluded refs are invisible in routine logs and the user
+        # has no way to know which papers were skipped from claim
+        # verification).
+        skipped_too_few_sections: list[str] = []
+        skipped_too_large: list[tuple[str, int]] = []  # (ref_key, pages)
 
         for ref_key, md_path in to_check:
             ctx = ManuscriptContext.from_markdown(md_path, ref_key=ref_key)
 
             if len(ctx.sections) < 2:
-                logger.debug(
-                    "Ref {}: {} sections, skipping", ref_key, len(ctx.sections)
-                )
+                skipped_too_few_sections.append(ref_key)
                 results[ref_key] = RefInternalResult(
                     key=ref_key,
                     internal_score=1.0,  # no data, not penalized
@@ -703,12 +749,7 @@ async def run_ref_internal_checks(
             if ctx.abstract:
                 total_chars += len(ctx.abstract)
             if total_chars > config.max_document_chars:
-                logger.debug(
-                    "Ref {}: ~{} pages ({} chars), skipping LLM checks",
-                    ref_key,
-                    total_chars // 3500,
-                    total_chars,
-                )
+                skipped_too_large.append((ref_key, total_chars // 3500))
                 results[ref_key] = RefInternalResult(
                     key=ref_key,
                     internal_score=1.0,  # not penalized
@@ -771,24 +812,63 @@ async def run_ref_internal_checks(
                 pairwise_queries.extend(batch)
                 pairwise_map.append((ref_key, check_name, count))
 
+        if skipped_too_large:
+            too_large_summary = ", ".join(f"{k} (~{p}pp)" for k, p in skipped_too_large)
+            logger.info(
+                "Ref internal checks: {} ref(s) excluded — too large for "
+                "max_document_chars={}: {}",
+                len(skipped_too_large),
+                config.max_document_chars,
+                too_large_summary,
+            )
+        if skipped_too_few_sections:
+            logger.info(
+                "Ref internal checks: {} ref(s) excluded — fewer than 2 "
+                "parsed sections: {}",
+                len(skipped_too_few_sections),
+                ", ".join(skipped_too_few_sections),
+            )
+
         logger.info(
             "Ref internal checks: {} pairwise + {} full-paper queries across {} refs",
             len(pairwise_queries),
             len(fullpaper_queries),
-            len(to_check),
+            len(to_check) - len(skipped_too_large) - len(skipped_too_few_sections),
         )
 
         # Run both batches concurrently (different thinking modes)
         async def _empty() -> list[dict | None]:
             return []
 
+        # Per-caller concurrency hints: pairwise queries are
+        # medium-class (~2-5K-token prompts); fullpaper queries are
+        # the heavy ~30K-token prompts the global
+        # ``llm_max_concurrency`` was sized for, so they pass
+        # concurrency=None to inherit the user-tunable knob. Both
+        # batches launch concurrently via asyncio.gather below;
+        # combined in-flight worst case is
+        # MEDIUM_PROMPT_CONCURRENCY + llm_max_concurrency, which the
+        # MEDIUM cap is intentionally held below the throughput plateau
+        # to leave KV-cache headroom for. If saturation reappears,
+        # sequence the two awaits instead of gathering.
         pairwise_coro = (
-            llm_query_batch(pairwise_queries, config=config, thinking="low")
+            llm_query_batch(
+                pairwise_queries,
+                config=config,
+                thinking="low",
+                concurrency=MEDIUM_PROMPT_CONCURRENCY,
+                size_class="medium",
+            )
             if pairwise_queries
             else _empty()
         )
         fullpaper_coro = (
-            llm_query_batch(fullpaper_queries, config=config, thinking="medium")
+            llm_query_batch(
+                fullpaper_queries,
+                config=config,
+                thinking="medium",
+                size_class="heavy",
+            )
             if fullpaper_queries
             else _empty()
         )

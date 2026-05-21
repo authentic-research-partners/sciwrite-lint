@@ -75,12 +75,14 @@ def _normalize_filename(filename: str) -> str:
     return re.sub(r"\s+", " ", name).strip()
 
 
-def _leading_token(filename: str) -> str:
+def leading_token(filename: str) -> str:
     """Return the first alphanumeric token of a filename stem.
 
     Used for citekey-prefix lookup: ``dewey1910_How_We_Think.pdf`` →
     ``"dewey1910"``. Returns ``""`` when the stem has no alphanumeric
-    characters.
+    characters. Shared by :mod:`sciwrite_lint.local_sources` (drop-folder
+    matching) and :mod:`sciwrite_lint.references.citations` (workspace-
+    root matching) so both apply the same citekey-prefix convention.
     """
     stem = Path(filename).stem
     match = re.match(r"[A-Za-z0-9]+", stem)
@@ -156,7 +158,7 @@ def match_local_sources(
 
     keys_by_lower = {k.lower(): k for k in titles}
     for src in candidates:
-        token = _leading_token(src.name).lower()
+        token = leading_token(src.name).lower()
         if not token:
             continue
         key = keys_by_lower.get(token)

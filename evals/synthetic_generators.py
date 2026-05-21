@@ -15,12 +15,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from evals.synthetic_types import (  # noqa: F401 — re-export for backward compat
-    _BIBITEMS,
-    SyntheticCase,
-    _make_doc,
-    _make_sectioned_doc,
-)
+from evals.synthetic_types import SyntheticCase
 
 
 # ---------------------------------------------------------------------------

@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from pydantic import BaseModel, ConfigDict, Field
 
 from sciwrite_lint.config import LintConfig, PaperConfig
 from sciwrite_lint.models import Citation, Finding
@@ -33,7 +33,7 @@ from sciwrite_lint.references.workspace_db import (
 
 from sciwrite_lint.pipeline.checks import run_llm_checks_batched, run_text_checks
 from sciwrite_lint.pipeline.claims import _stage_bib_verify, _stage_claims
-from sciwrite_lint.pipeline.embeddings import _extract_claim_texts
+from sciwrite_lint.pipeline.embeddings import persist_manuscript_citations
 from sciwrite_lint.pipeline.fetch import _stage_fetch
 from sciwrite_lint.pipeline.orchestration import _backup_workspace
 from sciwrite_lint.pipeline.pdf_context import citations_from_pdf_context
@@ -61,8 +61,7 @@ from sciwrite_lint.pipeline.unreliable import _stage_unreliable
 from sciwrite_lint.pipeline.verify import _stage_verify
 
 
-@dataclass
-class StagedPaperResult:
+class StagedPaperResult(BaseModel):
     """Result from ``run_papers_staged`` for one paper.
 
     Contains all pipeline outputs needed for scoring: findings from all
@@ -78,13 +77,14 @@ class StagedPaperResult:
     error: str | None = None
 
 
-@dataclass
-class _PaperCtx:
+class _PaperCtx(BaseModel):
     """Per-paper mutable state carried across stages in ``run_papers_staged``.
 
     Each paper gets one context object at setup. Stages mutate it
     (appending findings, storing claim results, etc.) as they complete.
     """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
     tex_path: Path
@@ -92,13 +92,13 @@ class _PaperCtx:
     config: LintConfig
     refs_dir: Path
     citations: list[Citation]
-    check_findings: list[Finding]
-    verify_findings: list[Finding]
-    claim_findings: list[Finding]
-    claim_results: list[dict]
-    bib_checks: list[Any]
-    ref_figure_descs: dict[str, str]
-    run: Any  # RunStats from usage.py
+    check_findings: list[Finding] = Field(default_factory=list)
+    verify_findings: list[Finding] = Field(default_factory=list)
+    claim_findings: list[Finding] = Field(default_factory=list)
+    claim_results: list[dict] = Field(default_factory=list)
+    bib_checks: list[Any] = Field(default_factory=list)
+    ref_figure_descs: dict[str, str] = Field(default_factory=dict)
+    run: Any = None  # RunStats from usage.py
     error: str | None = None
 
 
@@ -381,13 +381,13 @@ async def run_papers_staged(
         # Stage 4a: GROBID PARSE — concurrent with shared memory monitor
         # ------------------------------------------------------------------
         logger.info("=== Stage 4a: GROBID parse ({} papers) ===", len(ctxs))
-        from sciwrite_lint.pdf.grobid import (
-            MAX_PARSE_CONCURRENCY,
-            monitor_container_memory,
-        )
+        from sciwrite_lint.pdf.grobid import monitor_container_memory
 
-        parse_sem = asyncio.Semaphore(MAX_PARSE_CONCURRENCY)
-        mem_monitor = asyncio.create_task(monitor_container_memory(parse_sem))
+        max_parse = ctxs[0].config.grobid_max_concurrency
+        parse_sem = asyncio.Semaphore(max_parse)
+        mem_monitor = asyncio.create_task(
+            monitor_container_memory(parse_sem, max_concurrency=max_parse)
+        )
 
         # Store parse results for each paper (needed to collect embedding keys)
         parse_results_map: dict[str, dict[str, str]] = {}
@@ -453,17 +453,23 @@ async def run_papers_staged(
                 if web_path.exists():
                     keys_to_embed.append(key)
 
-            # Extract claim texts for query vector pre-computation.
-            # The embedding subprocess encodes these alongside document
-            # chunks so Stage 5 never loads the model in the parent process.
-            claim_texts = _extract_claim_texts(ctx.config, ctx.tex_path)
+            # Persist manuscript citations so the embedding subprocess can
+            # read claim contexts from each paper's workspace.db (instead of
+            # receiving them via the manifest). Stage 4b then encodes any
+            # contexts that lack a query vector alongside the document
+            # chunks, in a single model load. Build-time non-fatal failures
+            # surface here as a system-issue Finding routed via check_findings.
+            n_citations, build_finding = persist_manuscript_citations(
+                ctx.config, ctx.refs_dir, tex_path=ctx.tex_path
+            )
+            if build_finding is not None:
+                ctx.check_findings.append(build_finding)
 
-            if keys_to_embed or claim_texts:
+            if keys_to_embed or n_citations:
                 embed_manifest.append(
                     {
                         "keys": keys_to_embed,
                         "references_dir": str(ctx.refs_dir),
-                        "claim_texts": claim_texts,
                     }
                 )
 

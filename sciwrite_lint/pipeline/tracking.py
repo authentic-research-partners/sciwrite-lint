@@ -7,6 +7,7 @@ progress.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +25,7 @@ def _track(refs_dir: Path, stage: str, status: str, detail: str = "") -> None:
     try:
         with get_db(refs_dir) as conn:
             update_pipeline_stage(conn, stage, status, detail)
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.debug(f"pipeline stage tracking failed ({type(e).__name__}: {e})")
 
 

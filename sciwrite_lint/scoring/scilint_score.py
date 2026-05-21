@@ -215,19 +215,41 @@ def _score_reference(claims: list[dict[str, Any]]) -> RefScore:
     """Compute the verification score for a single reference.
 
     Aggregates all claims citing this reference. The overall verdict
-    is the *worst* verdict across all claims (conservative).
-    The purpose is taken from the most common purpose across claims.
+    is the *worst* verdict across all claims (conservative). The
+    purpose is taken from the most common purpose across claims.
+    SKIPPED rows (cite extracted but never verified) are excluded from
+    scoring — they carry no LLM judgment and would otherwise dilute the
+    average. If every claim for the ref is SKIPPED, the returned
+    RefScore has ``verdict='SKIPPED'`` and ``weight=0.0`` so the ref
+    contributes nothing to the weighted referencing-quality average.
     """
     key = claims[0].get("key", "")
 
+    # Exclude SKIPPED rows from scoring — they have no LLM verdict.
+    scored_claims = [c for c in claims if c.get("verdict") != "SKIPPED"]
+
+    if not scored_claims:
+        return RefScore(
+            key=key,
+            purpose="context",
+            weight=0.0,
+            verdict="SKIPPED",
+            verification_score=0.0,
+            weighted_score=0.0,
+            claim_count=len(claims),
+            supports_count=0,
+            partial_count=0,
+            not_supported_count=0,
+        )
+
     # Count verdicts
-    supports = sum(1 for c in claims if c.get("verdict") == "SUPPORTS")
-    partial = sum(1 for c in claims if c.get("verdict") == "PARTIALLY_SUPPORTS")
-    not_supported = sum(1 for c in claims if c.get("verdict") == "NOT_SUPPORTED")
+    supports = sum(1 for c in scored_claims if c.get("verdict") == "SUPPORTS")
+    partial = sum(1 for c in scored_claims if c.get("verdict") == "PARTIALLY_SUPPORTS")
+    not_supported = sum(1 for c in scored_claims if c.get("verdict") == "NOT_SUPPORTED")
 
     # Determine dominant purpose (most frequent, breaking ties by weight)
     purpose_counts: dict[str, int] = {}
-    for c in claims:
+    for c in scored_claims:
         p = c.get("citation_purpose", "evidence")
         purpose_counts[p] = purpose_counts.get(p, 0) + 1
     dominant_purpose = max(
@@ -237,11 +259,11 @@ def _score_reference(claims: list[dict[str, Any]]) -> RefScore:
 
     # Verification score: weighted average of all claim verdicts for this ref
     total_score = 0.0
-    for c in claims:
+    for c in scored_claims:
         if not c.get("dismissed"):
             v = c.get("verdict", "CANNOT_DETERMINE")
             total_score += VERDICT_SCORES.get(v, 0.25)
-    active_claims = [c for c in claims if not c.get("dismissed")]
+    active_claims = [c for c in scored_claims if not c.get("dismissed")]
     avg_score = total_score / len(active_claims) if active_claims else 0.25
 
     # Overall verdict (worst non-dismissed)
@@ -249,7 +271,7 @@ def _score_reference(claims: list[dict[str, Any]]) -> RefScore:
     overall_verdict = "SUPPORTS"
     for c in active_claims:
         v = c.get("verdict", "CANNOT_DETERMINE")
-        if priority.index(v) < priority.index(overall_verdict):
+        if v in priority and priority.index(v) < priority.index(overall_verdict):
             overall_verdict = v
 
     weight = PURPOSE_WEIGHTS.get(dominant_purpose, 0.2)
@@ -261,7 +283,7 @@ def _score_reference(claims: list[dict[str, Any]]) -> RefScore:
         verdict=overall_verdict,
         verification_score=avg_score,
         weighted_score=weight * avg_score,
-        claim_count=len(claims),
+        claim_count=len(scored_claims),
         supports_count=supports,
         partial_count=partial,
         not_supported_count=not_supported,

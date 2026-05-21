@@ -49,7 +49,7 @@ def run_verify(args: argparse.Namespace) -> int:
     from sciwrite_lint.references.citations import get_last_citation_source
     from sciwrite_lint.pipeline import extract_citations_for_paper
 
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
     from sciwrite_lint.cli.config import check_api_config
     from sciwrite_lint.cli.fetch import fetch_for_citations
 
@@ -148,7 +148,7 @@ def run_status(args: argparse.Namespace) -> int:
     from sciwrite_lint.references.metadata import load_all_metadata
     from sciwrite_lint.pipeline import extract_citations_for_paper
 
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
 
     config = _load_config(args)
     pc = _resolve_paper(config, args.paper)
@@ -279,7 +279,7 @@ def run_ref_health(args: argparse.Namespace) -> int:
         bib_path = None
         name = tex_path.stem
     else:
-        from sciwrite_lint.__main__ import _load_config, _resolve_paper
+        from sciwrite_lint.cli._common import _load_config, _resolve_paper
 
         config = _load_config(args)
         assert paper_name is not None  # guarded above
@@ -426,7 +426,7 @@ def run_ref_health(args: argparse.Namespace) -> int:
 
 def run_verify_claims(args: argparse.Namespace) -> int:
     """Verify claims against cited sources using local LLM or Claude Opus."""
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
 
     config = _load_config(args)
     pc = _resolve_paper(config, args.paper)

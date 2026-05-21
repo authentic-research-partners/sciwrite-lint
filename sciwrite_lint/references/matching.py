@@ -10,36 +10,19 @@ import re
 from typing import Any
 
 from anyascii import anyascii
+from rapidfuzz import fuzz as _rf_fuzz
 
 from sciwrite_lint.models import Citation
-from sciwrite_lint.schemas import VenueMatch, vllm_schema
+from sciwrite_lint.schemas import VenueMatch, vllm_schema_unbounded
 
 # Thresholds
 TITLE_THRESHOLD = 0.80  # rapidfuzz ratio
 AUTHOR_THRESHOLD = 0.60  # combined Jaccard + sequence
 YEAR_TOLERANCE = 1  # ±1 year
 
-# Try rapidfuzz first; use basic implementation if unavailable
-try:
-    from rapidfuzz import fuzz as _rf_fuzz
 
-    def _fuzzy_ratio(a: str, b: str) -> float:
-        return _rf_fuzz.ratio(a, b) / 100.0
-except ImportError:
-
-    def _fuzzy_ratio(a: str, b: str) -> float:
-        """Basic sequence similarity when rapidfuzz not installed."""
-        if not a or not b:
-            return 0.0
-        a, b = a.lower(), b.lower()
-        if a == b:
-            return 1.0
-        # Simple word overlap ratio
-        wa, wb = set(a.split()), set(b.split())
-        if not wa or not wb:
-            return 0.0
-        overlap = len(wa & wb)
-        return (2 * overlap) / (len(wa) + len(wb))
+def _fuzzy_ratio(a: str, b: str) -> float:
+    return _rf_fuzz.ratio(a, b) / 100.0
 
 
 def _normalize(text: str) -> str:
@@ -100,17 +83,8 @@ def _normalize_venue(venue: str) -> str:
     return v
 
 
-try:
-    from rapidfuzz import fuzz as _rf_fuzz_venue
-
-    def _fuzzy_partial_ratio(a: str, b: str) -> float:
-        return _rf_fuzz_venue.partial_ratio(a, b) / 100.0
-
-except ImportError:
-
-    def _fuzzy_partial_ratio(a: str, b: str) -> float:
-        """Fallback: use standard ratio when rapidfuzz not installed."""
-        return _fuzzy_ratio(a, b)
+def _fuzzy_partial_ratio(a: str, b: str) -> float:
+    return _rf_fuzz.partial_ratio(a, b) / 100.0
 
 
 def venue_similarity(tex_venue: str, api_venue: str) -> float:
@@ -135,7 +109,7 @@ VENUE_THRESHOLD = (
 )
 
 
-_VENUE_CONFIRM_SCHEMA = vllm_schema(VenueMatch)
+_VENUE_CONFIRM_SCHEMA = vllm_schema_unbounded(VenueMatch)
 
 
 async def venue_match_llm(

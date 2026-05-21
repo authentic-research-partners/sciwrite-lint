@@ -13,11 +13,13 @@ Subcommands (wired via sciwrite-lint CLI):
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 from pathlib import Path
 
 from loguru import logger
 
+from sciwrite_lint.checks._diagnostics import split_findings, split_findings_dicts
 from sciwrite_lint.config import LintConfig
 
 # Default output directory
@@ -341,8 +343,9 @@ def _match_injections_to_findings(
                 found = True
                 break
 
-        # Fallback: if no context match but rule fired, count as detected
-        # (injection may have changed line numbers, making exact match hard)
+        # Loose match: if no context match but rule fired, count as
+        # detected (injection may have changed line numbers, making
+        # exact match hard)
         if not found and candidates:
             found = True
 
@@ -520,8 +523,13 @@ def run_inject(
             ) -> None:
                 async with sem:
                     llm_findings = await _run_llm_rules_on_file(path, cfg)
-                findings_data = text_findings + llm_findings
-                _save_paper_result(arxiv_id, injection_dicts, findings_data)
+                # Strip system issues from injection-detection metrics
+                # — they have no ground-truth label and would distort
+                # per-rule precision/recall in EvalReport aggregation.
+                manuscript_findings, _ = split_findings_dicts(
+                    text_findings + llm_findings
+                )
+                _save_paper_result(arxiv_id, injection_dicts, manuscript_findings)
                 if path.suffix == ".tex":
                     path.unlink(missing_ok=True)
 
@@ -723,16 +731,27 @@ def run_full_pipeline(
                     )
                     continue
 
-                findings_data = [f.model_dump() for f in sr.findings]
+                # Split system issues out — they describe the linter,
+                # not the manuscript, and must not pollute scoring,
+                # judging, or per-rule aggregation.
+                manuscript_findings, system_issues = split_findings(sr.findings)
+                findings_data = [f.model_dump() for f in manuscript_findings]
+                system_issue_dicts = [f.model_dump() for f in system_issues]
                 claim_results = sr.claim_results
                 print(
-                    f"  {arxiv_id}: {len(findings_data)} findings, {len(claim_results)} claims"
+                    f"  {arxiv_id}: {len(findings_data)} findings, "
+                    f"{len(claim_results)} claims"
+                    + (
+                        f", {len(system_issue_dicts)} system issue(s)"
+                        if system_issue_dicts
+                        else ""
+                    )
                 )
 
                 # Judge (optional, Claude API — no GPU)
                 verdict_dicts: list[dict] = []
                 judge_elapsed = 0.0
-                if judge and sr.findings:
+                if judge and manuscript_findings:
                     import time as _time
 
                     from eval_real_world.judge import judge_findings
@@ -746,7 +765,9 @@ def run_full_pipeline(
                             f"## {s.title}\n{s.clean_text}" for s in ctx.sections
                         )
                         to_judge = [
-                            f for f in sr.findings if f.level in ("error", "warning")
+                            f
+                            for f in manuscript_findings
+                            if f.level in ("error", "warning")
                         ][:max_judge_findings]
                         t_judge = _time.monotonic()
                         verdicts = await judge_findings(
@@ -780,8 +801,12 @@ def run_full_pipeline(
                     try:
                         with get_db(refs_dir) as conn:
                             update_pipeline_stage(conn, "contributions", "running")
-                    except Exception:
-                        pass
+                    except sqlite3.Error as e:
+                        logger.debug(
+                            "pipeline_stage update (running) failed: {}: {}",
+                            type(e).__name__,
+                            e,
+                        )
                     try:
                         from sciwrite_lint.cli.rank import (
                             compute_contribution_axes_from_ctx,
@@ -813,8 +838,12 @@ def run_full_pipeline(
                                     "failed",
                                     str(e)[:200],
                                 )
-                        except Exception:
-                            pass
+                        except sqlite3.Error as db_err:
+                            logger.debug(
+                                "pipeline_stage update (failed) failed: {}: {}",
+                                type(db_err).__name__,
+                                db_err,
+                            )
 
                 score_result = compute_scilint_score(
                     arxiv_id,
@@ -849,6 +878,7 @@ def run_full_pipeline(
                     ),
                     "contribution": round(score_result.contribution.overall, 4),
                     "n_findings": len(findings_data),
+                    "n_system_issues": len(system_issue_dicts),
                     "n_claims": len(claim_results),
                     "n_refs_scored": score_result.total_refs_scored,
                     "findings_by_rule": {},
@@ -858,6 +888,8 @@ def run_full_pipeline(
                     result["findings_by_rule"][rid] = (
                         result["findings_by_rule"].get(rid, 0) + 1
                     )
+                if system_issue_dicts:
+                    result["system_issues"] = system_issue_dicts
                 if c_scores:
                     result["contribution_axes"] = c_scores
                 if verdict_dicts:

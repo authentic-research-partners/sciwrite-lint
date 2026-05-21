@@ -27,7 +27,6 @@ async def acquire_fulltext(
     expected_authors: list[str] | None = None,
     expected_year: int | None = None,
     expected_entry_type: str = "article",
-    progress: bool = True,
 ) -> AcquisitionResult:
     """Acquire full text for a citation into ``references_dir / {key}.pdf``.
 
@@ -46,10 +45,6 @@ async def acquire_fulltext(
     :param expected_entry_type: Bib entry type (``article``, ``book``,
         ``techreport``, ...). Controls the validator's body-length hard
         reject and the corporate-author carve-out.
-    :param progress: Retained for backwards compatibility with CLI callers.
-        Currently emits one summary INFO log on completion; the per-source
-        progress prints that the old implementation produced are replaced
-        with debug-level loguru events from the public API.
     """
     from sciwrite_lint.oa import FetchConfig, download_pdf
 
@@ -78,13 +73,12 @@ async def acquire_fulltext(
     )
 
     if dr.found and dr.out_path is not None:
-        if progress:
-            logger.info(
-                "{}: downloaded via {} → {}",
-                key,
-                dr.source or "unknown",
-                dr.out_path.name,
-            )
+        logger.info(
+            "{}: downloaded via {} → {}",
+            key,
+            dr.source or "unknown",
+            dr.out_path.name,
+        )
         return AcquisitionResult(
             found=True,
             source=dr.source or "",
@@ -101,13 +95,12 @@ async def acquire_fulltext(
     )
     failure_status = _classify_acquisition_failure(dr.failed_sources)
     if dr.oa_url:
-        if progress:
-            logger.info(
-                "{}: manual download needed: {} "
-                "(save PDF to local_pdfs/ or MHTML to local_web/)",
-                key,
-                dr.oa_url,
-            )
+        logger.info(
+            "{}: manual download needed: {} "
+            "(save PDF to local_pdfs/ or MHTML to local_web/)",
+            key,
+            dr.oa_url,
+        )
         return AcquisitionResult(
             found=False,
             source="manual",

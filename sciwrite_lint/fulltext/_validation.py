@@ -11,12 +11,22 @@ Hard rejects (bypass all positive signals):
 - CORE.ac.uk metadata landing pages
 - Article-type entries whose extractable body is shorter than 1.5k chars
 
-Positive signals (need at least one per the ``_decide`` table):
+Positive signals collected for the ``_decide`` table:
 
 - ``doi_match``  — bib DOI appears verbatim in first two pages
 - ``title_sim`` — GROBID header title vs bib title (``_title_similarity``)
 - ``surname_match`` — count of bib-author surnames found in first two pages
 - ``year_match`` — bib year appears in first two pages
+
+``doi_match`` is **not** unilateral. The OA waterfall fetched the PDF
+*using* the bib's DOI, so finding the same DOI in the PDF's footer is
+largely tautological (modern OA PDFs from PLOS / eLife / MDPI / Frontiers
+stamp the DOI on every page). With AI-assisted writing, hallucinated
+bibs pointing at real-but-unrelated papers are a real failure mode, so
+``doi_match`` requires at least one corroborating bib field
+(``title_sim >= 0.5``, ``surname_match >= 1``, or — for author-less
+bibs — ``year_match``) before acceptance. When the bib supplies *only*
+a DOI, there is nothing to corroborate against and DOI-match accepts.
 
 Entry-type carve-out for books / techreports / manuals / inbook /
 inproceedings / incollection: skip the body-length hard reject, and when
@@ -185,12 +195,50 @@ def _decide(
     doi_match: bool,
     year_match: bool,
 ) -> tuple[bool, str, float]:
-    """Apply the acceptance table. Returns (accepted, reason, confidence)."""
-    if doi_match:
-        return True, "doi match", 1.0
+    """Apply the acceptance table. Returns (accepted, reason, confidence).
 
+    ``doi_match`` requires corroboration from another bib field; see the
+    module docstring for the rationale (hallucinated-bib failure mode).
+    All other rules are evaluated only when ``doi_match`` is False.
+    """
     has_authors = bool(evidence.authors)
     is_corporate_form = evidence.entry_type in _CORPORATE_ENTRY_TYPES
+
+    if doi_match:
+        # The OA waterfall used the bib's DOI to fetch this PDF, so finding
+        # the same DOI in the PDF's footer is largely tautological. With
+        # AI-assisted writing, hallucinated bibs pointing at real-but-
+        # unrelated papers are a real failure mode — require at least one
+        # other bib field to corroborate before we trust the match.
+        has_title = bool(evidence.title)
+        has_year = evidence.year is not None
+        if not (has_authors or has_title or has_year):
+            # Bib supplied only a DOI; nothing else exists to cross-check.
+            return True, "doi match (no other bib signals)", 1.0
+
+        corroborating: list[str] = []
+        if title_sim >= 0.5:
+            corroborating.append(f"title_sim={title_sim:.2f}")
+        if surname_match >= 1:
+            corroborating.append(f"surnames={surname_match}")
+        if year_match and not has_authors:
+            # Year alone is too weak when bib lists authors — the dai2021
+            # case had year_match=True by coincidence. Only credit year
+            # for corporate-form bibs where authors are unavailable.
+            corroborating.append("year")
+
+        if corroborating:
+            return True, f"doi+corroborating ({', '.join(corroborating)})", 1.0
+
+        return (
+            False,
+            (
+                f"doi-only match — bib may misidentify the paper "
+                f"(title_sim={title_sim:.2f}, surnames={surname_match}, "
+                f"year={year_match}, grobid_title={grobid_title[:50]!r})"
+            ),
+            0.5,
+        )
 
     if title_sim >= 0.85:
         if not has_authors:

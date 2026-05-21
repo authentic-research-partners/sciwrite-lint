@@ -29,6 +29,7 @@ from pathlib import Path
 
 import httpx
 from loguru import logger
+from lxml import html as lxml_html
 
 from sciwrite_lint._network import ssrf_safe_client
 from sciwrite_lint.fulltext._common import (
@@ -57,14 +58,6 @@ def _parse_ideas_landing_urls(html_text: str) -> list[str]:
     normalised to absolute URLs. Duplicate URLs are removed preserving
     first-seen order.
     """
-    try:
-        from lxml import html as lxml_html
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError(
-            "lxml is required for NBER/IDEAS title search; install it via "
-            "`pip install lxml`"
-        ) from e
-
     try:
         tree = lxml_html.fromstring(html_text)
     except (ValueError, lxml_html.etree.ParserError):
@@ -107,14 +100,6 @@ def _parse_ideas_file_url(html_text: str) -> str | None:
     in ``.pdf`` are returned; anything else is skipped so the caller never
     receives a landing page or scheme-spoofed value.
     """
-    try:
-        from lxml import html as lxml_html
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError(
-            "lxml is required for NBER/IDEAS title search; install it via "
-            "`pip install lxml`"
-        ) from e
-
     try:
         tree = lxml_html.fromstring(html_text)
     except (ValueError, lxml_html.etree.ParserError):

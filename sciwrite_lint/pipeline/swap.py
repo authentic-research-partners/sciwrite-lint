@@ -1,40 +1,48 @@
 """vLLM container swap + GPU probes used by GPU-bound stages.
 
-Vision and embedding stages share one GPU with text vLLM. On native Linux
-(no CUDA overcommit) we stop text vLLM before GPU embedding and restart
-after. For the vision backend we swap text↔vision vLLM containers, but
-only when there is actual inference work to do — cached reruns skip the
-swap entirely.
+Vision and embedding stages share one GPU with text vLLM. We stop text vLLM
+before GPU embedding and restart after — on both native Linux (where the
+alternative is a hard CUDA OOM) and WSL2 (where the alternative is a silent
+spill to system RAM that runs 30–100× slower). For the vision backend we
+swap text↔vision vLLM containers, but only when there is actual inference
+work to do — cached reruns skip the swap entirely.
+
+GPU exclusivity invariant. Only one heavy GPU process runs at a time:
+text vLLM, vision vLLM, or an in-process model (embedder /
+transformers vision). The single entry point ``claim_gpu_exclusive``
+enforces this — every stage that touches the GPU calls it before
+starting work. The function stops every competitor BEFORE deciding
+whether to start the target, so it is correct regardless of what the
+caller pre-started (including the foot-gun case of
+``containers start --vision`` having both up at once).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
+import torch
 from loguru import logger
 
 from sciwrite_lint.config import LintConfig, PaperWorkspace
+
+GPUTarget = Literal["text", "vision", "none"]
 
 
 def _needs_embedding_swap(config: LintConfig) -> bool:
     """Check if we need to stop text vLLM for GPU embedding.
 
-    On native Linux (no CUDA overcommit), embedding can't coexist with
-    vLLM on the GPU. We stop vLLM first, embed on GPU, then restart.
-    On WSL2, overcommit handles coexistence — no swap needed.
+    Embedder + vLLM together overflow VRAM on a 20 GB consumer GPU. On
+    native Linux that fails outright (no CUDA overcommit). On WSL2 the
+    overflow silently spills to shared GPU memory (system RAM mapped
+    over PCIe), which works but runs 30–100× slower — KV cache becomes
+    underused and gen tok/s collapses by an order of magnitude. Either
+    way the right move is to stop text vLLM before GPU embedding.
     """
-    from sciwrite_lint.config import is_wsl2
-
-    if is_wsl2():
-        return False
     if config.embedding_device == "cpu":
         return False
-    try:
-        import torch
-
-        return torch.cuda.is_available()
-    except ImportError:
-        return False
+    return torch.cuda.is_available()
 
 
 def _is_vllm_responding(endpoint: str) -> bool:
@@ -49,16 +57,29 @@ def _is_vllm_responding(endpoint: str) -> bool:
 
 
 def _stop_vllm_for_embedding(config: LintConfig) -> None:
-    """Stop text vLLM to free GPU for embedding on native Linux.
+    """Stop both vLLM containers to free GPU for embedding.
 
-    Only stops if text vLLM is actually running.
+    Embedder is an in-process sentence-transformers model that loads
+    onto the GPU. Either vLLM container competing for VRAM at that
+    moment causes a hard CUDA OOM on native Linux, or a silent spill
+    to system RAM on WSL2 (30–100× slower; see
+    ``_needs_embedding_swap``).
+
+    We stop BOTH containers (not just text) so the foot-gun of having
+    vision pre-started by the user is also handled — see
+    ``claim_gpu_exclusive`` for the same invariant.
     """
-    from sciwrite_lint.vllm.vllm_server import stop_container
+    from sciwrite_lint.vllm.vllm_server import MODELS, stop_container
 
-    if not _is_vllm_responding(config.llm_endpoint):
-        return
-    logger.info("Stopping text vLLM for GPU embedding (native Linux, no overcommit)...")
-    stop_container(config, model=config.llm_model)
+    vision_port = MODELS["qwen3-vl"]["port"]
+    vision_endpoint = f"http://localhost:{vision_port}/v1"
+
+    if _is_vllm_responding(config.llm_endpoint):
+        logger.info("Stopping text vLLM for GPU embedding...")
+        stop_container(config, model=config.llm_model)
+    if _is_vllm_responding(vision_endpoint):
+        logger.info("Stopping vision vLLM for GPU embedding...")
+        stop_container(config, model="qwen3-vl")
 
 
 def _restart_vllm_after_embedding(config: LintConfig) -> None:
@@ -178,64 +199,31 @@ def _cited_needs_inference(refs_dir: Path, fresh: bool = False) -> bool:
     return False
 
 
-async def _swap_to_vision_vllm(config: LintConfig) -> None:
-    """Stop text vLLM, start vision vLLM, wait for API ready.
+async def claim_gpu_exclusive(target: GPUTarget, config: LintConfig) -> None:
+    """Single defensive entry point — ensure only ``target`` is running.
 
-    Called before vision stages when ``config.vision_backend == "vllm"``.
-    Skips if the vision API is already responding (user pre-started it).
-    Skips if no container runtime is available (test environments).
-    """
-    from sciwrite_lint.vllm.vllm_server import (
-        MODELS,
-        _check_api_health,
-        start_container,
-        stop_container,
-        wait_for_ready,
-    )
+    Heavy GPU users tracked:
+    - text vLLM container (port 5001)
+    - vision vLLM container (port 5002)
+    - in-process models (embedder, transformers vision) — caller is
+      responsible for unloading these before calling this with
+      ``target="none"``; this function only stops the vLLM containers
+      it knows about.
 
-    vision_port = MODELS["qwen3-vl"]["port"]
-    vision_endpoint = f"http://localhost:{vision_port}/v1"
+    Behavior:
+    - ``target="text"``: stop vision if up, ensure text is up.
+    - ``target="vision"``: stop text if up, ensure vision is up.
+    - ``target="none"``: stop both vLLMs (e.g. before GPU embedding
+      or transformers vision inference).
 
-    # Already running? Skip the swap.
-    if await _check_api_health(vision_endpoint):
-        logger.info("Vision vLLM already running on port {}", vision_port)
-        return
+    The "stop competitors" pass runs **before** the "is target already
+    up?" check, so the function is correct even when both containers
+    are running unsupervised (the foot-gun case of
+    ``containers start --vision``). Idempotent — safe to call
+    repeatedly.
 
-    # Text vLLM not running? Nothing to swap from.
-    if not await _check_api_health(config.llm_endpoint):
-        logger.debug("Text vLLM not running — skipping vision swap")
-        return
-
-    # Stop text vLLM to free GPU
-    logger.info("Stopping text vLLM to free GPU for vision...")
-    stop_container(config, model=config.llm_model)
-
-    # Start vision vLLM
-    logger.info("Starting vision vLLM (qwen3-vl)...")
-    ret = start_container(config, model="qwen3-vl")
-    if ret != 0:
-        raise RuntimeError(
-            "Failed to start vision vLLM container. "
-            "Check: sciwrite-lint vllm start --model qwen3-vl"
-        )
-
-    # Wait for API
-    logger.info("Waiting for vision vLLM API on port {}...", vision_port)
-    ready = await wait_for_ready(vision_endpoint, timeout=300)
-    if not ready:
-        raise RuntimeError(
-            f"Vision vLLM did not become ready within 300s on port {vision_port}. "
-            "Check logs: sciwrite-lint vllm logs --model qwen3-vl"
-        )
-    logger.info("Vision vLLM ready")
-
-
-async def _swap_to_text_vllm(config: LintConfig) -> None:
-    """Stop vision vLLM, start text vLLM, wait for API ready.
-
-    Called after vision stages to restore text vLLM for Stages 1+2.
-    Skips if text API is already responding.
-    Skips if no container runtime is available (test environments).
+    Skips silently if no container runtime is available (test
+    environments).
     """
     from sciwrite_lint.vllm.vllm_server import (
         MODELS,
@@ -246,32 +234,72 @@ async def _swap_to_text_vllm(config: LintConfig) -> None:
     )
 
     text_endpoint = config.llm_endpoint
-
-    # Always stop vision vLLM if it's running — free VRAM for text stages
     vision_port = MODELS["qwen3-vl"]["port"]
-    if await _check_api_health(f"http://localhost:{vision_port}/v1"):
-        logger.info("Stopping vision vLLM to free GPU...")
+    vision_endpoint = f"http://localhost:{vision_port}/v1"
+
+    text_up = await _check_api_health(text_endpoint)
+    vision_up = await _check_api_health(vision_endpoint)
+
+    # Stop every competitor BEFORE deciding to start anything. Doing
+    # this unconditionally (rather than "if target is not already up")
+    # is what closes the foot-gun: we never leave a non-target container
+    # running just because the target is also already up.
+    if target != "text" and text_up:
+        logger.info("Stopping text vLLM (claiming GPU for {})", target)
+        stop_container(config, model=config.llm_model)
+    if target != "vision" and vision_up:
+        logger.info("Stopping vision vLLM (claiming GPU for {})", target)
         stop_container(config, model="qwen3-vl")
 
-    # Text already running? Done.
-    if await _check_api_health(text_endpoint):
-        logger.info("Text vLLM already running")
+    if target == "none":
         return
 
-    # Start text vLLM
-    logger.info("Starting text vLLM ({})...", config.llm_model)
-    ret = start_container(config, model=config.llm_model)
+    # Start target if not already up
+    if target == "text":
+        if text_up:
+            logger.info("Text vLLM already running")
+            return
+        logger.info("Starting text vLLM ({})...", config.llm_model)
+        ret = start_container(config, model=config.llm_model)
+        if ret != 0:
+            raise RuntimeError(
+                "Failed to start text vLLM container. "
+                "Check: sciwrite-lint containers start"
+            )
+        ready = await wait_for_ready(text_endpoint, timeout=300)
+        if not ready:
+            raise RuntimeError(
+                f"Text vLLM did not become ready within 300s at "
+                f"{text_endpoint}. Check logs: sciwrite-lint vllm logs"
+            )
+        logger.info("Text vLLM ready")
+        return
+
+    # target == "vision"
+    if vision_up:
+        logger.info("Vision vLLM already running on port {}", vision_port)
+        return
+    logger.info("Starting vision vLLM (qwen3-vl)...")
+    ret = start_container(config, model="qwen3-vl")
     if ret != 0:
         raise RuntimeError(
-            "Failed to start text vLLM container. Check: sciwrite-lint containers start"
+            "Failed to start vision vLLM container. "
+            "Check: sciwrite-lint vllm start --model qwen3-vl"
         )
-
-    # Wait for API
-    logger.info("Waiting for text vLLM API...")
-    ready = await wait_for_ready(text_endpoint, timeout=300)
+    ready = await wait_for_ready(vision_endpoint, timeout=300)
     if not ready:
         raise RuntimeError(
-            f"Text vLLM did not become ready within 300s at {text_endpoint}. "
-            "Check logs: sciwrite-lint vllm logs"
+            f"Vision vLLM did not become ready within 300s on port "
+            f"{vision_port}. Check logs: sciwrite-lint vllm logs --model qwen3-vl"
         )
-    logger.info("Text vLLM ready")
+    logger.info("Vision vLLM ready")
+
+
+async def _swap_to_vision_vllm(config: LintConfig) -> None:
+    """Claim exclusive GPU access for the vision vLLM (stops competitors first)."""
+    await claim_gpu_exclusive("vision", config)
+
+
+async def _swap_to_text_vllm(config: LintConfig) -> None:
+    """Claim exclusive GPU access for the text vLLM (stops competitors first)."""
+    await claim_gpu_exclusive("text", config)

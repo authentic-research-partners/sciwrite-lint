@@ -14,9 +14,15 @@ from sciwrite_lint.tex_parser import (
 )
 
 
-def analyze_sections(tex_path: Path) -> list[SectionInfo]:
-    """Analyze section structure: titles, depths, word counts, citation counts."""
-    text = strip_comments(tex_path.read_text(encoding="utf-8"))
+def analyze_sections(tex_path: Path, *, text: str | None = None) -> list[SectionInfo]:
+    """Analyze section structure: titles, depths, word counts, citation counts.
+
+    ``text`` lets callers that already have a comment-stripped read of the
+    file (e.g. ``_build_context_latex``) skip the redundant re-read +
+    ``strip_comments`` pass.
+    """
+    if text is None:
+        text = strip_comments(tex_path.read_text(encoding="utf-8"))
     body = body_without_bibliography(text)
     lines = body.split("\n")
 
@@ -59,9 +65,16 @@ def analyze_sections(tex_path: Path) -> list[SectionInfo]:
     return sections
 
 
-def analyze_sections_with_text(tex_path: Path) -> list[tuple[SectionInfo, str]]:
-    """Like analyze_sections but also returns raw text for each section."""
-    text = strip_comments(tex_path.read_text(encoding="utf-8"))
+def analyze_sections_with_text(
+    tex_path: Path, *, text: str | None = None
+) -> list[tuple[SectionInfo, str]]:
+    """Like analyze_sections but also returns raw text for each section.
+
+    ``text`` lets callers reuse a pre-stripped read; see
+    :func:`analyze_sections`.
+    """
+    if text is None:
+        text = strip_comments(tex_path.read_text(encoding="utf-8"))
     body = body_without_bibliography(text)
     lines = body.split("\n")
 
@@ -100,9 +113,14 @@ def analyze_sections_with_text(tex_path: Path) -> list[tuple[SectionInfo, str]]:
     return result
 
 
-def get_abstract_text(tex_path: Path) -> str:
-    """Extract abstract text from a LaTeX file."""
-    text = strip_comments(tex_path.read_text(encoding="utf-8"))
+def get_abstract_text(tex_path: Path, *, text: str | None = None) -> str:
+    """Extract abstract text from a LaTeX file.
+
+    ``text`` lets callers reuse a pre-stripped read; see
+    :func:`analyze_sections`.
+    """
+    if text is None:
+        text = strip_comments(tex_path.read_text(encoding="utf-8"))
     m = re.search(
         r"\\begin\{abstract\}(.*?)\\end\{abstract\}",
         text,

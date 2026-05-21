@@ -159,13 +159,14 @@ def run_containers(args: argparse.Namespace) -> int:
             failed = True
 
         model = getattr(args, "model", None)
-        ret = start_container(config, model=model, pull=update)
+        replace = getattr(args, "replace", False)
+        ret = start_container(config, model=model, pull=update, replace=replace)
         if ret != 0:
             failed = True
 
         if vision:
             for vm in VISION_MODELS:
-                ret = start_container(config, model=vm, pull=update)
+                ret = start_container(config, model=vm, pull=update, replace=replace)
                 if ret != 0:
                     failed = True
 

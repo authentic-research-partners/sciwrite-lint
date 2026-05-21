@@ -36,6 +36,23 @@ from sciwrite_lint.config import LintConfig
 from sciwrite_lint.models import Citation
 
 
+def _coerce_year(value: object) -> int | None:
+    """Coerce a year-ish value from bib/canonical metadata to an int.
+
+    Year fields are stored as ``str`` or ``int`` across the metadata
+    surface. Returns ``None`` for empty, non-numeric, or out-of-range
+    values — the validator treats ``None`` as "no year signal available".
+    """
+    if isinstance(value, int):
+        return value if 1500 <= value <= 2100 else None
+    if isinstance(value, str):
+        match = value.strip()[:4]
+        if match.isdigit():
+            year = int(match)
+            return year if 1500 <= year <= 2100 else None
+    return None
+
+
 def _is_fresh_negative(meta_access: dict, ttl_days: int) -> bool:
     """True if this ref has a cached exhausted failure still within the TTL.
 
@@ -166,8 +183,6 @@ async def _stage_fetch(
     fetched_keys: list[str] = []
 
     async def _fetch_one(c: Citation, meta) -> None:
-        from sciwrite_lint.cli.fetch import _coerce_year
-
         doi = meta.canonical.get("doi") or c.doi
         arxiv_id = meta.canonical.get("arxiv_id")
         oa_url = meta.access.get("oa_url")
@@ -195,7 +210,6 @@ async def _stage_fetch(
                     expected_authors=expected_authors,
                     expected_year=expected_year,
                     expected_entry_type=expected_entry_type,
-                    progress=False,
                 )
 
         if result.found and result.local_path:

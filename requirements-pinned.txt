@@ -1,13 +1,15 @@
-# Pinned versions of sciwrite-lint's top-level dependencies.
+# Pinned versions of sciwrite-lint's RUNTIME top-level dependencies.
 #
-# This file pins ONLY the packages declared in pyproject.toml (runtime + all
-# optional extras). Transitive dependencies are NOT pinned — pip will resolve
-# them within each top-level package's own constraints.
+# Only packages declared in pyproject.toml ``[project] dependencies`` are
+# pinned here — the optional-dependencies extras (``dev``) are dev-only
+# tooling that doesn't belong in the user-facing pinned file. Transitive
+# dependencies are also not pinned; pip resolves them within each
+# top-level package's own constraints.
 #
 # Purpose: reproduce the exact versions of packages that sciwrite-lint is
 # actively developed and tested against. Generated from the maintainer's
 # working `sciwrite-lint` conda env via `pip freeze`, filtered to declared
-# deps.
+# runtime deps.
 #
 # Regenerate with:
 #   python scripts/regenerate_pinned_requirements.py
@@ -19,6 +21,7 @@
 # See docs/README.md → "Reproducible environment" for details.
 
 aiosqlite==0.22.1
+annotated-types==0.7.0
 anyascii==0.3.3
 bibtexparser==1.4.4
 defusedxml==0.7.1
@@ -31,12 +34,11 @@ openai==2.30.0
 pdf2image==1.17.0
 pdfplumber==0.11.9
 pillow==12.2.0
+psutil==7.2.2
 pydantic==2.12.5
 pypandoc_binary==1.17
 pypdf==6.10.2
 pypdfium2==5.6.0
-pytest-xdist==3.8.0
-pytest==9.0.3
 RapidFuzz==3.14.3
 rfc3986==2.0.0
 rich==14.3.3

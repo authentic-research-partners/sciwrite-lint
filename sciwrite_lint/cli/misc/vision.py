@@ -20,7 +20,7 @@ def run_vision(args: argparse.Namespace) -> int:
     Normally runs automatically as part of ``sciwrite-lint check``.
     This command is for running vision separately (e.g. to pre-warm cache).
     """
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
 
     config = _load_config(args)
 

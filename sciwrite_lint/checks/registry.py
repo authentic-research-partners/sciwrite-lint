@@ -41,6 +41,7 @@ _CHECK_MODULES = [
     "sciwrite_lint.checks.reference_accuracy",
     "sciwrite_lint.checks.retracted_cite",
     "sciwrite_lint.checks.full_paper_consistency",
+    "sciwrite_lint.checks.internal_consistency_pairs",
     "sciwrite_lint.checks.unreferenced_figure",
     "sciwrite_lint.checks.prose_quality",
 ]

@@ -1,7 +1,7 @@
 """MHTML (MIME HTML archive) → markdown conversion.
 
 Browsers save single-file web archives with the ``.mhtml`` (Chromium, Edge,
-Firefox) or ``.mht`` (legacy Windows/IE) extensions. Both formats are
+Firefox) or ``.mht`` (Windows / Internet Explorer) extensions. Both formats are
 multipart MIME containers whose first ``text/html`` part is the rendered
 page — useful for JavaScript-heavy sites where a headless ``requests.get``
 would only see the pre-hydration shell.
@@ -15,11 +15,12 @@ returns ``"web_page"`` without any format-specific branching.
 Errors are loud on purpose: if the file is not valid MHTML, or has no
 HTML part, or trafilatura extracts nothing usable, the caller gets a
 :class:`MHTMLParseError` with enough context to decide what to do.
-Silent degradation is banned here (see ``.claude/rules/error-handling.md``).
+Silent degradation is banned here.
 """
 
 from __future__ import annotations
 
+from email import errors as email_errors
 from email import message_from_bytes, policy
 from email.message import EmailMessage
 from pathlib import Path
@@ -79,9 +80,11 @@ def read_mhtml_source_url(path: Path) -> str:
     try:
         raw = path.read_bytes()
         msg = message_from_bytes(raw, policy=policy.default)
-    except OSError:
+    except OSError as e:
+        logger.debug("mhtml header read failed for {}: {}", path, e)
         return ""
-    except Exception:
+    except email_errors.MessageError as e:
+        logger.debug("mhtml header parse failed for {}: {}", path, e)
         return ""
     if not isinstance(msg, EmailMessage):
         return ""
@@ -179,7 +182,16 @@ def mhtml_to_markdown(path: Path) -> tuple[str, str]:
     source_url = _extract_source_url(msg, html_part)
     title = _extract_title(html) or path.stem
 
-    body = trafilatura.extract(html, url=source_url or None, include_links=True)
+    # output_format='markdown' is required: the default ('txt') separates
+    # paragraphs with single \n rather than blank lines, defeating the
+    # downstream chunker (text.split("\n\n")). See web.py::_html_to_markdown
+    # for the full rationale.
+    body = trafilatura.extract(
+        html,
+        url=source_url or None,
+        include_links=True,
+        output_format="markdown",
+    )
     if not body:
         raise MHTMLParseError(
             f"trafilatura produced no markdown from {path} — the HTML part "

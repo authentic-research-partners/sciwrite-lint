@@ -14,11 +14,18 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
+    import importlib.util
+
     from evals.cli_eval import (
         run_eval_calibration,
-        run_eval_real_world,
         run_eval_scilint_score,
         run_eval_synthetic,
+        run_rw_corpus,
+        run_rw_fetch,
+        run_rw_fpr,
+        run_rw_inject,
+        run_rw_pipeline,
+        run_rw_report,
     )
 
     parser = argparse.ArgumentParser(
@@ -84,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rw_corpus.add_argument("--categories", help="Comma-separated arXiv categories")
     p_rw_corpus.add_argument("--sources", help="Comma-separated: arxiv,biorxiv")
     p_rw_corpus.add_argument("--seed", type=int, default=42)
-    p_rw_corpus.set_defaults(func=run_eval_real_world)
+    p_rw_corpus.set_defaults(func=run_rw_corpus)
 
     p_rw_fpr = rw_sub.add_parser("fpr", help="FPR eval (Sonnet-judged)")
     p_rw_fpr.add_argument("--workspace", default="real_world_corpus")
@@ -92,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rw_fpr.add_argument("--max-papers", type=int)
     p_rw_fpr.add_argument("--max-findings", type=int, default=20)
     p_rw_fpr.add_argument("--config", help="Path to .sciwrite-lint.toml")
-    p_rw_fpr.set_defaults(func=run_eval_real_world)
+    p_rw_fpr.set_defaults(func=run_rw_fpr)
 
     p_rw_inject = rw_sub.add_parser("inject", help="Inject errors, measure detection")
     p_rw_inject.add_argument("--workspace", default="real_world_corpus")
@@ -101,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rw_inject.add_argument("--seed", type=int, default=42)
     p_rw_inject.add_argument("--config", help="Path to .sciwrite-lint.toml")
     p_rw_inject.add_argument("--llm", action="store_true", help="Include LLM rules")
-    p_rw_inject.set_defaults(func=run_eval_real_world)
+    p_rw_inject.set_defaults(func=run_rw_inject)
 
     p_rw_pipeline = rw_sub.add_parser(
         "pipeline", help="Full pipeline (SciLint Score) on corpus papers"
@@ -132,11 +139,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Max findings to judge per paper (default: 20)",
     )
     p_rw_pipeline.add_argument("--config", help="Path to .sciwrite-lint.toml")
-    p_rw_pipeline.set_defaults(func=run_eval_real_world)
+    p_rw_pipeline.set_defaults(func=run_rw_pipeline)
 
     p_rw_report = rw_sub.add_parser("report", help="Show aggregated results")
     p_rw_report.add_argument("--results-dir", default="real_world_results")
-    p_rw_report.set_defaults(func=run_eval_real_world)
+    p_rw_report.set_defaults(func=run_rw_report)
 
     p_rw_fetch = rw_sub.add_parser(
         "fetch",
@@ -162,8 +169,20 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Polite-contact email for Unpaywall + User-Agent.",
     )
-    p_rw_fetch.set_defaults(func=run_eval_real_world)
+    p_rw_fetch.set_defaults(func=run_rw_fetch)
 
+    # Optional ``evals._dev`` subcommands. When ``evals._dev`` is installed,
+    # extra dev-only subcommands register here; otherwise ``find_spec``
+    # returns ``None`` and the registration is skipped.
+    #
+    # Check the parent package first because ``find_spec`` raises
+    # ``ModuleNotFoundError`` (not returns ``None``) when an intermediate
+    # path on a dotted name is missing. Once the parent is confirmed
+    # present, the child lookup is safe.
+    if importlib.util.find_spec("evals._dev") is not None:
+        from evals._dev.cli_main_dev import register_dev_commands
+
+        register_dev_commands(sub, rw_sub)
 
     args = parser.parse_args(argv)
     if not args.command:

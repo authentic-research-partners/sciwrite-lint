@@ -69,6 +69,11 @@ def cite_purposes_to_findings(
     for r in results:
         if r.get("dismissed"):
             continue
+        # SKIPPED rows never reached the verifier (no local source / filtered
+        # out), so cite_purpose was never classified — don't fabricate a
+        # "no argumentative function" finding from missing data.
+        if r.get("verdict") == "SKIPPED":
+            continue
 
         # Prefer independent classification; use eval_claims field if absent
         purpose = r.get("cite_purpose") or r.get("citation_purpose", "context")

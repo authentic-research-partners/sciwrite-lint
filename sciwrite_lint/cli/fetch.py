@@ -9,23 +9,7 @@ from pathlib import Path
 from loguru import logger
 
 from sciwrite_lint.config import LintConfig
-
-
-def _coerce_year(value: object) -> int | None:
-    """Coerce a year-ish value from bib/canonical metadata to an int.
-
-    Year fields are stored as ``str`` or ``int`` across the metadata
-    surface. Returns ``None`` for empty, non-numeric, or out-of-range
-    values — the validator treats ``None`` as "no year signal available".
-    """
-    if isinstance(value, int):
-        return value if 1500 <= value <= 2100 else None
-    if isinstance(value, str):
-        match = value.strip()[:4]
-        if match.isdigit():
-            year = int(match)
-            return year if 1500 <= year <= 2100 else None
-    return None
+from sciwrite_lint.pipeline.fetch import _coerce_year as _coerce_year
 
 
 def eager_parse(key: str, pdf_path: Path, refs_dir: Path) -> None:
@@ -182,7 +166,7 @@ def run_fetch(args: argparse.Namespace) -> int:
     from sciwrite_lint.references.metadata import load_all_metadata
     from sciwrite_lint.pipeline import extract_citations_for_paper
 
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
     from sciwrite_lint.cli.config import check_api_config
 
     config = _load_config(args)

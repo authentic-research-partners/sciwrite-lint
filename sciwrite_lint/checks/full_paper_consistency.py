@@ -15,17 +15,34 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from loguru import logger
 
+from sciwrite_lint.checks._diagnostics import llm_unavailable_finding
 from sciwrite_lint.checks.registry import check
+from sciwrite_lint.llm_utils import THINKING_PRESETS, VLLM_DEFAULT_MODEL, VLLM_MODELS
 from sciwrite_lint.models import Finding
-from sciwrite_lint.schemas import FullPaperIssueList, vllm_schema
+from sciwrite_lint.schemas import (
+    FullPaperIssue,
+    FullPaperIssueList,
+    chars_to_word_hint,
+    pydantic_max,
+    truncate_to_model,
+    vllm_schema_unbounded,
+)
 
 if TYPE_CHECKING:
     from sciwrite_lint.config import LintConfig
     from sciwrite_lint.manuscript_store import ManuscriptContext
 
-_ISSUE_SCHEMA = vllm_schema(FullPaperIssueList)
+_ISSUE_SCHEMA = vllm_schema_unbounded(FullPaperIssueList)
+
+# Prompt-side guidance derived from the Pydantic caps so the prompt stays
+# in sync if any ``max_length`` is bumped — this is Layer 1 of the
+# schema bounds architecture documented in ``schemas.py``.
+_MAX_ISSUES = pydantic_max(FullPaperIssueList, "issues") or 5
+_DESC_MAX_WORDS = chars_to_word_hint(pydantic_max(FullPaperIssue, "description"))
+_LOC_MAX_WORDS = chars_to_word_hint(pydantic_max(FullPaperIssue, "location"))
 
 # Headings that mark the references section (excluded from paper body).
 _REFERENCES_HEADINGS = frozenset(
@@ -73,8 +90,11 @@ using established terminology loosely).
 - Set is_genuine to true ONLY for clear, unambiguous factual errors. \
 When in doubt, set is_genuine to false.
 - Prefer returning {{"issues": []}} over flagging borderline cases.
-- Report at most 5 issues. If you find more than 5 genuine issues, \
-return only the 5 most important ones.
+- Report at most {max_issues} issues. If you find more than \
+{max_issues} genuine issues, return only the {max_issues} most \
+important ones.
+- Keep each field concise: ``description`` and ``evidence`` under \
+~{desc_max_words} words, ``location`` under ~{loc_max_words} words.
 
 Return ONLY valid JSON: {{"issues": [{{"description": "...", "evidence": "...", \
 "location": "section or paragraph where the issue appears", \
@@ -95,17 +115,18 @@ Return {{"issues": []}} if no genuine issues found.\
 # question prompt) plus 2K safety padding for token estimation error.
 _OVERHEAD_TOKENS = 2500
 
-# Output budget reserved for the JSON response. Matches the vLLM model
-# default (VLLM_MODELS["qwen3"]["max_tokens"]) — this is the response
-# portion only. ``llm_query`` adds the active thinking budget on top
-# when dispatching to vLLM. FullPaperIssueList caps the issues list at
-# 5, which fits comfortably in this budget.
-_OUTPUT_RESERVE_TOKENS = 2048
+# Output budget reserved for the JSON response. Tracks the vLLM model
+# default — ``llm_query`` uses ``model_cfg["max_tokens"]`` as the
+# response portion and adds the active thinking budget on top when
+# dispatching to vLLM. Reading from ``VLLM_MODELS`` directly so this
+# never drifts when the model default is retuned.
+_OUTPUT_RESERVE_TOKENS = VLLM_MODELS[VLLM_DEFAULT_MODEL]["max_tokens"]
 
-# Worst-case thinking budget (medium preset, see THINKING_PRESETS).
-# Reserved in the context-window accounting alongside the output budget;
-# the sum matches what ``llm_query`` sends as ``max_tokens``.
-_THINKING_RESERVE_TOKENS = 1024
+# Worst-case thinking budget (medium preset). Reserved in the
+# context-window accounting alongside the output budget; the sum matches
+# what ``llm_query`` sends as ``max_tokens``. Read from THINKING_PRESETS
+# so a retuned budget propagates without manual sync.
+_THINKING_RESERVE_TOKENS = THINKING_PRESETS["medium"]["budget"]
 
 # Rough chars-to-tokens ratio (conservative: overestimates tokens).
 _CHARS_PER_TOKEN = 3.5
@@ -153,13 +174,23 @@ def _build_paper_body(ctx: ManuscriptContext) -> str:
 
 
 def _get_max_model_len(config: "LintConfig") -> int:
-    """Query vLLM for max_model_len, with a safe default."""
+    """Query vLLM for max_model_len.
+
+    Returns 20_000 if the probe cannot reach vLLM — a conservative ceiling
+    that fits any production-grade vLLM serve. The probe failure is logged
+    at WARNING so the operator sees that vLLM was unreachable.
+    """
     try:
         from sciwrite_lint.vllm.metrics import fetch_metrics
 
         metrics = fetch_metrics(config.llm_endpoint)
         return int(metrics.get("max_seq", 20_000))
-    except Exception:
+    except (httpx.HTTPError, OSError, ValueError, KeyError) as e:
+        logger.warning(
+            "vLLM max_model_len probe failed ({}: {}); using conservative 20_000",
+            type(e).__name__,
+            e,
+        )
         return 20_000
 
 
@@ -211,6 +242,22 @@ def _load_figure_descriptions(config: "LintConfig") -> str:
         return ""
 
 
+def format_system_prompt(body: str, figure_section: str) -> str:
+    """Format ``_SYSTEM_TEMPLATE`` with all derived word/count caps.
+
+    Single entry point for both ``full_paper_consistency`` (manuscript)
+    and ``ref_internal_checks`` (cited papers) — keeps the
+    Pydantic-derived guidance numbers in one place.
+    """
+    return _SYSTEM_TEMPLATE.format(
+        paper_body=body,
+        figure_section=figure_section,
+        max_issues=_MAX_ISSUES,
+        desc_max_words=_DESC_MAX_WORDS,
+        loc_max_words=_LOC_MAX_WORDS,
+    )
+
+
 def _build_system_prompt(
     tex_path: Path,
     config: "LintConfig",
@@ -249,10 +296,7 @@ def _build_system_prompt(
         )
         return None
 
-    return _SYSTEM_TEMPLATE.format(
-        paper_body=body,
-        figure_section=figure_section,
-    )
+    return format_system_prompt(body, figure_section)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +311,10 @@ def _extract_findings(
 ) -> list[Finding]:
     """Convert LLM result to findings, keeping only genuine issues."""
     findings: list[Finding] = []
+    # Wire schema is unbounded (vllm_schema_unbounded) — clip to the
+    # Pydantic caps so a model that exceeds the prompt's "at most 5"
+    # doesn't push extra issues through.
+    result = truncate_to_model(FullPaperIssueList, result)
     for item in result.get("issues", []):
         if not item.get("is_genuine", False):
             continue
@@ -541,27 +589,35 @@ def _make_check_fns(
 
     def _build_queries(
         tex_path: Path, config: "LintConfig"
-    ) -> list[tuple[str, str, dict, str]]:
+    ) -> tuple[list[tuple[str, str, dict, str]], Path | None]:
         system = _build_system_prompt(tex_path, config)
         if system is None:
-            _build_queries._state = None  # type: ignore[attr-defined]
-            return []
+            return [], None
 
         # Skip figure checks when no figure descriptions are available
         if (
             requires_figures
             and "Not available." in system.split("</figure_descriptions>")[0]
         ):
-            _build_queries._state = None  # type: ignore[attr-defined]
-            return []
+            return [], None
 
-        _build_queries._state = tex_path  # type: ignore[attr-defined]
-        return [(system, question, _ISSUE_SCHEMA, "FullPaperIssue")]
+        return [(system, question, _ISSUE_SCHEMA, "FullPaperIssue")], tex_path
 
-    def _process_results(results: list[dict | None]) -> list[Finding]:
-        tex_path = getattr(_build_queries, "_state", None)
-        if not tex_path or not results or not results[0]:
+    def _process_results(
+        results: list[dict | None],
+        *,
+        state: Path | None,
+    ) -> list[Finding]:
+        tex_path = state
+        # No state / no results => the check intentionally did not issue a
+        # query (figures unavailable, doc too large). Nothing to report.
+        if not tex_path or not results:
             return []
+        # ``None`` means the LLM exhausted its retry ladder in
+        # ``llm_utils.llm_query`` — surface this as a finding so the
+        # JSON report shows that the check did not actually run.
+        if results[0] is None:
+            return [llm_unavailable_finding(check_id, file=tex_path.name)]
         return _extract_findings(results[0], check_id, tex_path)
 
     return _build_queries, _process_results

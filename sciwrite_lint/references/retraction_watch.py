@@ -12,11 +12,11 @@ from __future__ import annotations
 import csv
 import io
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
+from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
     from sciwrite_lint.config import LintConfig
@@ -31,9 +31,10 @@ _cached_db: dict[str, RWEntry] | None = None
 _cached_at: float = 0.0
 
 
-@dataclass(frozen=True, slots=True)
-class RWEntry:
+class RWEntry(BaseModel):
     """A single entry from the Retraction Watch database."""
+
+    model_config = ConfigDict(frozen=True)
 
     doi: str
     nature: str  # "Retraction", "Expression of Concern", "Correction", "Reinstatement"

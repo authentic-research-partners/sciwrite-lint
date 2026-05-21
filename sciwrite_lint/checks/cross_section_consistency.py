@@ -11,6 +11,7 @@ query tuples, process_results() converts responses to Findings.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -18,10 +19,23 @@ from sciwrite_lint.checks.registry import check
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.models import Finding
 
-from sciwrite_lint.schemas import ConsistencyResult, vllm_schema
+from sciwrite_lint.schemas import (
+    ConsistencyResult,
+    Contradiction,
+    chars_to_word_hint,
+    pydantic_max,
+    truncate_to_model,
+    vllm_schema_unbounded,
+)
 
 
-_CONSISTENCY_SCHEMA = vllm_schema(ConsistencyResult)
+_CONSISTENCY_SCHEMA = vllm_schema_unbounded(ConsistencyResult)
+
+# Prompt-side guidance derived from Pydantic caps — Layer 1 of the
+# schema bounds architecture (see ``schemas.py`` module docstring).
+_MAX_CONTRADICTIONS = pydantic_max(ConsistencyResult, "contradictions") or 4
+_SAYS_MAX_WORDS = chars_to_word_hint(pydantic_max(Contradiction, "section_a_says"))
+_TYPE_MAX_WORDS = chars_to_word_hint(pydantic_max(Contradiction, "type"))
 
 _CONSISTENCY_SYSTEM = """\
 You are checking a scientific manuscript for internal consistency.
@@ -44,14 +58,21 @@ For each item, set is_genuine to true ONLY if the values or claims \
 CONFLICT. Set is_genuine to false if the passages agree or discuss \
 different topics.
 
-Report at most 4 contradictions. If you find more, return only the 4 \
-most clear-cut cases.
+Report at most {max_contradictions} contradictions. If you find more, \
+return only the {max_contradictions} most clear-cut cases. Keep each \
+field concise: ``section_a_says``, ``section_b_says``, and \
+``explanation`` under ~{says_max_words} words; ``type`` under \
+~{type_max_words} words.
 
-Reply with JSON: {"contradictions": [\
-{"type": "number|claim|framing", "section_a_says": "...", \
-"section_b_says": "...", "explanation": "...", "is_genuine": true/false}]}
-Return {"contradictions": []} if nothing to compare.
-"""
+Reply with JSON: {{"contradictions": [\
+{{"type": "number|claim|framing", "section_a_says": "...", \
+"section_b_says": "...", "explanation": "...", "is_genuine": true/false}}]}}
+Return {{"contradictions": []}} if nothing to compare.
+""".format(
+    max_contradictions=_MAX_CONTRADICTIONS,
+    says_max_words=_SAYS_MAX_WORDS,
+    type_max_words=_TYPE_MAX_WORDS,
+)
 
 # Section pairs to compare (a_titles, b_titles, description)
 _SECTION_PAIRS = [
@@ -91,11 +112,10 @@ def _build_queries(tex_path: Path, config: LintConfig):
             "Document ~{} pages — too large for cross-section consistency",
             total_chars // 3500,
         )
-        _build_queries._state = []  # type: ignore[attr-defined]
-        return []
+        return [], []
 
-    queries = []
-    state = []
+    queries: list[tuple[str, str, dict, str]] = []
+    state: list[tuple[str, Any, Path]] = []
 
     for a_titles, b_titles, pair_desc in _SECTION_PAIRS:
         # Abstract is a LaTeX environment, not a \section — use ctx.abstract
@@ -131,18 +151,24 @@ def _build_queries(tex_path: Path, config: LintConfig):
         )
         state.append((pair_desc, b_sections[0], tex_path))
 
-    _build_queries._state = state  # type: ignore[attr-defined]
-    return queries
+    return queries, state
 
 
-def _process_results(results):
-    findings = []
+def _process_results(
+    results: list[dict[str, Any] | None],
+    *,
+    state: list[tuple[str, Any, Path]],
+) -> list[Finding]:
+    findings: list[Finding] = []
     seen_keys: set[str] = set()
-    state = getattr(_build_queries, "_state", [])
 
     for (pair_desc, sec, tex_path), result in zip(state, results):
         if not result:
             continue
+        # Clip to the Pydantic caps — wire schema is unbounded
+        # (vllm_schema_unbounded), so the LLM may emit slightly more
+        # than the prompt asked for.
+        result = truncate_to_model(ConsistencyResult, result)
         for item in result.get("contradictions", []):
             if not item.get("is_genuine", False):
                 continue

@@ -9,9 +9,11 @@ from typing import Any
 
 from loguru import logger
 
+from sciwrite_lint.checks._diagnostics import split_findings
 from sciwrite_lint.config import LintConfig
-from sciwrite_lint.exceptions import LLMConnectionError, SciWriteLintError
+from sciwrite_lint.exceptions import SciWriteLintError
 from sciwrite_lint.models import Finding
+
 from sciwrite_lint.report import format_findings
 
 
@@ -19,127 +21,42 @@ def _resolve_helpers(
     args: argparse.Namespace, config: LintConfig
 ) -> list[tuple[str, Path]]:
     """Import and call _resolve_input_files from __main__."""
-    from sciwrite_lint.__main__ import _resolve_input_files
+    from sciwrite_lint.cli._common import _resolve_input_files
 
     return _resolve_input_files(args, config)
 
 
-async def run_llm_checks_batched(
-    checks: list[tuple],
-    tex_path: Path,
+def _emit_paper_results(
+    name: str,
+    label: str,
+    findings: list[Finding],
     config: LintConfig,
-) -> list[Finding]:
-    """Run all LLM checks batched by (thinking, temperature, n_samples).
+    fmt: str,
+) -> bool:
+    """Render + save results for one paper. Returns True if any error.
 
-    All LLM checks must implement the build_queries/process_results protocol:
-    - build_queries(tex_path, config) -> list of (system, user, schema, name) tuples
-    - process_results(results) -> list[Finding]
+    Splits findings into manuscript / system buckets via the canonical
+    helper, prints the manuscript panel, then a separate system-issues
+    panel (terminal mode only — JSON-stdout consumers see only the
+    manuscript findings; the on-disk report carries both fields). The
+    integrity summary, JSON report, and error gate all see manuscript
+    findings only — system issues describe the linter's state, not the
+    manuscript.
 
-    Each check can set ``thinking`` ("off", "low", "medium", "high") to
-    control chain-of-thought reasoning, ``temperature`` (float, or None
-    for the model default) to control sampling, and ``n_samples`` (int,
-    default 1) to request multiple samples per query for self-consistency
-    voting. Queries are grouped by the ``(thinking, temperature,
-    n_samples)`` triple so each group runs as a single batch call with
-    the correct sampling regime.
-
-    When n_samples > 1, each query contributes ``n_samples`` consecutive
-    entries to its check's result slice — process_results is responsible
-    for slicing in groups of n_samples and voting.
+    Used by both single-paper and batch CLI flows so the split / render
+    / count contract is enforced in one place.
     """
-    from sciwrite_lint.llm_utils import llm_query_batch
-
-    # Phase 1: collect queries, grouped by (thinking, temperature, n). max_tokens
-    # is a fixed per-model constant (see VLLM_MODELS); output length is
-    # bounded by Pydantic schema constraints, not per-query overrides.
-    BatchKey = tuple[str, float | None, int]
-    queries_by_key: dict[BatchKey, list[tuple[str, str, dict, str]]] = {}
-    # Slice entry: (meta, fn, key, start_query_idx, query_count, n_samples).
-    # The result slice for this check is
-    #   key_results[start_query_idx * n : (start_query_idx + query_count) * n]
-    check_slices: list[tuple[Any, Any, BatchKey, int, int, int]] = []
-    build_failures: list[Finding] = []
-
-    for meta, fn in checks:
-        build = getattr(fn, "build_queries", None)
-        if build is None:
-            raise RuntimeError(f"LLM check {meta.id} missing build_queries")
-        try:
-            queries = build(tex_path, config)
-            thinking = getattr(fn, "thinking", "off")
-            temperature = getattr(fn, "temperature", None)
-            n_samples = int(getattr(fn, "n_samples", 1))
-            key: BatchKey = (thinking, temperature, n_samples)
-            if key not in queries_by_key:
-                queries_by_key[key] = []
-            start = len(queries_by_key[key])
-            queries_by_key[key].extend(queries)
-            check_slices.append((meta, fn, key, start, len(queries), n_samples))
-        except Exception as e:
-            logger.error(f"Check {meta.id} build_queries failed: {e}")
-            build_failures.append(
-                Finding(
-                    level="info",
-                    rule_id=meta.id,
-                    message=f"Check {meta.id} could not run (internal error)",
-                    context=f"{type(e).__name__}: {e!s}"[:200],
-                )
-            )
-
-    # Phase 2: one batch call per (thinking, temperature, n) group
-    results_by_key: dict[BatchKey, list[dict | None]] = {}
-    for key, batch_queries in queries_by_key.items():
-        thinking, temperature, n_samples = key
-        if batch_queries:
-            try:
-                results_by_key[key] = await llm_query_batch(
-                    batch_queries,
-                    config=config,
-                    thinking=thinking,
-                    temperature=temperature,
-                    n=n_samples,
-                )
-            except LLMConnectionError:
-                raise
-            except Exception as e:
-                logger.error(
-                    f"LLM batch query failed (thinking={thinking}, "
-                    f"temperature={temperature}, n={n_samples}): {e}"
-                )
-                results_by_key[key] = [None] * (len(batch_queries) * n_samples)
-
-    # Phase 3: distribute results to each check. Slice bounds scale by
-    # n_samples — each query contributed n consecutive result entries.
-    findings: list[Finding] = []
-    for meta, fn, key, start, count, n_samples in check_slices:
-        try:
-            if count > 0:
-                process = getattr(fn, "process_results")
-                key_results = results_by_key.get(key, [])
-                result_start = start * n_samples
-                result_end = (start + count) * n_samples
-                check_results = key_results[result_start:result_end]
-                check_findings = process(check_results)
-            else:
-                check_findings = []
-
-            for f in check_findings:
-                override = config.effective_severity(meta.id, meta.severity)
-                if override != f.level:
-                    f.level = override  # type: ignore[assignment]
-            findings.extend(check_findings)
-        except Exception as e:
-            logger.error(f"Check {meta.id} failed: {e}")
-            findings.append(
-                Finding(
-                    level="info",
-                    rule_id=meta.id,
-                    message=f"Check {meta.id} could not run (internal error)",
-                    context=f"{type(e).__name__}: {e!s}"[:200],
-                )
-            )
-
-    return build_failures + findings
+    manuscript, system_issues = split_findings(findings)
+    format_findings(manuscript, label, fmt=fmt, color=config.color)
+    if system_issues and fmt != "json":
+        format_findings(
+            system_issues,
+            f"{label} — system issues",
+            fmt=fmt,
+            color=config.color,
+        )
+    _print_integrity_summary(name, manuscript, config, system_issues=system_issues)
+    return any(f.level == "error" for f in manuscript)
 
 
 def run_check(args: argparse.Namespace) -> int:
@@ -152,7 +69,7 @@ def run_check(args: argparse.Namespace) -> int:
     """
     from sciwrite_lint.pipeline import preflight, run_full_check
 
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
 
     config = _load_config(args)
     fmt = args.format or config.output_format
@@ -252,10 +169,7 @@ def run_check(args: argparse.Namespace) -> int:
 
     label = f"{name} ({tex_path.name})" if name != tex_path.stem else tex_path.name
     print()
-    format_findings(findings, label, fmt=fmt, color=config.color)
-    _print_integrity_summary(name, findings, config)
-
-    if any(f.level == "error" for f in findings):
+    if _emit_paper_results(name, label, findings, config, fmt):
         all_ok = False
 
     return 0 if all_ok else 1
@@ -316,10 +230,7 @@ def _run_check_batch(
             continue
 
         label = f"{name} ({tex_path.name})" if name != tex_path.stem else tex_path.name
-        format_findings(sr.findings, label, fmt=fmt, color=config.color)
-        _print_integrity_summary(name, sr.findings, config)
-
-        if any(f.level == "error" for f in sr.findings):
+        if _emit_paper_results(name, label, sr.findings, config, fmt):
             all_ok = False
 
     return 0 if all_ok else 1
@@ -329,8 +240,14 @@ def _print_integrity_summary(
     paper_name: str,
     findings: list[Finding],
     config: LintConfig,
+    system_issues: list[Finding] | None = None,
 ) -> None:
-    """Compute integrity, save report, print summary."""
+    """Compute integrity, save report, print summary.
+
+    ``findings`` must be manuscript-only — system issues (linter could
+    not run a check) are passed via ``system_issues`` and routed to a
+    separate JSON field so they don't contaminate scores or counts.
+    """
     import json
 
     from sciwrite_lint.scoring.scilint_score import (
@@ -338,6 +255,8 @@ def _print_integrity_summary(
         _score_reference,
         compute_integrity,
     )
+
+    system_issues = system_issues or []
 
     output_dir = config.results_dir
 
@@ -364,6 +283,7 @@ def _print_integrity_summary(
         metadata_map = load_all_metadata(ws.root)
 
     findings_dicts = [f.model_dump() for f in findings]
+    system_issue_dicts = [f.model_dump() for f in system_issues]
     result = compute_integrity(
         findings_dicts,
         claims,
@@ -435,7 +355,11 @@ def _print_integrity_summary(
         }
         ref_details.append(detail)
 
-    # Save report
+    # Save report. ``findings`` and ``total_findings``/``errors``/
+    # ``warnings`` describe the manuscript only; ``system_issues`` and
+    # ``total_system_issues`` describe linter operational state (LLM
+    # gave up, vision subprocess timed out). The split lets a reviewer
+    # see manuscript quality without operational noise inflating it.
     report = {
         "paper": paper_name,
         "scilint_score": round(
@@ -447,8 +371,10 @@ def _print_integrity_summary(
         "total_findings": len(findings_dicts),
         "errors": sum(1 for f in findings_dicts if f.get("level") == "error"),
         "warnings": sum(1 for f in findings_dicts if f.get("level") == "warning"),
+        "total_system_issues": len(system_issue_dicts),
         "references": ref_details,
         "findings": findings_dicts,
+        "system_issues": system_issue_dicts,
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -465,6 +391,39 @@ def _print_integrity_summary(
     print(f"    Internal Consistency:  {result.internal_consistency:.2f}")
     print(f"    Referencing Quality:   {result.referencing_quality:.2f}")
     print("  (Run 'sciwrite-lint contributions' to add contribution axes)")
+
+    # Claim coverage — show how many cites were verified vs. skipped so
+    # the reviewer can tell at a glance which slice of the bibliography
+    # actually got LLM-checked. SKIPPED rows are persisted but produce no
+    # manuscript findings; their counts belong with the score banner, not
+    # the findings panel.
+    if claims:
+        verdicts: dict[str, int] = {}
+        for c in claims:
+            v = c.get("verdict") or "UNKNOWN"
+            verdicts[v] = verdicts.get(v, 0) + 1
+        n_skipped = verdicts.get("SKIPPED", 0)
+        n_verified = sum(
+            verdicts.get(v, 0)
+            for v in ("SUPPORTS", "NOT_SUPPORTED", "PARTIALLY_SUPPORTS")
+        )
+        n_undet = verdicts.get("CANNOT_DETERMINE", 0)
+        if n_skipped or n_undet:
+            print(
+                f"  Claim coverage: {n_verified} verified, "
+                f"{n_undet} undetermined, {n_skipped} skipped (no local source)"
+            )
+
+    # System issues report on the linter, not the manuscript — show
+    # them as a separate one-liner so they don't dilute the score
+    # banner. The full list is in the JSON report under system_issues.
+    if system_issue_dicts:
+        n = len(system_issue_dicts)
+        print(
+            f"\n  Note: {n} system issue{'s' if n != 1 else ''} "
+            f"(linter could not run all checks — see "
+            f"check_{paper_name}.json:system_issues)"
+        )
 
 
 def run_check_pdf(pdf_path: Path, config: LintConfig, fmt: str) -> int:

@@ -120,7 +120,7 @@ else:
     print(f"No OA copy found. Reasons: {'; '.join(result.failed_sources)}")
 ```
 
-The `is_oa` flag fires only when Unpaywall or OpenAlex confirm — in practice that covers most hybrid-OA publishers but not everything. If your use case needs broader coverage, layer your own heuristic on top (e.g. "if `found=False` and `doi` was provided, always offer the user the Unpaywall landing URL as a fallback").
+The `is_oa` flag fires only when Unpaywall or OpenAlex confirm — in practice that covers most hybrid-OA publishers but not everything. If your use case needs broader coverage, layer your own heuristic on top (e.g. "if `found=False` and `doi` was provided, always offer the user the Unpaywall landing URL as a next step").
 
 ## fetch_web — URL → markdown in memory
 

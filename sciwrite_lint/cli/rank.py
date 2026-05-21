@@ -10,6 +10,7 @@ from typing import Any
 
 from loguru import logger
 
+from sciwrite_lint.checks._diagnostics import split_findings
 from sciwrite_lint.config import LintConfig, PaperConfig
 from sciwrite_lint.models import Finding
 
@@ -97,7 +98,10 @@ def build_scilint_result(
     )
 
     paper_name = file_path.stem
-    findings_dicts = [f.model_dump() for f in findings]
+    # Strip system issues — they describe the linter's own state and
+    # must not contribute to the manuscript's internal score.
+    manuscript, _ = split_findings(findings)
+    findings_dicts = [f.model_dump() for f in manuscript]
     result: SciLintScoreResult = compute_scilint_score(
         paper_name,
         claim_results=[],
@@ -142,7 +146,7 @@ def score_standalone_file(
 
 def run_contributions(args: argparse.Namespace) -> int:
     """Compute SciLint Score from claim verification results."""
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
 
     config = _load_config(args)
 

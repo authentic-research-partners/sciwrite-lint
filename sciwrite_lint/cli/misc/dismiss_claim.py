@@ -9,7 +9,7 @@ def run_dismiss_claim(args: argparse.Namespace) -> int:
     """Dismiss a claim verification finding as false positive."""
     from datetime import date
 
-    from sciwrite_lint.__main__ import _load_config
+    from sciwrite_lint.cli._common import _load_config
 
     config = _load_config(args)
     ws = config.paper_workspace(args.paper)

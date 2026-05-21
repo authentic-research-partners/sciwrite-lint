@@ -26,7 +26,7 @@ local_web/bcnyorg2024_About.md
 
 The leading token up to the first `_`, `-`, `.`, or space is treated as the citekey (case-insensitive). Everything after is decoration — title, version, page range, anything. No fuzzy matching involved.
 
-**Form B — title-only** (fallback)
+**Form B — title-only** (used when the filename does not start with a citekey)
 
 ```
 local_pdfs/The Structure of Scientific Revolutions.pdf

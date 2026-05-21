@@ -9,6 +9,7 @@ check that re-runs on stored metadata (no API calls).
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any, Literal
 
@@ -88,8 +89,13 @@ def _register_ref_in_workspace(
                 title=canonical.get("title") or bibitem.get("title"),
                 authors=authors if isinstance(authors, list) else None,
             )
-    except Exception:
-        logger.debug("Failed to register {} in workspace DB", meta.key)
+    except sqlite3.Error as e:
+        logger.debug(
+            "Failed to register {} in workspace DB ({}: {})",
+            meta.key,
+            type(e).__name__,
+            e,
+        )
 
 
 async def _stage_verify(
@@ -478,9 +484,16 @@ async def _confirm_venue_findings(
         async with sem:
             try:
                 same = await venue_match_llm(m.group(1), m.group(2), config=config)
-            except Exception as e:
-                logger.debug("Venue match LLM failed: {}", e)
-                return f  # vLLM error, keep the finding
+            except (httpx.HTTPError, OSError, asyncio.TimeoutError) as e:
+                # vLLM unreachable / timeout: keep the venue finding rather
+                # than drop it silently. WARN so the operator sees that LLM
+                # confirmation didn't run, not DEBUG which is usually muted.
+                logger.warning(
+                    "Venue match LLM unavailable ({}: {}); keeping finding",
+                    type(e).__name__,
+                    e,
+                )
+                return f
         if same is True:
             return None  # vLLM confirmed same venue — suppress
         return f

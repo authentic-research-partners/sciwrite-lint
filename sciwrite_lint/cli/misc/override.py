@@ -9,7 +9,7 @@ def run_override(args: argparse.Namespace) -> int:
     """Manually override a citation's verification tier."""
     from datetime import date
 
-    from sciwrite_lint.__main__ import _load_config, _resolve_paper
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
     from sciwrite_lint.models import CitationMetadata
     from sciwrite_lint.references.metadata import (
         compute_tier,

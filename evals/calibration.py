@@ -12,12 +12,15 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sqlite3
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from sciwrite_lint.checks._diagnostics import split_findings
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -540,7 +543,11 @@ async def _score_batch_async(
             return
 
         paper_config = paper_configs[name]
-        findings_data = [f.model_dump() for f in sr.findings]
+        # Strip system issues so they don't pollute the calibration
+        # score. They are still emitted via the per-paper check_*.json
+        # report — calibration only cares about manuscript quality.
+        manuscript_findings, _system_issues = split_findings(sr.findings)
+        findings_data = [f.model_dump() for f in manuscript_findings]
         claim_results = sr.claim_results
 
         # Contribution axes
@@ -550,8 +557,12 @@ async def _score_batch_async(
             try:
                 with get_db(refs_dir) as conn:
                     update_pipeline_stage(conn, "contributions", "running")
-            except Exception:
-                pass
+            except sqlite3.Error as e:
+                logger.debug(
+                    "pipeline_stage update (running) failed for {}: {}",
+                    name,
+                    e,
+                )
             ctx = get_or_create_manuscript_context(pdf_path, paper_config)
             claim_dicts = extract_claims_from_context(ctx, pdf_path)
             ns = _argparse.Namespace(model=model)

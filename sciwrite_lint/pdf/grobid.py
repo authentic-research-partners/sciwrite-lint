@@ -216,7 +216,41 @@ def stop_grobid() -> None:
 
 _MEMORY_WARN_THRESHOLD = 0.80  # warn at 80% of limit
 _MEMORY_THROTTLE_THRESHOLD = 0.70  # start throttling at 70%
+# Default GROBID parse concurrency. Operators override via
+# ``config.grobid_max_concurrency`` (TOML ``[containers]
+# grobid_max_concurrency = N``); this constant remains as the default
+# baked into ``LintConfig`` and is referenced by the few internal
+# call sites that don't have a config in scope.
 MAX_PARSE_CONCURRENCY = 4
+
+# HTTP timeout for the GROBID POST that processes one PDF. Scaled by
+# file size because GROBID throughput is ~1-3 MB/s under load — a
+# fixed 60 s ceiling is fine for typical 1-3 MB articles but tips over
+# on the 10-20 MB heavy reports / book scans we see in real corpora
+# (e.g. an 18.6 MB report). The base 60 s POST timeout was tipping
+# over under exactly this load pattern. The retry helper still kicks
+# in on top of this — but the right base unit is "give the parser
+# proportional time", not "retry the same too-short ceiling 3× and
+# hope".
+_GROBID_TIMEOUT_FLOOR_S = 60.0
+_GROBID_TIMEOUT_PER_MB_S = 10.0
+_GROBID_TIMEOUT_CEILING_S = 600.0  # 10 minutes — refuse to wait longer
+
+
+def _grobid_timeout_for(pdf_bytes_len: int) -> float:
+    """Scale GROBID POST timeout by PDF size, clamped to [60 s, 600 s].
+
+    GROBID measured throughput is roughly 1-3 MB/s on an idle server
+    and slower under concurrent load (the parser pool is configured
+    at ``concurrency: 10`` and our pipeline sends up to
+    ``MAX_PARSE_CONCURRENCY=4`` simultaneously). 10 s/MB is a
+    conservative envelope: small docs still finish well under the
+    60 s floor; the largest book-length PDFs in the corpora
+    (~30-50 MB) get 5-9 minutes.
+    """
+    size_mb = pdf_bytes_len / (1024 * 1024)
+    scaled = _GROBID_TIMEOUT_FLOOR_S + _GROBID_TIMEOUT_PER_MB_S * size_mb
+    return min(_GROBID_TIMEOUT_CEILING_S, max(_GROBID_TIMEOUT_FLOOR_S, scaled))
 
 
 def _resolve_cgroup_dir(
@@ -265,6 +299,25 @@ def _read_cgroup_memory(cgroup: Path) -> tuple[int, int | None]:
             used = int(line.split()[1])
             break
     return used, limit
+
+
+def _read_cgroup_cpu_usage_usec(cgroup: Path) -> int | None:
+    """Read cumulative CPU usage in microseconds from cgroup v2 ``cpu.stat``.
+
+    Caller samples this across two ticks to compute cores in use:
+    ``cores = (curr - prev) / 1_000_000 / dt_seconds``.
+    """
+    try:
+        text = (cgroup / "cpu.stat").read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("usage_usec "):
+            try:
+                return int(line.split()[1])
+            except (ValueError, IndexError):
+                return None
+    return None
 
 
 def container_memory_status(
@@ -326,6 +379,36 @@ def gpu_utilization() -> int | None:
         return None
 
 
+def gpu_memory_free_bytes() -> int | None:
+    """Return free VRAM in bytes from nvidia-smi, or None.
+
+    On WSL2, when free VRAM hits zero, new allocations on the same GPU
+    don't fail outright — Windows WDDM silently maps the overflow to
+    system RAM via PCIe, 30–100× slower than dedicated VRAM. The
+    standard ``\\GPU Adapter Memory`` perf counter cannot see NVIDIA's
+    CUDA allocations (vLLM bypasses WDDM accounting), so the only
+    reliable spillover-risk indicator we can read from inside WSL2 is
+    "how close is dedicated VRAM to zero free." This helper exposes that
+    so the monitor can warn before a new GPU consumer (embedder,
+    second container) trips the spillover.
+    """
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip()) * 1024 * 1024
+    except ValueError:
+        return None
+
+
 _PEAK_FILE = Path.home() / ".sciwrite-lint" / "peak_memory.json"
 
 
@@ -352,18 +435,24 @@ def _save_peak(container: str, peak_bytes: int) -> None:
 
 
 async def monitor_container_memory(
-    sem: asyncio.Semaphore, interval: float = 10.0
+    sem: asyncio.Semaphore,
+    interval: float = 10.0,
+    max_concurrency: int = MAX_PARSE_CONCURRENCY,
 ) -> None:
     """Background task that monitors GROBID memory and throttles concurrency.
 
     - Tracks peak usage → ``~/.sciwrite-lint/peak_memory.json``
-    - At 70% of limit: reduces parse concurrency from 4 → 2
-    - At 80% of limit: reduces to 1 and logs a warning
-    - When memory drops below 70%: restores full concurrency
+    - At 70% of limit: reduces parse concurrency to ``max_concurrency - 2``
+    - At 80% of limit: reduces to ``max_concurrency - 1`` and logs a warning
+    - When memory drops below 70%: restores ``max_concurrency`` slots
 
     Throttling works by acquiring slots on ``sem`` (the parse semaphore),
     reducing what's available for actual parsing. The semaphore must be
     created by the caller (same event loop) and shared with the parse stage.
+    Caller passes ``max_concurrency`` to keep the throttle math consistent
+    with the semaphore size — pass ``config.grobid_max_concurrency`` so
+    operator overrides via ``[containers] grobid_max_concurrency`` flow
+    through to the throttle decision.
 
     Designed to be run as an asyncio task; cancel to stop.
     """
@@ -390,11 +479,11 @@ async def monitor_container_memory(
 
             pct = used / limit
 
-            # Determine how many slots to reserve (0–3, leaving at least 1)
+            # Determine how many slots to reserve, leaving at least 1
             if pct >= _MEMORY_WARN_THRESHOLD:
-                target_reserved = MAX_PARSE_CONCURRENCY - 1
+                target_reserved = max(0, max_concurrency - 1)
             elif pct >= _MEMORY_THROTTLE_THRESHOLD:
-                target_reserved = MAX_PARSE_CONCURRENCY - 2
+                target_reserved = max(0, max_concurrency - 2)
             else:
                 target_reserved = 0  # full concurrency
 
@@ -414,7 +503,7 @@ async def monitor_container_memory(
             if reserved > 0:
                 used_gb = used / (1024**3)
                 limit_gb = limit / (1024**3)
-                active = MAX_PARSE_CONCURRENCY - reserved
+                active = max_concurrency - reserved
                 if pct >= _MEMORY_WARN_THRESHOLD:
                     logger.warning(
                         f"GROBID memory: {used_gb:.1f}GB / {limit_gb:.1f}GB "
@@ -437,7 +526,22 @@ async def monitor_container_memory(
 
 
 async def process_pdf(pdf_path: Path) -> GrobidResult:
-    """Process a PDF through GROBID. Returns structured result."""
+    """Process a PDF through GROBID. Returns structured result.
+
+    Retries on transient failures via the project's shared
+    ``retry_on_transient`` helper:
+
+    * HTTP 429/500/502/503/504 — server is busy / restarting
+    * ``httpx.TimeoutException`` — including ``ReadTimeout`` from a
+      heavy PDF queued behind other heavy PDFs
+    * ``httpx.ConnectError`` — transient network blip
+
+    Anything else (HTTP 4xx other than 429, ``GrobidUnparseableError``
+    raised by ``_parse_tei`` callers, etc.) propagates immediately.
+    On retry exhaustion we wrap the final exception as ``RuntimeError``
+    so ``parse_all_missing._parse_one`` can record the per-key error
+    without killing the whole parse batch.
+    """
     if not await is_grobid_running():
         raise RuntimeError(
             "GROBID is not running. Start with:\n  sciwrite-lint containers start"
@@ -446,40 +550,39 @@ async def process_pdf(pdf_path: Path) -> GrobidResult:
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
 
-    from loguru import logger
+    from sciwrite_lint.rate_limiter import retry_on_transient
     from sciwrite_lint.usage import tracked
 
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
+    timeout = _grobid_timeout_for(len(pdf_bytes))
+
+    async def _do_post() -> httpx.Response:
         async with tracked("grobid"):
-            resp = await _get_client().post(
+            return await _get_client().post(
                 f"{GROBID_URL}/api/processFulltextDocument",
                 files={"input": (pdf_path.name, pdf_bytes, "application/pdf")},
                 data={"consolidateCitations": "1"},
-                timeout=60.0,
+                timeout=timeout,
             )
 
-        if resp.status_code == 200:
-            return _parse_tei(resp.text)
-
-        if resp.status_code in (500, 503) and attempt < max_retries:
-            delay = 2**attempt
-            logger.warning(
-                "GROBID returned {} for {} (attempt {}/{}), retrying in {}s",
-                resp.status_code,
-                pdf_path.name,
-                attempt,
-                max_retries,
-                delay,
-            )
-            await asyncio.sleep(delay)
-            continue
-
-        raise RuntimeError(
-            f"GROBID returned {resp.status_code} for {pdf_path.name}: {resp.text[:200]}"
+    try:
+        resp = await retry_on_transient(
+            _do_post,
+            max_retries=3,
+            base_delay=2.0,
+            label=f"GROBID {pdf_path.name}",
         )
+    except (httpx.TimeoutException, httpx.ConnectError) as exc:
+        raise RuntimeError(
+            f"GROBID transport error after retries for {pdf_path.name}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
-    raise RuntimeError(f"GROBID failed after {max_retries} retries for {pdf_path.name}")
+    if resp.status_code == 200:
+        return _parse_tei(resp.text)
+
+    raise RuntimeError(
+        f"GROBID returned {resp.status_code} for {pdf_path.name}: {resp.text[:200]}"
+    )
 
 
 class GrobidUnparseableError(RuntimeError):
@@ -510,7 +613,7 @@ def _classify_unparseable_pdf(pdf_path: Path) -> str:
       2. Otherwise, check pdfinfo for a known-problematic producer
          (CorelDRAW, Preview, etc. tend to produce structurally odd PDFs
          that GROBID's pdfalto extractor chokes on).
-      3. Fallback generic reason.
+      3. Generic reason if neither signal fires.
 
     Runs shelled-out ``pdftotext`` and ``pdfinfo`` (poppler-utils,
     already a GROBID system dependency). Any error in the diagnostic

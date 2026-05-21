@@ -699,7 +699,9 @@ async def run_bib_verification(
     return results
 
 
-# Keep single-reference convenience function for backward compatibility
+# Convenience wrapper for single-reference verification — most callers use
+# ``verify_ref_bibliographies(refs, ...)`` for the batch case; this is the
+# one-shot form used in interactive contexts.
 async def verify_ref_bibliography(
     ref_key: str,
     ref_text: str,

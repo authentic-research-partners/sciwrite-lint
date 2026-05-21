@@ -1,9 +1,13 @@
 """Pydantic models for vLLM structured output schemas.
 
 Every string field has a generous ``max_length`` (chars) set at ~2x natural
-output length. This tells vLLM's constrained decoder how much space each
-field gets, so the JSON structure completes within ``max_tokens``. The limits
-are ceilings — the model writes naturally below them.
+output length. **These bounds enforce post-decode validation only** — they
+do NOT reach the wire schema sent to vLLM, because ``maxLength`` /
+``maxItems`` constraints trigger xgrammar's slow path on this stack
+(0/30 success at concurrency=60 with a single bounded field). Bounds are
+enforced via a four-layer architecture: prompt word-count guidance +
+``max_tokens`` sized to fit + parser truncation (``truncate_to_model``)
++ Pydantic ``model_validate`` as a defense-in-depth check.
 
 Conservative token math (3 chars/token worst case): the widest single-item
 schema is ``ClaimVerdict`` at ~300 tokens; list-valued schemas dominate the
@@ -13,10 +17,15 @@ sizes, combined with the active thinking preset's budget, determine the
 total ``max_tokens`` sent to vLLM — see ``llm_utils.py::llm_query`` for
 how the two are combined.
 
-To get the JSON schema dict for vLLM::
+To build a wire schema for vLLM::
 
-    from sciwrite_lint.schemas import ClaimVerdict, vllm_schema
-    schema = vllm_schema(ClaimVerdict)
+    from sciwrite_lint.schemas import ClaimVerdict, vllm_schema_unbounded
+    schema = vllm_schema_unbounded(ClaimVerdict)  # strips bounds for the wire
+
+The ``vllm_schema()`` (without ``_unbounded``) helper exists for the
+schema-generator unit tests; do NOT use it for live ``response_format``
+payloads — the bounded form ships ``maxLength`` / ``maxItems`` on the
+wire and triggers xgrammar's slow path.
 """
 
 from __future__ import annotations
@@ -118,6 +127,12 @@ def vllm_schema(model: type[BaseModel]) -> dict[str, Any]:
 
     Inlines ``$ref`` references (vLLM doesn't resolve ``$defs``) and strips
     Pydantic metadata (``title``, ``description``) to keep the schema compact.
+
+    !!! Important !!! For vLLM call sites where Pydantic ``Field(max_length=...)``
+    or list-length bounds exist on the model, prefer
+    ``vllm_schema_unbounded`` — sending ``maxLength`` / ``maxItems`` over
+    the wire on this stack triggers xgrammar's slow path and collapses
+    throughput.
     """
     raw = model.model_json_schema()
     defs = raw.pop("$defs", {})
@@ -133,6 +148,169 @@ def vllm_schema(model: type[BaseModel]) -> dict[str, Any]:
         return obj
 
     return _resolve(raw)
+
+
+# Constraint keys stripped by ``vllm_schema_unbounded``. These trigger
+# xgrammar's slow path on the vLLM/xgrammar version we run — bench
+# confirmed a single ``maxLength`` collapses 30/30 success to 0/30 with
+# every request hitting the client-side timeout. The Pydantic model
+# still carries these constraints for **post-decode validation**; they
+# just don't go on the wire.
+_VLLM_BANNED_SCHEMA_KEYS = frozenset(
+    {
+        "maxLength",
+        "minLength",
+        "maxItems",
+        "minItems",
+        "pattern",
+        "multipleOf",
+        "maximum",
+        "minimum",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+    }
+)
+
+
+def _strip_vllm_banned_keys(obj: Any) -> Any:
+    """Recursively strip xgrammar-slow constraint keys from a JSON
+    schema dict tree. Returns a new structure (does not mutate input)."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_vllm_banned_keys(v)
+            for k, v in obj.items()
+            if k not in _VLLM_BANNED_SCHEMA_KEYS
+        }
+    if isinstance(obj, list):
+        return [_strip_vllm_banned_keys(v) for v in obj]
+    return obj
+
+
+def vllm_schema_unbounded(model: type[BaseModel]) -> dict[str, Any]:
+    """Generate a JSON schema dict for vLLM, with length / count
+    constraints stripped.
+
+    Use this **instead of** ``vllm_schema`` when the Pydantic model
+    carries ``Field(max_length=...)`` or list-length bounds — those
+    constraints trigger xgrammar's slow path on this stack (a single
+    ``maxLength`` field is enough to collapse throughput from 30/30 to
+    0/30, every request hits the client-side timeout). The Pydantic
+    model still validates post-decode; only the wire schema sent to
+    vLLM is stripped.
+    """
+    return _strip_vllm_banned_keys(vllm_schema(model))
+
+
+# ---------------------------------------------------------------------------
+# Defensive truncation for LLM-output dicts
+# ---------------------------------------------------------------------------
+
+
+def _max_length_from_metadata(metadata: list[Any]) -> int | None:
+    """Pull a ``max_length`` constraint out of a Pydantic field's
+    metadata list. Used by ``truncate_to_model`` to apply the same
+    cap that ``vllm_schema_unbounded`` strips from the wire."""
+    from annotated_types import MaxLen
+
+    for m in metadata:
+        if isinstance(m, MaxLen):
+            return int(m.max_length)
+    return None
+
+
+def _coerce_to_bounds(value: Any, annotation: Any, cap: int | None) -> Any:
+    """Truncate one value against its declared annotation + max_length.
+
+    Strings: clip to ``cap`` chars. Lists: clip to ``cap`` items, then
+    recurse into each item if it's a nested ``BaseModel`` (so item
+    fields get their own caps applied). Other types pass through.
+    """
+    from typing import get_args, get_origin
+
+    if isinstance(value, str):
+        return value[:cap] if cap is not None else value
+    if isinstance(value, list):
+        truncated = value[:cap] if cap is not None else value
+        if get_origin(annotation) is list:
+            args = get_args(annotation)
+            if args:
+                inner = args[0]
+                if isinstance(inner, type) and issubclass(inner, BaseModel):
+                    return [
+                        truncate_to_model(inner, item)
+                        if isinstance(item, dict)
+                        else item
+                        for item in truncated
+                    ]
+        return truncated
+    return value
+
+
+_CHARS_PER_WORD = 8  # English including spaces & punctuation
+
+
+def pydantic_max(model: type[BaseModel], field: str) -> int | None:
+    """Read the ``max_length`` constraint from a Pydantic field.
+
+    For string fields, returns the character cap. For list fields,
+    returns the item cap (Pydantic emits this as ``maxItems`` in JSON
+    schema). Returns ``None`` if the field doesn't exist on the
+    model or doesn't carry a ``max_length``.
+
+    Used by prompt builders to keep "under ~N words" / "at most N
+    items" guidance in sync with Pydantic's ``max_length`` — this is
+    the prompt-side layer of the schema bounds architecture (see the
+    module docstring above).
+    """
+    if field not in model.model_fields:
+        return None
+    return _max_length_from_metadata(model.model_fields[field].metadata)
+
+
+def chars_to_word_hint(chars: int | None) -> int:
+    """Convert a character cap to a natural-language word target.
+
+    Rounds up to the nearest 5 so the prompt reads cleanly ("under
+    ~50 words" not "under ~37 words"). Returns 0 if input is None,
+    so callers can use this on optional max_length lookups without
+    branching.
+
+    Math: ~8 chars/word for English with spaces and punctuation.
+    """
+    if chars is None or chars <= 0:
+        return 0
+    words = chars // _CHARS_PER_WORD
+    return ((words + 4) // 5) * 5
+
+
+def truncate_to_model(model: type[BaseModel], data: Any) -> Any:
+    """Truncate an LLM-output dict to match a Pydantic model's bounds.
+
+    The wire schema is unbounded (``vllm_schema_unbounded``), so the
+    LLM can emit slightly more than the prompt asked for — extra list
+    items or longer strings. Calling this helper before
+    ``model.model_validate(data)`` (or before iterating dict fields
+    directly) ensures consumers see bounded data and never raise
+    ``ValidationError`` on a minor over-run.
+
+    Walks the model's fields recursively: top-level lists clipped to
+    their ``max_length`` count, top-level strings clipped to their
+    ``max_length``, and nested submodels in lists get the same
+    treatment for their fields. Returns a new structure (does not
+    mutate input).
+    """
+    if not isinstance(data, dict):
+        return data
+    out: dict[str, Any] = {}
+    for k, v in data.items():
+        if k not in model.model_fields:
+            out[k] = v
+            continue
+        finfo = model.model_fields[k]
+        out[k] = _coerce_to_bounds(
+            v, finfo.annotation, _max_length_from_metadata(finfo.metadata)
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +366,44 @@ class ConsistencyResult(BaseModel):
     """Cross-section consistency check result."""
 
     contradictions: list[Contradiction] = Field(max_length=4)
+
+
+# ---------------------------------------------------------------------------
+# Internal-consistency pairs (checks/internal_consistency_pairs.py)
+# ---------------------------------------------------------------------------
+
+
+class PairContradiction(BaseModel):
+    """A contradiction between an anchor sentence and one of its neighbors.
+
+    ``neighbor_index`` is 1-based and references the numbered neighbor list
+    in the user prompt — so process_results can map the finding back to the
+    specific (anchor, neighbor) pair without re-running retrieval. The
+    upper bound is set comfortably above ``_MAX_NEIGHBORS`` in
+    ``checks/internal_consistency_pairs.py`` (currently 12) so a future
+    bump of that ceiling does not require a schema change. Out-of-range
+    values are dropped in ``_process_results``.
+    """
+
+    neighbor_index: int = Field(ge=1, le=32)
+    type: str = Field(max_length=100)
+    anchor_says: str = Field(max_length=400)
+    neighbor_says: str = Field(max_length=400)
+    explanation: str = Field(max_length=400)
+    is_genuine: bool = Field(
+        description="true ONLY if the anchor and that neighbor actively disagree"
+    )
+
+
+class PairConsistencyResult(BaseModel):
+    """Per-anchor result: contradictions found across this anchor's neighbors.
+
+    Capped at 4 entries to bound the LLM's output budget — when more
+    than 4 contradictions exist for an anchor the prompt instructs the
+    model to return the most clear-cut.
+    """
+
+    contradictions: list[PairContradiction] = Field(max_length=4)
 
 
 # ---------------------------------------------------------------------------

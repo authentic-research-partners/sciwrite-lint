@@ -116,8 +116,14 @@ class CitationAPI:
                 client=self._client,
             )
         except Exception as e:
+            # The waterfall caller distinguishes ``{"error": …}`` from
+            # ``None`` (not-found): error dicts mean "lookup itself
+            # failed" and stay visible, ``None`` means "no result for
+            # this citation". All API lookups in this module return the
+            # error shape so transient network failures don't masquerade
+            # as misses.
             logger.debug("CrossRef lookup failed for {}: {}", citation.key, e)
-            return None
+            return {"error": str(e), "source": "crossref"}
 
     # ------------------------------------------------------------------
     # OpenAlex
@@ -502,6 +508,13 @@ async def batch_openalex(
                 label="OpenAlex batch",
             )
             if resp.status_code != 200:
+                # API failure ≠ "no matches". Log at WARNING so the operator
+                # sees the API was unreachable; the verify-cascade still
+                # falls through to S2/CrossRef per the pipeline contract.
+                logger.warning(
+                    "OpenAlex batch returned status {}; cascading to next provider",
+                    resp.status_code,
+                )
                 return results
             works = resp.json().get("results", [])
             for work in works:
@@ -552,7 +565,7 @@ async def batch_s2(
             async with tracked("semantic_scholar", ids=len(ids)):
                 try:
                     resp = await retry_on_transient(
-                        lambda: client.post(
+                        lambda ids=ids: client.post(
                             "https://api.semanticscholar.org/graph/v1/paper/batch",
                             json={"ids": ids},
                             params={"fields": _S2_FIELDS},
@@ -560,13 +573,27 @@ async def batch_s2(
                         label="S2 batch",
                     )
                     if resp.status_code != 200:
+                        # API failure ≠ "no matches". Log at WARNING so the
+                        # operator sees the API was unreachable.
+                        logger.warning(
+                            "S2 batch returned status {} for {} IDs; "
+                            "cascading to next provider",
+                            resp.status_code,
+                            len(ids),
+                        )
                         continue
                     papers = resp.json()
                     for paper, (key, _s2_id) in zip(papers, batch):
                         if paper:  # S2 returns null for not-found
                             results[key] = _parse_s2(paper)
                 except httpx.HTTPError as e:
-                    logger.debug("S2 batch request failed: {}", e)
+                    # Network error ≠ "no matches". WARNING so the operator
+                    # can see API was unreachable; cascade continues.
+                    logger.warning(
+                        "S2 batch request failed ({}: {}); cascading to next provider",
+                        type(e).__name__,
+                        e,
+                    )
                     continue
 
     return results
@@ -606,10 +633,28 @@ async def parallel_crossref(
                             polite_email=config.polite_email,
                             client=client,
                         )
-                        if result and not result.get("error"):
-                            results[c.key] = result
+                        if result is None:
+                            return  # not-found — fine, next provider handles
+                        if result.get("error"):
+                            # API failure ≠ "no match". Log at WARNING so
+                            # the operator sees CrossRef was unreachable;
+                            # don't propagate the error dict into ``results``
+                            # because callers expect parsed-result shape.
+                            logger.warning(
+                                "CrossRef lookup failed for {}: {}",
+                                c.key,
+                                result["error"],
+                            )
+                            return
+                        results[c.key] = result
                     except Exception as e:
-                        logger.debug("CrossRef lookup failed for {}: {}", c.key, e)
+                        # Network error ≠ "no match". WARNING so visible.
+                        logger.warning(
+                            "CrossRef lookup raised for {} ({}: {})",
+                            c.key,
+                            type(e).__name__,
+                            e,
+                        )
 
         await asyncio.gather(*[_lookup_one(c) for c in citations])
     return results

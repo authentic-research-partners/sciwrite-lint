@@ -68,9 +68,7 @@ _SEMANTIC_TP_CASES = [
         "semantic_object_vs_purpose",
         "Current educational technology is built for a different object: content delivery.",
         expected_span="object",
-        description=(
-            "'object' used where 'purpose' or 'objective' is intended."
-        ),
+        description=("'object' used where 'purpose' or 'objective' is intended."),
     ),
     _case(
         "semantic_comprise_of",

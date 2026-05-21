@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
 import httpx
+from rapidfuzz import fuzz
 
 from sciwrite_lint._network import ResponseTooLarge, ssrf_safe_client, stream_with_limit
 
@@ -199,18 +200,7 @@ def _fuzzy_score(a: str, b: str) -> float:
     """Raw fuzzy similarity between two lowercased strings."""
     if not a or not b:
         return 0.0
-    try:
-        from rapidfuzz import fuzz
-
-        return fuzz.ratio(a, b) / 100.0
-    except ImportError:
-        pass
-
-    wa = set(a.split())
-    wb = set(b.split())
-    if not wa or not wb:
-        return 0.0
-    return (2 * len(wa & wb)) / (len(wa) + len(wb))
+    return fuzz.ratio(a, b) / 100.0
 
 
 def _find_pdf_in_html(html: str, base_url: str) -> str | None:

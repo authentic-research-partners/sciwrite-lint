@@ -500,7 +500,10 @@ def find_active_db_runs(
                 "SELECT paper, workspace_root, timestamp, pid FROM runs "
                 "WHERE workspace_root != '' ORDER BY timestamp DESC LIMIT 50",
             ).fetchall()
-    except Exception:
+    except sqlite3.Error as e:
+        logger.debug(
+            "find_active_db_runs: DB query failed ({}: {})", type(e).__name__, e
+        )
         return []
 
     seen: set[str] = set()

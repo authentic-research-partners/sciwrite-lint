@@ -13,6 +13,7 @@ import asyncio
 import httpx
 from loguru import logger
 
+from sciwrite_lint._network import ssrf_safe_client
 from sciwrite_lint.oa._models import FetchConfig, WebResult
 from sciwrite_lint.web import (
     BROWSER_HEADERS,
@@ -63,9 +64,8 @@ async def fetch_web(
 
     own_client = client is None
     if own_client:
-        client = httpx.AsyncClient(
+        client = ssrf_safe_client(
             timeout=cfg.timeout,
-            follow_redirects=True,
             headers={"User-Agent": cfg.user_agent, **BROWSER_HEADERS},
         )
     assert client is not None

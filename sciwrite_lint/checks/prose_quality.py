@@ -35,11 +35,25 @@ from pydantic import BaseModel, ValidationError
 
 from sciwrite_lint.checks.registry import check
 from sciwrite_lint.models import Finding
-from sciwrite_lint.schemas import ProseIssue, ProseIssueList, vllm_schema
+from sciwrite_lint.schemas import (
+    ProseIssue,
+    ProseIssueList,
+    chars_to_word_hint,
+    pydantic_max,
+    truncate_to_model,
+    vllm_schema_unbounded,
+)
 from sciwrite_lint.tex_parser import split_sentences
 
 if TYPE_CHECKING:
     from sciwrite_lint.config import LintConfig
+
+# Prompt-side guidance derived from Pydantic caps — Layer 1 of the
+# schema bounds architecture (see ``schemas.py``). The prompt's
+# "at most 2 issues per sentence" hint is intentionally tighter than
+# ProseIssueList's max_length=3 (encourages selectivity); we therefore
+# don't derive that one.
+_FIELD_MAX_WORDS = chars_to_word_hint(pydantic_max(ProseIssue, "span"))
 
 
 class _ReviewableSentence(BaseModel):
@@ -57,7 +71,7 @@ class _ReviewableSentence(BaseModel):
     sentence: str
 
 
-_ISSUE_SCHEMA = vllm_schema(ProseIssueList)
+_ISSUE_SCHEMA = vllm_schema_unbounded(ProseIssueList)
 
 # Section titles that should not be run through prose review.
 _SKIP_HEADINGS = frozenset(
@@ -197,6 +211,9 @@ hesitation. "medium" for likely-but-defensible. "low" is dropped on \
 output, so use "low" generously when uncertain — do not upgrade \
 uncertain calls to "medium" or "high".
 7. At most 2 issues per sentence. Usually zero.
+8. Keep each field concise: ``span``, ``issue``, and ``suggestion`` \
+under ~{field_max_words} words each. ``span`` is just the offending \
+substring; ``issue`` and ``suggestion`` are short notes, not paragraphs.
 
 OUTPUT (JSON only):
 {{"issues": [{{"type": "grammar"|"semantic", "span": "exact substring", \
@@ -293,29 +310,27 @@ def _collect_sentences(
 # finding is trivially unanimous) and the check ships at the cost of a
 # single decode per sentence.
 #
-# Rationale for shipping N=1 rather than N=3: empirically, stepping
-# from N=1 → N=3 was a small precision gain at ~3× the wall-clock
-# cost (decode is the bottleneck, not prefill). The big wins came
-# from pandoc ingest + positive prompt + style-leak filter; voting was
-# incremental. Setting to 3 or 5 is a one-line opt-in if a future
-# workload makes voting worth the cost.
+# Setting this to 3 or 5 is a one-line opt-in to self-consistency
+# voting, at a proportional wall-clock cost.
 _N_SAMPLES = 1
 
 
 def _build_queries(
     tex_path: Path,
     config: "LintConfig",
-) -> list[tuple[str, str, dict, str]]:
+) -> tuple[list[tuple[str, str, dict, str]], list["_ReviewableSentence"]]:
     """Emit one query per sentence. Sample multiplication happens in the
     batch runner via ``n_samples`` so the N samples share a prefill."""
     items = _collect_sentences(tex_path, config)
-    _build_queries._state = items  # type: ignore[attr-defined]
     queries: list[tuple[str, str, dict, str]] = []
     for item in items:
-        system = _SYSTEM_TEMPLATE.format(paragraph=item.paragraph)
+        system = _SYSTEM_TEMPLATE.format(
+            paragraph=item.paragraph,
+            field_max_words=_FIELD_MAX_WORDS,
+        )
         user = f'Sentence to analyze: "{item.sentence}"'
         queries.append((system, user, _ISSUE_SCHEMA, "ProseIssueList"))
-    return queries
+    return queries, items
 
 
 # Phrases that indicate the model emitted a non-finding (sentence is fine
@@ -402,6 +417,12 @@ def _parse_sample(
     """Parse one sample's result into validated, emittable issues."""
     if not result:
         return []
+    # Wire schema is unbounded (vllm_schema_unbounded) — without this
+    # truncation a model that exceeds ``ProseIssueList`` bounds (e.g.
+    # 4 issues, 350-char span) raises ``ValidationError`` and the
+    # whole sample gets dropped, losing the analysis. Clip to the
+    # documented caps first so validate succeeds with bounded data.
+    result = truncate_to_model(ProseIssueList, result)
     try:
         parsed = ProseIssueList.model_validate(result)
     except ValidationError as e:
@@ -481,14 +502,17 @@ def _vote_findings(
     return findings
 
 
-def _process_results(results: list[dict[str, Any] | None]) -> list[Finding]:
+def _process_results(
+    results: list[dict[str, Any] | None],
+    *,
+    state: list["_ReviewableSentence"],
+) -> list[Finding]:
     """Vote ``_N_SAMPLES`` samples per sentence into findings.
 
     Queries are laid out as contiguous blocks of size ``_N_SAMPLES`` per
     sentence — slice them back in order, parse each sample, then vote
     on the span. See :func:`_vote_findings`.
     """
-    state: list[_ReviewableSentence] = getattr(_build_queries, "_state", [])
     if not state:
         return []
     expected = len(state) * _N_SAMPLES

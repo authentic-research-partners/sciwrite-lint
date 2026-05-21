@@ -94,117 +94,110 @@ def run_eval_calibration(args: argparse.Namespace) -> int:
     return 0 if result.total_passed == result.total_constraints else 1
 
 
-def run_eval_real_world(args: argparse.Namespace) -> int:
-    """Dispatch real-world evaluation subcommands."""
+def run_rw_corpus(args: argparse.Namespace) -> int:
+    """Handler for ``eval-real-world corpus``."""
+    from eval_real_world.runner import run_corpus
     from sciwrite_lint.__main__ import _load_config
 
-    action = args.rw_action
+    cats = args.categories.split(",") if args.categories else None
+    srcs = args.sources.split(",") if getattr(args, "sources", None) else None
+    config = _load_config(args)
+    run_corpus(
+        Path(args.workspace),
+        n=args.n,
+        categories=cats,
+        seed=args.seed,
+        sources=srcs,
+        config=config,
+    )
+    return 0
 
-    if action == "corpus":
-        from eval_real_world.runner import run_corpus
 
-        cats = args.categories.split(",") if args.categories else None
-        srcs = args.sources.split(",") if getattr(args, "sources", None) else None
-        config = _load_config(args)
-        run_corpus(
-            Path(args.workspace),
-            n=args.n,
-            categories=cats,
-            seed=args.seed,
-            sources=srcs,
-            config=config,
-        )
-        return 0
+def run_rw_fpr(args: argparse.Namespace) -> int:
+    """Handler for ``eval-real-world fpr``."""
+    from eval_real_world.runner import run_fpr
+    from sciwrite_lint.__main__ import _load_config
 
-    if action == "fpr":
-        from eval_real_world.runner import run_fpr
+    config = _load_config(args)
+    output = Path(args.output) if args.output else None
+    run_fpr(
+        Path(args.workspace),
+        output_dir=output,
+        config=config,
+        max_papers=args.max_papers,
+        max_findings_per_paper=args.max_findings,
+    )
+    return 0
 
-        config = _load_config(args)
-        output = Path(args.output) if args.output else None
-        run_fpr(
-            Path(args.workspace),
+
+def run_rw_inject(args: argparse.Namespace) -> int:
+    """Handler for ``eval-real-world inject``."""
+    from eval_real_world.runner import run_inject
+    from sciwrite_lint.__main__ import _load_config
+
+    config = _load_config(args)
+    output = Path(args.output) if args.output else None
+    run_inject(
+        Path(args.workspace),
+        output_dir=output,
+        config=config,
+        max_papers=args.max_papers,
+        seed=args.seed,
+        llm=getattr(args, "llm", False),
+    )
+    return 0
+
+
+def run_rw_pipeline(args: argparse.Namespace) -> int:
+    """Handler for ``eval-real-world pipeline``."""
+    from eval_real_world.runner import run_full_pipeline
+    from sciwrite_lint.__main__ import _load_config
+    from sciwrite_lint.cli.config import check_api_config
+
+    config = _load_config(args)
+    # Pipeline runs the full fetch stage (OA PDF acquisition), which
+    # requires polite_email for Unpaywall and Retraction Watch. Fail
+    # fast here rather than letting every paper succeed through verify
+    # and then error out mid-pipeline at fetch.
+    api_errors = check_api_config(config, needs_email=True)
+    if api_errors:
+        for e in api_errors:
+            logger.error(f"  ✗ {e}")
+        return 2
+    output = Path(args.output) if getattr(args, "output", None) else None
+    run_full_pipeline(
+        Path(args.workspace),
+        output_dir=output,
+        config=config,
+        max_papers=getattr(args, "max_papers", None),
+        contribution=not getattr(args, "no_contribution", False),
+        model=getattr(args, "model", ""),
+        concurrency=getattr(args, "concurrency", 2),
+        judge=getattr(args, "judge", False),
+        max_judge_findings=getattr(args, "max_judge_findings", 20),
+    )
+    return 0
+
+
+def run_rw_report(args: argparse.Namespace) -> int:
+    """Handler for ``eval-real-world report``."""
+    from eval_real_world.runner import run_report
+
+    run_report(Path(args.results_dir))
+    return 0
+
+
+def run_rw_fetch(args: argparse.Namespace) -> int:
+    """Handler for ``eval-real-world fetch``."""
+    from eval_real_world.fetch import run_fetch_eval
+
+    output = Path(args.output) if getattr(args, "output", None) else None
+    download = Path(args.download) if getattr(args, "download", None) else None
+    asyncio.run(
+        run_fetch_eval(
             output_dir=output,
-            config=config,
-            max_papers=args.max_papers,
-            max_findings_per_paper=args.max_findings,
+            download_to=download,
+            email=getattr(args, "email", ""),
         )
-        return 0
-
-    if action == "inject":
-        from eval_real_world.runner import run_inject
-
-        config = _load_config(args)
-        output = Path(args.output) if args.output else None
-        run_inject(
-            Path(args.workspace),
-            output_dir=output,
-            config=config,
-            max_papers=args.max_papers,
-            seed=args.seed,
-            llm=getattr(args, "llm", False),
-        )
-        return 0
-
-    if action == "pipeline":
-        from eval_real_world.runner import run_full_pipeline
-        from sciwrite_lint.cli.config import check_api_config
-
-        config = _load_config(args)
-        # Pipeline runs the full fetch stage (OA PDF acquisition), which
-        # requires polite_email for Unpaywall and Retraction Watch. Fail
-        # fast here rather than letting every paper succeed through verify
-        # and then error out mid-pipeline at fetch.
-        api_errors = check_api_config(config, needs_email=True)
-        if api_errors:
-            for e in api_errors:
-                logger.error(f"  ✗ {e}")
-            return 2
-        output = Path(args.output) if getattr(args, "output", None) else None
-        run_full_pipeline(
-            Path(args.workspace),
-            output_dir=output,
-            config=config,
-            max_papers=getattr(args, "max_papers", None),
-            contribution=not getattr(args, "no_contribution", False),
-            model=getattr(args, "model", ""),
-            concurrency=getattr(args, "concurrency", 2),
-            judge=getattr(args, "judge", False),
-            max_judge_findings=getattr(args, "max_judge_findings", 20),
-        )
-        return 0
-
-    if action == "matching":
-        from eval_real_world.matching import run_matching_eval
-
-        output = Path(args.output) if getattr(args, "output", None) else None
-        asyncio.run(
-            run_matching_eval(
-                Path(args.workspace),
-                max_papers=getattr(args, "max_papers", None),
-                seed=getattr(args, "seed", 42),
-                output_dir=output,
-            )
-        )
-        return 0
-
-    if action == "report":
-        from eval_real_world.runner import run_report
-
-        run_report(Path(args.results_dir))
-        return 0
-
-    if action == "fetch":
-        from eval_real_world.fetch import run_fetch_eval
-
-        output = Path(args.output) if getattr(args, "output", None) else None
-        download = Path(args.download) if getattr(args, "download", None) else None
-        asyncio.run(
-            run_fetch_eval(
-                output_dir=output,
-                download_to=download,
-                email=getattr(args, "email", ""),
-            )
-        )
-        return 0
-
+    )
     return 0

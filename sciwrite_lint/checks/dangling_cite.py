@@ -23,7 +23,7 @@ def _check_latex(tex_path: Path, config: LintConfig) -> list[Finding]:
 
     try:
         citations = extract_bibitems(tex_path)
-    except (ValueError, ImportError):
+    except ValueError:
         return []
 
     bib_keys = {c.key for c in citations}

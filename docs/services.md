@@ -2,7 +2,7 @@
 
 sciwrite-lint requires two local services and uses several external APIs. Start both before running the linter.
 
-**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM). Developed and tested on WSL2 with 64 GB RAM and an RTX 4000 Ada (20 GB VRAM). Native Linux is likely to work but is untested and may require GPU memory allocation tuning (see [Embedding device](#embedding-device) below). Not tested on macOS.
+**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM) and at least 32 GB system RAM. Tested on WSL2 with NVIDIA driver 546.01+; native Linux is likely to work but is untested and may require GPU memory allocation tuning (see [Embedding device](#embedding-device) below). Not tested on macOS.
 
 ## Quick start
 
@@ -57,6 +57,30 @@ sciwrite-lint vllm stop
 ```
 
 Requires an NVIDIA GPU with at least 16 GB VRAM, CUDA drivers, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Runs via podman/docker with `--device nvidia.com/gpu=all` (CDI).
+
+### Concurrency: `[llm] max_concurrency` and `[vision] max_concurrency`
+
+`sciwrite-lint check` issues many vLLM requests in parallel — full-paper consistency, ref-internal, and claim verification each batch dozens to hundreds of queries. The vision pipeline does the same with image requests against a separate vLLM container on port 5002. To keep either server from queueing the whole batch at once (which would cross the per-request timeout on the slowest-to-schedule request), the client caps in-flight requests per batch:
+
+```toml
+[llm]
+max_concurrency = 12        # text-vLLM (port 5001), default 12
+
+[vision]
+max_concurrency = 64        # vision-vLLM (port 5002), default 64
+request_timeout = 120       # seconds; vision responses are smaller than text
+```
+
+**Why a client-side cap matters.** The OpenAI-compatible API exposes no signal that distinguishes "your request is queued at the server" from "your request is being processed." The read timeout (300 s for text, 120 s for vision) starts ticking the moment the request leaves your machine and runs through queue wait, prefill, and decode together. If you flood vLLM with hundreds of large requests, the slowest one waits minutes for a scheduling slot, and the timeout fires *before* it ever runs. Capping concurrency in our process holds the surplus requests locally with no clock running, so the timeout only ever covers actual server-side work.
+
+**Why the text and vision defaults differ.** Text full-paper queries can be ~30 K tokens each, so the text cap is set conservatively to keep KV-cache pressure manageable on a single mid-sized GPU; the heaviest in-codebase caller (reference-internal full-paper checks) drives this cap. Smaller-prompt callers (manuscript LLM checks, claim taxonomy, ref-internal pairwise) run at higher hardcoded caps internally — see "code-internal callers" below. Vision requests are uniformly small (~3.6 K tokens including the image embedding), so the vision cap can be much higher without saturating the multimodal KV cache.
+
+**When to tune:**
+
+- **Lower** (e.g. text → 4, vision → 32) if you see `APITimeoutError` mid-run, or if you run multiple papers concurrently (`--concurrency N` in `check`) on a single GPU — the cap is per-batch, so multi-paper mode multiplies it.
+- **Raise** if you have a larger GPU and want shorter wall time. For text, 16–32 is reasonable on small-prompt workloads (LLM checks, claim taxonomy) — code-internal callers already pass per-batch hints so the global only binds the heavy full-paper case. Push the vision cap upward in similar increments and watch for saturation symptoms.
+
+If you see a run abort with `vLLM at http://localhost:5001/v1 became unreachable mid-request: APITimeoutError`, the symptom is almost always saturation under heavy prompts, not a too-large single prompt. Lower `max_concurrency` (or `--concurrency` for paper-level batches) before raising `llm_timeout`.
 
 ## External APIs
 
@@ -202,10 +226,10 @@ device = "auto"    # "auto" (GPU if available), "cpu", "cuda"
 
 GPU embedding is ~50x faster than CPU (seconds vs. minutes for a typical paper).
 
-**GPU memory sharing with vLLM:** The embedding model (~1.2 GB) and vLLM share a single GPU. The pipeline runs embedding and vLLM inference in separate sequential stages, never at the same time. GPU memory is explicitly released between stages. Encode batch size adapts to chunk token length to stay within VRAM limits.
+**GPU memory sharing with vLLM:** The embedding model (~1.2 GB) and vLLM share a single GPU. The pipeline stops the text vLLM container before embedding runs and restarts it after, on **both WSL2 and native Linux** — neither platform tolerates concurrent active CUDA workloads on a 16–24 GB consumer GPU. Encode batch size adapts to chunk token length to stay within VRAM limits.
 
-- **Windows (WSL2):** GPU memory is virtualized — the OS transparently pages vLLM's idle memory while embedding runs. This is the tested and recommended platform. No configuration needed.
-- **Native Linux:** GPU memory is physical (no overcommit). `device = "auto"` defaults to CPU. To enable GPU embedding, set `device = "cuda"` and ensure enough free VRAM (lower vLLM's `--gpu-memory-utilization` from 0.9 if needed).
+- **Windows (WSL2):** swap adds ~30 s per pipeline run for the embedding window. **Recommended setup:** in NVIDIA Control Panel → 3D Settings → Manage 3D Settings → *CUDA - Sysmem Fallback Policy*, choose **Prefer No Sysmem Fallback**. By default Windows silently spills GPU overflow into system RAM via PCIe (30–100× slower than VRAM); disabling the fallback makes WSL2 fail loudly on overflow instead of running degraded. Driver 546.01+.
+- **Native Linux:** same swap path. CUDA OOM errors are loud by default — no setting to change.
 
 To force CPU embedding on any platform, set `device = "cpu"`. This avoids any GPU memory interaction but is ~50x slower.
 
@@ -234,11 +258,11 @@ sciwrite-lint check --paper my-paper --vision-backend vllm
 sciwrite-lint vision --paper my-paper --backend vllm
 ```
 
-**GPU memory sharing (transformers backend):** On WSL2, CUDA memory overcommit lets the 2B VL model share VRAM with vLLM transparently. On native Linux, auto-resolves to CPU.
+**GPU memory sharing (transformers backend):** The 2B VL subprocess sequences with text vLLM the same way the embedder does — stop text vLLM, run vision in subprocess, restart text vLLM. Same on WSL2 and native Linux.
 
 **Container swap (vllm backend):** The pipeline stops text vLLM, starts vision vLLM (~90-130s), runs all vision stages, then swaps back. Skips the swap if the vision container is already running. Pre-start with `sciwrite-lint containers start --vision` to avoid the wait during pipeline runs.
 
-**Native Linux GPU embedding:** On native Linux (no CUDA overcommit), the pipeline automatically stops text vLLM before embedding, runs embedding on GPU (~50x faster than CPU), then restarts text vLLM. This is transparent — no configuration needed. *(Preliminary: tested on WSL2 only; expected to work on native Linux, may need minor fixes.)*
+**GPU embedding swap (all platforms):** The pipeline automatically stops text vLLM before the embedding stage, runs embedding on GPU in a subprocess (~50× faster than CPU), then restarts text vLLM. Transparent — no configuration needed. WSL2 and native Linux behave the same way.
 
 **Caching:** Figure descriptions are cached in workspace.db by SHA-256 of image bytes + caption text. Only changed or new images trigger re-inference. A typical manuscript (5-8 figures) takes ~35s on first run, 0s on subsequent runs.
 

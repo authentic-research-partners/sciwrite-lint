@@ -71,7 +71,7 @@ class FetchOutcome(BaseModel):
 
 # Curated reference set. Each case targets a specific source in the
 # waterfall so the per-source success columns are interpretable. Stretch
-# goals like "fallback past wrong candidate" live in
+# goals like "skip past a wrong candidate" live in
 # ``scripts/verify_oa_economics_sources.py --rank`` — this set just
 # confirms the happy path end-to-end.
 DEFAULT_CASES: list[FetchRef] = [
