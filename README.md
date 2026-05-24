@@ -81,7 +81,7 @@ sciwrite-lint contributions paper.pdf --format json
 
 ### Optimizations
 
-Three models — a vision model (Qwen3-VL-2B default, or 8B FP8 via `--vision-backend vllm` for +15% accuracy), an embedding model (Arctic Embed), and an 8B reasoning LLM (Qwen3 via vLLM) — share a single consumer GPU. The pipeline runs each in its own stage and explicitly stops one before starting the next, so only one ever owns GPU memory at a time (same code path on WSL2 and native Linux). FP8 weights and KV cache (Ada Lovelace+) and per-paper SQLite caching with hash-based invalidation are baseline. On top of that:
+Three models — a vision model (Qwen3-VL-2B default, or 8B FP8 via `--vision-backend vllm` for +15% accuracy), an embedding model (Arctic Embed), and an 8B reasoning LLM (Qwen3 via vLLM) — share a single consumer GPU. The pipeline runs each in its own stage and explicitly stops one before starting the next, so only one ever owns GPU memory at a time (same code path on WSL2 and native Linux). FP8 weights and KV cache (Ada Lovelace+) and per-paper SQLite caching are baseline; every cache layer pins its inputs by hash so editing the paper, replacing a figure, or refreshing a reference recomputes only what's affected (see the *Iterative editing* subsection under Usage — `--fresh` is not part of the normal loop). On top of that:
 
 - **Cost-aware verify-claim ladder** — sentence chunk → paragraph chunk → whole section. Each level fans out top-N candidates in parallel; stops on a conclusive verdict. Most claims resolve at the cheap sentence level (~200-token prompts) instead of paying for whole sections (~5K tokens), with full-section escalation reserved for hard cases
 - **Prefix-first prompt structure** — shared context placed before variable content in all prompts, maximizing vLLM's automatic prefix caching
@@ -216,7 +216,18 @@ sciwrite-lint contributions paper.pdf           # standalone file scoring
 
 `check` runs the full pipeline in one command: text checks → figure analysis → LLM consistency → reference verification via APIs → download and parse cited papers → claim verification → consistency checks on cited papers → bibliography verification → aggregate reliability scores → SciLint Score. An initial run on a 50-reference paper takes up to 30 minutes (dominated by downloads and claim verification); subsequent cached runs complete in minutes.
 
-Use `--fresh` to start from scratch (backs up the existing workspace before recreating it).
+### Iterative editing — no `--fresh` needed
+
+`sciwrite-lint check` invalidates cached results whenever the inputs they were derived from change, so rerunning after an edit just works. Concretely:
+
+- **Edit a sentence or paragraph** → the manuscript-LLM checks (prose-quality, cross-section consistency, etc.) re-run only on the touched sentences and their paragraph siblings; untouched prose stays cached
+- **Edit a paragraph around a citation** → the claim verifier reruns on the edited prose
+- **Replace a figure** (overwrite the PNG/PDF in your tree) → the vision cache re-describes it
+- **Swap the local LLM model** (e.g. `qwen3` ↔ `gemma3` via `--model`) → manuscript-check rows and claim verdicts no longer count as cache hits
+- **Overwrite a reference PDF** in your drop folder, or **re-fetch** an open-access PDF that has new bytes → the parser, embeddings, and claim verifier all rerun against the new content
+- **Upgrade a summary `.md` to a real PDF** in your drop folder → claims are re-verified against the richer evidence
+
+Use `--fresh` only when you want to wipe the workspace deliberately (it backs up the existing workspace before recreating it). It is not the answer to "I edited the paper and a finding looks stale" — if you ever see that, file an issue; a cache invariant is wrong and we'll fix it.
 
 Use `--checks ID[,ID...]` to run only the listed checks (comma-separated), disabling the rest for this invocation. Useful for fast iteration during editing (`--checks prose-quality` runs just the prose review), for debugging a single check, or for scripting a two-pass workflow. Unknown check IDs fail loudly — run `sciwrite-lint checks` to list available IDs.
 

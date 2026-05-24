@@ -170,7 +170,7 @@ The Retraction Watch database (~60,000+ entries) is downloaded as a CSV and cach
 
 - **Your manuscript text** — never sent to any external service. Parsed locally, checked locally.
 - **Full-text PDFs of cited papers** — downloaded to `references/{paper_name}/` (per-paper workspace) and processed by GROBID (local container). Never re-uploaded.
-- **LLM inference** — runs locally via vLLM. No text sent externally unless you explicitly use `--backend claude`.
+- **LLM inference** — runs locally via vLLM. No manuscript or reference text is sent externally.
 
 ### What leaves your machine
 

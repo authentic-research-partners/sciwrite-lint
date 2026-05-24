@@ -168,10 +168,31 @@ CREATE TABLE IF NOT EXISTS claim_results (
     reviewer_comment TEXT NOT NULL DEFAULT '',
     dismissed_date TEXT NOT NULL DEFAULT '',
     resolved_at TEXT NOT NULL DEFAULT '',
-    evidence_locator TEXT NOT NULL DEFAULT ''
+    evidence_locator TEXT NOT NULL DEFAULT '',
+    ref_src_hash TEXT NOT NULL DEFAULT '',
+    ref_parse_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_claims_key ON claim_results(ref_key);
 CREATE INDEX IF NOT EXISTS idx_claims_verdict ON claim_results(verdict);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Manuscript LLM check cache (prose-quality, cross-section, etc.)
+# ---------------------------------------------------------------------------
+
+_MANUSCRIPT_CHECK_CACHE_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS manuscript_check_cache (
+    prompt_hash TEXT NOT NULL,
+    check_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    cache_version TEXT NOT NULL DEFAULT '1',
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (prompt_hash, check_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mcc_check ON manuscript_check_cache(check_id);
+CREATE INDEX IF NOT EXISTS idx_mcc_model ON manuscript_check_cache(model);
 """
 
 
@@ -272,13 +293,23 @@ def _migrate_claim_results(conn: sqlite3.Connection) -> None:
         ("skip_reason", "''"),
         ("resolved_at", "''"),
         ("evidence_locator", "''"),
+        ("ref_src_hash", "''"),
+        ("ref_parse_hash", "''"),
     ]:
         try:
             conn.execute(
                 f"ALTER TABLE claim_results ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}"
             )
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        except sqlite3.OperationalError as e:
+            # Column already exists — the only legitimate cause of this
+            # error here, since the surrounding loop adds columns one at
+            # a time and we own the schema. Re-raising would force a
+            # workspace wipe on every existing install.
+            logger.debug(
+                "claim_results ALTER ADD COLUMN {} skipped (already present): {}",
+                col,
+                e,
+            )
 
 
 def _migrate_vision_cache(conn: sqlite3.Connection) -> None:
@@ -311,8 +342,14 @@ def _migrate_vision_cache(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE vision_cache ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}"
             )
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        except sqlite3.OperationalError as e:
+            # Column already exists — the only legitimate cause here;
+            # see the matching note in _migrate_claim_results above.
+            logger.debug(
+                "vision_cache ALTER ADD COLUMN {} skipped (already present): {}",
+                col,
+                e,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +384,7 @@ def open_db(references_dir: Path) -> sqlite3.Connection:
     conn.executescript(_REF_INTERNAL_CACHE_SCHEMA)
     conn.executescript(_CLAIM_RESULTS_SCHEMA)
     _migrate_claim_results(conn)
+    conn.executescript(_MANUSCRIPT_CHECK_CACHE_SCHEMA)
     conn.executescript(_CITATION_METADATA_SCHEMA)
     conn.executescript(_VISION_CACHE_SCHEMA)
     _migrate_vision_cache(conn)

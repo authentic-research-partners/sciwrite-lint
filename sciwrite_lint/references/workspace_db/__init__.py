@@ -57,6 +57,13 @@ from sciwrite_lint.references.workspace_db.pipeline_stage import (
     load_pipeline_stages,
     update_pipeline_stage,
 )
+from sciwrite_lint.references.workspace_db.manuscript_check_cache import (
+    count_rows as count_manuscript_check_cache_rows,
+    delete_by_cache_version as delete_manuscript_check_cache_by_version,
+    delete_by_model as delete_manuscript_check_cache_by_model,
+    lookup_many as lookup_manuscript_check_cache,
+    save_many as save_manuscript_check_cache,
+)
 from sciwrite_lint.references.workspace_db.manuscript_citations import (
     ManuscriptCitation,
     count_manuscript_citations,
@@ -146,4 +153,10 @@ __all__ = [
     "find_unembedded_contexts",
     "load_unique_contexts",
     "replace_manuscript_citations",
+    # Manuscript LLM check cache
+    "count_manuscript_check_cache_rows",
+    "delete_manuscript_check_cache_by_model",
+    "delete_manuscript_check_cache_by_version",
+    "lookup_manuscript_check_cache",
+    "save_manuscript_check_cache",
 ]

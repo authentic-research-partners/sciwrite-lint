@@ -574,14 +574,16 @@ async def process_pdf(pdf_path: Path) -> GrobidResult:
     except (httpx.TimeoutException, httpx.ConnectError) as exc:
         raise RuntimeError(
             f"GROBID transport error after retries for {pdf_path.name}: "
-            f"{type(exc).__name__}: {exc}"
+            f"{type(exc).__name__}: {exc}\n"
+            "Check container logs: sciwrite-lint containers logs grobid"
         ) from exc
 
     if resp.status_code == 200:
         return _parse_tei(resp.text)
 
     raise RuntimeError(
-        f"GROBID returned {resp.status_code} for {pdf_path.name}: {resp.text[:200]}"
+        f"GROBID returned {resp.status_code} for {pdf_path.name}: {resp.text[:200]}\n"
+        "Check container logs: sciwrite-lint containers logs grobid"
     )
 
 
@@ -623,6 +625,8 @@ def _classify_unparseable_pdf(pdf_path: Path) -> str:
     import shutil
     import subprocess
 
+    from loguru import logger
+
     # Step 1: is there any extractable text at all?
     if shutil.which("pdftotext"):
         try:
@@ -635,8 +639,13 @@ def _classify_unparseable_pdf(pdf_path: Path) -> str:
             ).stdout
             if len(text.strip()) < 100:
                 return "image-only PDF (no text layer) — GROBID cannot parse"
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug(
+                "pdftotext classifier failed for {}: {}: {}",
+                pdf_path.name,
+                type(e).__name__,
+                e,
+            )
 
     # Step 2: known-problematic producer?
     if shutil.which("pdfinfo"):
@@ -657,8 +666,13 @@ def _classify_unparseable_pdf(pdf_path: Path) -> str:
                         for marker in ("coreldraw", "preview", "quartz pdfcontext")
                     ):
                         return f"unsupported PDF producer ({value})"
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug(
+                "pdfinfo classifier failed for {}: {}: {}",
+                pdf_path.name,
+                type(e).__name__,
+                e,
+            )
 
     return "GROBID returned NO_BLOCKS (PDF structure not recognizable)"
 
@@ -722,7 +736,8 @@ async def extract_title_from_header(pdf_path: Path) -> str:
                 await asyncio.sleep(delay)
                 continue
             raise RuntimeError(
-                f"GROBID header extraction failed for {pdf_path.name}: {e}"
+                f"GROBID header extraction failed for {pdf_path.name}: {e}\n"
+                "Check container logs: sciwrite-lint containers logs grobid"
             ) from e
 
         if resp.status_code == 200:
@@ -751,7 +766,8 @@ async def extract_title_from_header(pdf_path: Path) -> str:
             continue
 
         raise RuntimeError(
-            f"GROBID header extraction returned {resp.status_code} for {pdf_path.name}"
+            f"GROBID header extraction returned {resp.status_code} for {pdf_path.name}\n"
+            "Check container logs: sciwrite-lint containers logs grobid"
         )
 
     # processHeaderDocument returns BibTeX by default — extract title field

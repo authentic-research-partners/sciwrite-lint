@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sciwrite-lint"
-version = "0.4.0"
+version = "0.5.0"
 description = "A linter for scientific manuscripts — reference verification, consistency checking, and structural validation."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
@@ -85,4 +85,6 @@ sciwrite-lint = "sciwrite_lint.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["sciwrite_lint*"]
+
+[tool.setuptools.package-data]
 

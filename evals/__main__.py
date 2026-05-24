@@ -13,9 +13,33 @@ import argparse
 import sys
 
 
-def main(argv: list[str] | None = None) -> int:
-    import importlib.util
+def _register_optional_extensions(
+    sub: argparse._SubParsersAction,  # type: ignore[type-arg]
+    rw_sub: argparse._SubParsersAction,  # type: ignore[type-arg]
+) -> None:
+    """Load CLI extensions discovered under ``evals``.
 
+    An underscore-prefixed subpackage is a CLI extension when its
+    ``__init__.py`` defines ``register_cli(sub, rw_sub)``. Discovery walks
+    ``evals.__path__`` via ``pkgutil``, so no extension package names
+    appear in this source — adding or removing one is a filesystem
+    change.
+    """
+    import importlib
+    import pkgutil
+
+    import evals as _pkg
+
+    for _finder, name, ispkg in pkgutil.iter_modules(_pkg.__path__):
+        if not ispkg or not name.startswith("_"):
+            continue
+        ext = importlib.import_module(f"{_pkg.__name__}.{name}")
+        register = getattr(ext, "register_cli", None)
+        if register is not None:
+            register(sub, rw_sub)
+
+
+def main(argv: list[str] | None = None) -> int:
     from evals.cli_eval import (
         run_eval_calibration,
         run_eval_scilint_score,
@@ -171,18 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_rw_fetch.set_defaults(func=run_rw_fetch)
 
-    # Optional ``evals._dev`` subcommands. When ``evals._dev`` is installed,
-    # extra dev-only subcommands register here; otherwise ``find_spec``
-    # returns ``None`` and the registration is skipped.
-    #
-    # Check the parent package first because ``find_spec`` raises
-    # ``ModuleNotFoundError`` (not returns ``None``) when an intermediate
-    # path on a dotted name is missing. Once the parent is confirmed
-    # present, the child lookup is safe.
-    if importlib.util.find_spec("evals._dev") is not None:
-        from evals._dev.cli_main_dev import register_dev_commands
-
-        register_dev_commands(sub, rw_sub)
+    # Load optional underscore-prefixed CLI extension subpackages (if any).
+    _register_optional_extensions(sub, rw_sub)
 
     args = parser.parse_args(argv)
     if not args.command:

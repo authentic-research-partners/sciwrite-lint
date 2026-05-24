@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0] — 2026-05-24
+
+### Added
+- **Per-prompt cache for manuscript-LLM checks.** Prose-quality, cross-section consistency, full-paper consistency, structure-promises, and internal-consistency-pairs now memoize each LLM call. A clean rerun against unchanged prose dispatches zero LLM calls; editing one sentence re-pays only for that sentence (and any sibling whose surrounding paragraph context shifted), so iterative edit→rerun loops on long manuscripts stay cheap. Switching the local vLLM model forces a full re-check.
+
+### Removed
+- **`verify-claims --backend claude` removed.** The Claude Sonnet path on `verify-claims` is gone; the `--backend` flag is removed and claim verification now runs only against the local vLLM. Existing workspaces auto-invalidate any cached Claude-stamped verdicts on the next run — no `--fresh` or migration step needed.
+
+### Fixed
+- **GROBID error messages now point at the log command.** Transport, response, and header-extraction errors from GROBID now suggest `Check container logs: sciwrite-lint containers logs grobid` so the operator's next step is in the message itself. PDF-classification subprocess failures (`pdftotext` / `pdfinfo`) are now logged at debug instead of silently swallowed.
+- **Claim verdicts no longer leak across edits or model swaps.** The `verify-claims` cache used to reuse a prior verdict whenever a citation matched by key and line, even after the inputs had changed. Re-runs now invalidate when (a) the prose around the citation was edited, (b) the local vLLM model changed, (c) the cited source kind changed (summary upgraded to a real PDF, web page to a PDF), (d) the source file was overwritten, or (e) the cited PDF was re-fetched. Existing workspaces self-correct on the next run; no `--fresh` needed.
+
+### Documentation
+- **Iterative editing without `--fresh`.** New README subsection "Iterative editing — no `--fresh` needed" documents the cache contract: every cache layer (source ingest, parsing, embeddings, vision figure descriptions, cited-paper checks, manuscript-LLM checks, claim verification) invalidates from a hash pinned to its inputs, so editing one sentence, replacing a figure, swapping the local LLM model, or replacing/re-fetching a cited PDF all recompute only what's affected. `--fresh` is reserved for the rare wipe-workspace case; a stale-looking result is a bug to report, not a workflow problem.
+
 ## [0.4.0] — 2026-05-19
 
 ### Added

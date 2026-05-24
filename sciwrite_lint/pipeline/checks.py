@@ -75,7 +75,22 @@ async def run_llm_checks_batched_impl(
     When n_samples > 1, each query contributes ``n_samples`` consecutive
     entries to its check's result slice — process_results is responsible
     for slicing in groups of n_samples and voting.
+
+    Cache interaction: results route through ``manuscript_check_cache``
+    when ``n_samples == 1`` and ``temperature`` is ``None`` or ``0.0``.
+    A check with no explicit ``.temperature`` is still cache-eligible
+    even though vLLM samples at the model default — the cache stamps
+    the first valid sample as canonical. Pin ``temperature=0.0`` for
+    bit-exact reuse (see ``prose_quality.py``).
+
+    Manuscript-LLM checks currently default to ``n_samples=1``; the
+    voting branch is reserved infrastructure kept on the measured
+    speed-vs-precision trade-off (decode-bound at N>1).
     """
+    from sciwrite_lint.llm.manuscript_cache import (
+        save_misses as _cache_save_misses,
+        split_cached_and_misses as _cache_split,
+    )
     from sciwrite_lint.llm_utils import SMALL_PROMPT_CONCURRENCY, llm_query_batch
 
     # Phase 1: collect queries, grouped by (thinking, temperature, n). max_tokens
@@ -83,6 +98,10 @@ async def run_llm_checks_batched_impl(
     # bounded by Pydantic schema constraints, not per-query overrides.
     BatchKey = tuple[str, float | None, int]
     queries_by_key: dict[BatchKey, list[tuple[str, str, dict, str]]] = {}
+    # Per-query check_id aligned with queries_by_key — needed to key the
+    # manuscript-check cache and to distinguish two checks that might
+    # accidentally emit the same prompt.
+    check_ids_by_key: dict[BatchKey, list[str]] = {}
     # Slice entry: (meta, fn, key, start_query_idx, query_count, n_samples, state).
     # The result slice for this check is
     #   key_results[start_query_idx * n : (start_query_idx + query_count) * n]
@@ -114,21 +133,56 @@ async def run_llm_checks_batched_impl(
             key: BatchKey = (thinking, temperature, n_samples)
             if key not in queries_by_key:
                 queries_by_key[key] = []
+                check_ids_by_key[key] = []
             start = len(queries_by_key[key])
             queries_by_key[key].extend(queries)
+            check_ids_by_key[key].extend([meta.id] * len(queries))
             check_slices.append((meta, fn, key, start, len(queries), n_samples, state))
         except Exception as e:
             logger.error(f"Check {meta.id} build_queries failed: {e}")
             build_failures.append(internal_error_finding(meta.id, e))
 
-    # Phase 2: one batch call per (thinking, temperature, n) group
+    # Phase 2: one batch call per (thinking, temperature, n) group. Two
+    # modes drive whether the manuscript-check cache is consulted:
+    #   - single-answer mode (n_samples == 1 and temperature is None|0):
+    #     the check wants one answer per prompt. Route through the cache —
+    #     only queries whose canonical prompt hash misses reach vLLM, fresh
+    #     results are written back. Note: temperature=None still samples at
+    #     the model default at the vLLM layer; the cache stamps the first
+    #     valid sample as canonical. Pin temperature=0.0 for bit-exact reuse.
+    #   - voting mode (n_samples > 1 or explicit temperature > 0): the check
+    #     needs N fresh independent samples each run to aggregate (self-
+    #     consistency vote). Bypass the cache on both read and write —
+    #     storing one sample would defeat the vote.
     results_by_key: dict[BatchKey, list[dict | None]] = {}
+    cache_hits = 0
+    cache_misses = 0
     for key, batch_queries in queries_by_key.items():
         thinking, temperature, n_samples = key
-        if batch_queries:
+        if not batch_queries:
+            continue
+        single_answer = n_samples == 1 and (temperature is None or temperature == 0.0)
+        if single_answer:
+            (
+                merged,
+                miss_queries,
+                miss_indices,
+                miss_check_ids,
+                miss_prompt_hashes,
+            ) = _cache_split(batch_queries, check_ids_by_key[key], config)
+            cache_hits += sum(1 for r in merged if r is not None)
+            cache_misses += len(miss_queries)
+        else:
+            merged = [None] * len(batch_queries)
+            miss_queries = list(batch_queries)
+            miss_indices = list(range(len(batch_queries)))
+            miss_check_ids = []
+            miss_prompt_hashes = []
+
+        if miss_queries:
             try:
-                results_by_key[key] = await llm_query_batch(
-                    batch_queries,
+                fresh = await llm_query_batch(
+                    miss_queries,
                     config=config,
                     thinking=thinking,
                     temperature=temperature,
@@ -143,7 +197,33 @@ async def run_llm_checks_batched_impl(
                     f"LLM batch query failed (thinking={thinking}, "
                     f"temperature={temperature}, n={n_samples}): {e}"
                 )
-                results_by_key[key] = [None] * (len(batch_queries) * n_samples)
+                fresh = [None] * (len(miss_queries) * n_samples)
+            # Single-answer mode (n_samples == 1) is the only path that
+            # caches: fresh entries align 1:1 with miss_queries. Voting
+            # mode (n_samples > 1) skips the cache, so the merge below
+            # stays correct.
+            if single_answer:
+                for pos, val in zip(miss_indices, fresh, strict=True):
+                    merged[pos] = val
+                _cache_save_misses(config, miss_prompt_hashes, miss_check_ids, fresh)
+                results_by_key[key] = merged
+            else:
+                # Voting mode: results scaled by n_samples (each query
+                # produces n consecutive entries). Re-emit the flattened
+                # list as-is for process_results to slice and vote.
+                results_by_key[key] = fresh
+        else:
+            results_by_key[key] = merged
+
+    if cache_hits or cache_misses:
+        total = cache_hits + cache_misses
+        pct = (100.0 * cache_hits / total) if total else 0.0
+        logger.info(
+            "Manuscript-check cache: {}/{} hits ({:.0f}%)",
+            cache_hits,
+            total,
+            pct,
+        )
 
     # Phase 3: distribute results to each check. Slice bounds scale by
     # n_samples — each query contributed n consecutive result entries.

@@ -5,8 +5,8 @@ cited source (PDF via GROBID or .md), splits into sections, and checks
 each section in parallel against the claim using a local LLM via vLLM.
 
 Only works for T1 citations (full text available). Skips T2/T3.
-Uses only local vLLM — no cloud services. For the Claude Opus backend
-(deep analysis, expensive), see sciwrite_lint.evals.eval_claims_opus.
+Uses only local vLLM — no cloud services. Manuscript text never leaves
+the local machine.
 """
 
 from __future__ import annotations
@@ -1421,16 +1421,16 @@ async def run_claim_verification(
     config: LintConfig | None = None,
     bib_format: str = "auto",
     bib_path: Path | None = None,
-    backend: str = "vllm",
     model: str = "",
     key_filter: str | None = None,
     limit: int | None = None,
     rerun: bool = False,
 ) -> list[dict]:
-    """Run claim verification for a paper.
-
-    backend: "vllm" (local LLM, default) or "claude" (Claude CLI, deep).
-    """
+    """Run claim verification for a paper against the local vLLM backend."""
+    # ``backend`` is fixed to "vllm". The column is preserved on
+    # ``claim_results`` to correctly invalidate any pre-0.5.0 rows that
+    # stored a different value.
+    backend = "vllm"
     from sciwrite_lint.references.citations import check_local_sources, extract_bibitems
     from sciwrite_lint.references.metadata import load_all_metadata
 
@@ -1449,7 +1449,7 @@ async def run_claim_verification(
         # Standalone PDF (no prior build_pdf_context call)
         from sciwrite_lint.pipeline import build_pdf_context, citations_from_pdf_context
 
-        asyncio.run(build_pdf_context(tex_path, config))
+        await build_pdf_context(tex_path, config)
         citations = citations_from_pdf_context(config)
     else:
         citations = extract_bibitems(tex_path, bib_format, bib_path=bib_path)
@@ -1532,42 +1532,52 @@ async def run_claim_verification(
     # contexts from workspace.db. The standalone path has no findings
     # list to populate, so any build-warning Finding is logged and
     # dropped — pipeline runs route it to system_issues correctly.
-    if backend != "claude":
-        from sciwrite_lint.pipeline import (
-            ensure_claim_query_vectors,
-            persist_manuscript_citations,
-        )
+    from sciwrite_lint.pipeline import (
+        ensure_claim_query_vectors,
+        persist_manuscript_citations,
+    )
 
-        _, build_finding = persist_manuscript_citations(
-            config, references_dir, tex_path=tex_path
+    _, build_finding = persist_manuscript_citations(
+        config, references_dir, tex_path=tex_path
+    )
+    if build_finding is not None:
+        logger.warning(
+            "Manuscript-context build warning surfaced (standalone "
+            "verify-claims; not surfaced as system issue): {}",
+            build_finding.context,
         )
-        if build_finding is not None:
-            logger.warning(
-                "Manuscript-context build warning surfaced (standalone "
-                "verify-claims; not surfaced as system issue): {}",
-                build_finding.context,
-            )
-        ensure_claim_query_vectors(references_dir, config)
+    ensure_claim_query_vectors(references_dir, config)
 
-    if backend == "claude":
-        vllm_model = ""
-        model_id = "claude"
-        logger.info("Backend: Claude Sonnet (via claude CLI)")
-    else:
-        vllm_model = model or config.llm_model or VLLM_DEFAULT_MODEL
-        model_id = f"vllm:{vllm_model}"
-        logger.info(f"Backend: vLLM ({VLLM_MODELS[vllm_model]['model']})")
+    vllm_model = model or config.llm_model or VLLM_DEFAULT_MODEL
+    model_id = f"vllm:{vllm_model}"
+    logger.info(f"Backend: vLLM ({VLLM_MODELS[vllm_model]['model']})")
 
     ref_paths: dict[str, Path | None] = {}
     ref_types: dict[str, str] = {}
+    ref_src_hashes: dict[str, str] = {}
     ref_sections: dict[str, list[Section]] = {}
     for key, local in local_files.items():
         ref_paths[key] = _resolve_reference_path(local, references_dir)
         meta = all_meta.get(key)
         if meta:
             ref_types[key] = meta.access.get("local_type", "none")
+            ref_src_hashes[key] = meta.access.get("local_file_src_hash", "")
         else:
             ref_types[key] = "pdf" if local.endswith(".pdf") else "summary"
+            ref_src_hashes[key] = ""
+
+    # parse_cache.pdf_hash moves whenever the GROBID-parsed PDF bytes
+    # change — covers OA-fetched refs (which have no drop-folder src
+    # hash) on top of the ref_src_hash signal for drop-folder refs.
+    from sciwrite_lint.references.workspace_db import (
+        get_db,
+        load_all_parse_cache,
+    )
+
+    ref_parse_hashes: dict[str, str] = {}
+    with get_db(references_dir) as _pc_conn:
+        for ref_key, row in load_all_parse_cache(_pc_conn).items():
+            ref_parse_hashes[ref_key] = row.get("pdf_hash", "")
 
     # Load previous results from workspace.db
     from sciwrite_lint.references.workspace_db import (
@@ -1603,8 +1613,35 @@ async def run_claim_verification(
 
     for i, claim in enumerate(verifiable):
         pk = (claim.key, claim.line)
-        if pk in previous:
-            results[i] = previous[pk]
+        cached = previous.get(pk)
+        # Reuse a cached verdict only when every input that could change
+        # it still matches: surrounding context, the backend/model that
+        # produced it, the kind of local source consulted, and the
+        # source-file hash (catches drop-folder PDF/MHTML re-ingests).
+        # Empty cached ref_src_hash is treated as "no info" — we don't
+        # invalidate on it alone, since OA-fetched refs have no ingest
+        # hash to compare.
+        cur_src_hash = ref_src_hashes.get(claim.key, "")
+        cur_parse_hash = ref_parse_hashes.get(claim.key, "")
+        cur_ref_type = ref_types.get(claim.key, "paper")
+        if (
+            cached is not None
+            and cached.get("context", "") == claim.context
+            and cached.get("backend", "") == backend
+            and cached.get("model", "") == model_id
+            and cached.get("ref_type", "") == cur_ref_type
+            and (
+                not cached.get("ref_src_hash", "")
+                or not cur_src_hash
+                or cached.get("ref_src_hash", "") == cur_src_hash
+            )
+            and (
+                not cached.get("ref_parse_hash", "")
+                or not cur_parse_hash
+                or cached.get("ref_parse_hash", "") == cur_parse_hash
+            )
+        ):
+            results[i] = cached
             skipped += 1
         elif not ref_paths.get(claim.key):
             results[i] = {
@@ -1628,11 +1665,6 @@ async def run_claim_verification(
             ref_sections[claim.key] = split_sections(ref_text) if ref_text else []
 
     _CLAIM_CONCURRENCY = 5
-    # Use the dynamic controller only when the vllm backend is active.
-    # Claude CLI has its own server-side admission, so a static
-    # semaphore is the right tool for it. ``concurrency_slot`` handles
-    # both branches uniformly so the loop body doesn't care which
-    # backend is in play.
     from sciwrite_lint.llm.concurrency_optimizer import (
         ControllerParams,
         concurrency_slot,
@@ -1643,7 +1675,7 @@ async def run_claim_verification(
         target_kv_grow=config.concurrency_target_kv_grow,
         target_kv_hi=config.concurrency_target_kv_hi,
     )
-    _use_dynamic = backend == "vllm" and config.use_dynamic_concurrency
+    _use_dynamic = config.use_dynamic_concurrency
     _slot_static_cap = (
         config.llm_max_concurrency if _use_dynamic else _CLAIM_CONCURRENCY
     )
@@ -1670,42 +1702,31 @@ async def run_claim_verification(
                 f"{ref_path.name} is a web page summary, not the actual paper"
             )
 
-        if backend == "claude":
-            # Claude CLI has its own server-side admission; use the slot
-            # as an outer per-claim throttle.
-            async with _slot():
-                from sciwrite_lint.claude_backend import verify_claim_claude
+        # vLLM: the slot wraps each individual LLM call inside
+        # verify_claim_vllm, so the controller's dynamic cap bounds
+        # the actual vLLM request volume regardless of how many
+        # claims and ladder fan-outs run in parallel.
+        sections = ref_sections[claim.key]
+        if not sections:
+            results[idx] = {
+                "key": claim.key,
+                "line": claim.line,
+                "context": claim.context,
+                "verdict": "CANNOT_DETERMINE",
+                "explanation": "Could not read reference",
+            }
+            return
 
-                logger.debug(f"Reference: {ref_path.name}")
-                logger.info("Sending to Claude CLI...")
-                project_dir = config.project_dir if config else None
-                verdict = verify_claim_claude(claim, ref_path, project_dir=project_dir)
-        else:
-            # vLLM: the slot wraps each individual LLM call inside
-            # verify_claim_vllm, so the controller's dynamic cap bounds
-            # the actual vLLM request volume regardless of how many
-            # claims and ladder fan-outs run in parallel.
-            sections = ref_sections[claim.key]
-            if not sections:
-                results[idx] = {
-                    "key": claim.key,
-                    "line": claim.line,
-                    "context": claim.context,
-                    "verdict": "CANNOT_DETERMINE",
-                    "explanation": "Could not read reference",
-                }
-                return
-
-            logger.debug(f"Reference: {ref_path.name} ({len(sections)} sections)")
-            verdict = await verify_claim_vllm(
-                claim,
-                sections,
-                config=config,
-                model_name=vllm_model,
-                references_dir=references_dir,
-                client=vllm_client,
-                slot=_slot,
-            )
+        logger.debug(f"Reference: {ref_path.name} ({len(sections)} sections)")
+        verdict = await verify_claim_vllm(
+            claim,
+            sections,
+            config=config,
+            model_name=vllm_model,
+            references_dir=references_dir,
+            client=vllm_client,
+            slot=_slot,
+        )
 
         if verdict:
             verdict["key"] = claim.key
@@ -1714,6 +1735,8 @@ async def run_claim_verification(
             verdict["backend"] = backend
             verdict["model"] = model_id
             verdict["ref_type"] = ref_type
+            verdict["ref_src_hash"] = ref_src_hashes.get(claim.key, "")
+            verdict["ref_parse_hash"] = ref_parse_hashes.get(claim.key, "")
             if ref_type == "web_page" and verdict.get("verdict") == "NOT_SUPPORTED":
                 verdict["verdict"] = "CANNOT_DETERMINE"
                 verdict["explanation"] = (
@@ -1744,23 +1767,18 @@ async def run_claim_verification(
             label="claim-verify",
             params=_ctrl_params,
         ) as _slot:
-            if backend == "claude":
-                await asyncio.gather(
-                    *[_verify_one(idx, c, None) for idx, c in to_verify]
-                )
-            else:
-                # Shared vLLM client for all claim verifications — avoids
-                # creating and tearing down a connection per claim.
-                from openai import AsyncOpenAI
+            # Shared vLLM client for all claim verifications — avoids
+            # creating and tearing down a connection per claim.
+            from openai import AsyncOpenAI
 
-                async with AsyncOpenAI(
-                    base_url=config.llm_endpoint,
-                    api_key="dummy",
-                    timeout=config.llm_timeout,
-                ) as vllm_client:
-                    await asyncio.gather(
-                        *[_verify_one(idx, c, vllm_client) for idx, c in to_verify]
-                    )
+            async with AsyncOpenAI(
+                base_url=config.llm_endpoint,
+                api_key="dummy",
+                timeout=config.llm_timeout,
+            ) as vllm_client:
+                await asyncio.gather(
+                    *[_verify_one(idx, c, vllm_client) for idx, c in to_verify]
+                )
 
     # Flatten — any None slots are claims that fell through (shouldn't happen)
     verified_results = [r for r in results if r is not None]

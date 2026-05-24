@@ -98,7 +98,6 @@ async def _stage_claims(
         references_dir,
         config=config,
         bib_path=bib_path,
-        backend="vllm",
         model=config.llm_model or "",
         rerun=rerun,
     )

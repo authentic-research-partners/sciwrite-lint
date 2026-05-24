@@ -11,7 +11,7 @@ _SELECT_FULL = (
     "SELECT id, ref_key, claim_text, line, context, verdict, confidence, "
     "relevant_quote, explanation, backend, model, ref_type, cite_purpose, "
     "skip_reason, dismissed, reviewer_comment, dismissed_date, "
-    "resolved_at, evidence_locator "
+    "resolved_at, evidence_locator, ref_src_hash, ref_parse_hash "
     "FROM claim_results"
 )
 
@@ -35,6 +35,8 @@ def _row_to_claim_dict(row: tuple[Any, ...]) -> dict[str, Any]:
         "skip_reason": row[13],
         "resolved_at": row[17],
         "evidence_locator": row[18],
+        "ref_src_hash": row[19],
+        "ref_parse_hash": row[20],
     }
     if row[14]:
         d["dismissed"] = True
@@ -58,8 +60,9 @@ def save_claim_results(
                (ref_key, claim_text, line, context, verdict, confidence,
                 relevant_quote, explanation, backend, model, ref_type,
                 cite_purpose, skip_reason, dismissed, reviewer_comment,
-                dismissed_date, resolved_at, evidence_locator)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                dismissed_date, resolved_at, evidence_locator, ref_src_hash,
+                ref_parse_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 r.get("key", ""),
@@ -80,6 +83,8 @@ def save_claim_results(
                 r.get("dismissed_date", ""),
                 r.get("resolved_at", ""),
                 r.get("evidence_locator", ""),
+                r.get("ref_src_hash", ""),
+                r.get("ref_parse_hash", ""),
             ),
         )
     conn.commit()

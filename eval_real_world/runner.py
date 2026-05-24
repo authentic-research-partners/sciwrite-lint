@@ -416,7 +416,7 @@ def run_inject(
                         input_path, pdf_cfg
                     )
                 except Exception as e:
-                    print(f"  GROBID parse failed for {p['arxiv_id']}: {e}")
+                    logger.warning("GROBID parse failed for {}: {}", p["arxiv_id"], e)
 
         asyncio.run(_parse_pdfs())
 
@@ -668,8 +668,12 @@ def run_full_pipeline(
                 try:
                     await build_pdf_context(input_path, paper_config)
                 except Exception as e:
-                    print(
-                        f"  [{i}/{len(papers)}] {arxiv_id}: FAILED (GROBID parse): {e}"
+                    logger.warning(
+                        "[{}/{}] {}: FAILED (GROBID parse): {}",
+                        i,
+                        len(papers),
+                        arxiv_id,
+                        e,
                     )
                     cached_results.append(
                         {
@@ -705,7 +709,7 @@ def run_full_pipeline(
                 run_papers_staged(staged_input, concurrency=concurrency)
             )
         except Exception as e:
-            print(f"Batch pipeline failed: {e}")
+            logger.warning("Batch pipeline failed: {}", e)
             staged_results = []
 
         # ------------------------------------------------------------------
@@ -783,7 +787,7 @@ def run_full_pipeline(
                             f"    Sonnet judged: {tp}/{len(verdicts)} TP ({judge_elapsed:.0f}s)"
                         )
                     except Exception as e:
-                        print(f"    Judging failed: {e}")
+                        logger.warning("Judging failed: {}", e)
 
                 # Load metadata for child integrity
                 refs_dir = paper_config.paper_workspace(arxiv_id).root
@@ -829,7 +833,7 @@ def run_full_pipeline(
                         with get_db(refs_dir) as conn:
                             update_pipeline_stage(conn, "contributions", "done")
                     except Exception as e:
-                        print(f"    Contribution axes failed: {e}")
+                        logger.warning("Contribution axes failed: {}", e)
                         try:
                             with get_db(refs_dir) as conn:
                                 update_pipeline_stage(

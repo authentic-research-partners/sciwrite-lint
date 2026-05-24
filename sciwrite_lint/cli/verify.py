@@ -335,6 +335,7 @@ def run_ref_health(args: argparse.Namespace) -> int:
     academic_unmatched: list[Path] = []
     web_matched: dict[str, Path] = {}
     web_unmatched: list[Path] = []
+    local_match_error: str | None = None
     try:
         if tex_file:
             from sciwrite_lint.config import load_config as _load_cfg
@@ -356,8 +357,13 @@ def run_ref_health(args: argparse.Namespace) -> int:
             _cfg.local_web_dir, titles, WEB_SUFFIXES
         )
     except Exception as e:
-        logger.debug(
-            f"ref-health: local source matching skipped ({type(e).__name__}: {e})"
+        # Record the failure so the report renders a visible notice instead
+        # of silently producing a ref-health output with the local-source
+        # section missing. Log at WARNING (not DEBUG) so the operator sees
+        # it even when running with the default log level.
+        local_match_error = f"{type(e).__name__}: {e}"
+        logger.warning(
+            "ref-health: local source matching skipped ({})", local_match_error
         )
 
     # --- Output ---
@@ -398,7 +404,9 @@ def run_ref_health(args: argparse.Namespace) -> int:
     if web_count:
         print(f"    ({web_count} web resources)")
 
-    # Local sources — academic (PDFs + MD summaries) + web (MD + MHTML)
+    # Local sources — academic (PDFs + MD summaries) + web (MD + MHTML).
+    # Matching failures are surfaced via logger.warning (above) so they
+    # appear in the operator's terminal regardless of report formatting.
     if academic_matched or academic_unmatched:
         print("\n  LOCAL ACADEMIC SOURCES")
         if academic_matched:
@@ -425,7 +433,7 @@ def run_ref_health(args: argparse.Namespace) -> int:
 
 
 def run_verify_claims(args: argparse.Namespace) -> int:
-    """Verify claims against cited sources using local LLM or Claude Opus."""
+    """Verify claims against cited sources using local vLLM."""
     from sciwrite_lint.cli._common import _load_config, _resolve_paper
 
     config = _load_config(args)
@@ -446,7 +454,6 @@ def run_verify_claims(args: argparse.Namespace) -> int:
             refs_dir,
             config=config,
             bib_path=pc.bib,
-            backend=args.backend,
             model=args.model,
             key_filter=args.key,
             limit=args.limit,

@@ -84,7 +84,7 @@ def run_parse(args: argparse.Namespace) -> int:
                         n = compute_and_store_embeddings(key, text, refs_dir)
                         print(f"    {key}: {n} chunks")
                     except Exception as e:
-                        print(f"    {key}: error — {e}")
+                        logger.warning("parse: embedding failed for {}: {}", key, e)
 
     print(f"\n  Summary: {cached} cached, {parsed} parsed, {failed} failed")
     if failed:

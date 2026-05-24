@@ -30,18 +30,15 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 OUTPUT = REPO_ROOT / "requirements-pinned.txt"
 
 HEADER = """\
-# Pinned versions of sciwrite-lint's RUNTIME top-level dependencies.
+# Pinned versions of sciwrite-lint's top-level runtime dependencies.
 #
 # Only packages declared in pyproject.toml ``[project] dependencies`` are
-# pinned here — the optional-dependencies extras (``dev``) are dev-only
-# tooling that doesn't belong in the user-facing pinned file. Transitive
-# dependencies are also not pinned; pip resolves them within each
-# top-level package's own constraints.
+# pinned here. Transitive dependencies are not pinned; pip resolves them
+# within each top-level package's own constraints.
 #
 # Purpose: reproduce the exact versions of packages that sciwrite-lint is
-# actively developed and tested against. Generated from the maintainer's
-# working `sciwrite-lint` conda env via `pip freeze`, filtered to declared
-# runtime deps.
+# actively developed and tested against. Generated via ``pip freeze`` from
+# the current install, filtered to declared runtime deps.
 #
 # Regenerate with:
 #   python scripts/regenerate_pinned_requirements.py

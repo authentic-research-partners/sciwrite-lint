@@ -14,8 +14,6 @@ import argparse
 import sys
 from pathlib import Path
 
-from loguru import logger
-
 from sciwrite_lint import __version__
 from sciwrite_lint.cli._common import (
     _classify_verify_issue as _classify_verify_issue,
@@ -40,6 +38,31 @@ _REPLACE_HELP = (
 # ---------------------------------------------------------------------------
 # Main parser
 # ---------------------------------------------------------------------------
+
+
+def _register_optional_extensions(
+    sub: argparse._SubParsersAction,  # type: ignore[type-arg]
+) -> None:
+    """Load CLI extensions discovered under ``sciwrite_lint``.
+
+    An underscore-prefixed subpackage is a CLI extension when its
+    ``__init__.py`` defines ``register_cli(sub)``. Discovery walks
+    ``sciwrite_lint.__path__`` via ``pkgutil``, so no extension package
+    names appear in this source — adding or removing one is a filesystem
+    change.
+    """
+    import importlib
+    import pkgutil
+
+    import sciwrite_lint as _pkg
+
+    for _finder, name, ispkg in pkgutil.iter_modules(_pkg.__path__):
+        if not ispkg or not name.startswith("_"):
+            continue
+        ext = importlib.import_module(f"{_pkg.__name__}.{name}")
+        register = getattr(ext, "register_cli", None)
+        if register is not None:
+            register(sub)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,47 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     p_checks = sub.add_parser("checks", help="List all registered checks")
     p_checks.set_defaults(func=run_checks_list)
 
-    # --- aicode-lint (optional — only registered when the WIP module is installed) ---
-    # ``sciwrite_lint.aicode_lint`` is excluded from the public release rsync
-    # while it stabilizes. Use ``importlib.util.find_spec`` to check whether
-    # the module is present rather than try/except ImportError (separately
-    # banned). Public installs (pip from PyPI) won't have it; dev installs
-    # do. Check the parent ``sciwrite_lint.aicode_lint`` first because
-    # ``find_spec`` raises ``ModuleNotFoundError`` on a missing intermediate
-    # path; once the parent is confirmed present, the child lookup is safe.
-    import importlib.util as _importlib_util
-
-    if _importlib_util.find_spec("sciwrite_lint.aicode_lint") is not None:
-        from sciwrite_lint.aicode_lint.cli import run_aicode_lint
-
-        p_aicode = sub.add_parser(
-            "aicode-lint",
-            help="LLM code review on Python sources via local vLLM (semantic antipatterns)",
-        )
-        p_aicode.add_argument(
-            "paths",
-            nargs="*",
-            help="Files, directories, or globs to scan (default: sciwrite_lint/**/*.py)",
-        )
-        p_aicode.add_argument(
-            "--rules",
-            default=None,
-            metavar="ID[,ID...]",
-            help="Run only the listed rule IDs (comma-separated). Default: all built-in rules.",
-        )
-        p_aicode.add_argument(
-            "--list-rules",
-            action="store_true",
-            help="Print the rule registry and exit.",
-        )
-        p_aicode.add_argument(
-            "--format",
-            choices=["terminal", "json"],
-            default=None,
-            help="Output format (default: terminal).",
-        )
-        p_aicode.add_argument("--config", help="Path to .sciwrite-lint.toml")
-        p_aicode.set_defaults(func=run_aicode_lint)
+    # Load optional underscore-prefixed CLI extension subpackages (if any).
+    _register_optional_extensions(sub)
 
     # --- init ---
     p_init = sub.add_parser(
@@ -270,12 +254,6 @@ def main(argv: list[str] | None = None) -> int:
     # --- verify-claims ---
     p_vc = sub.add_parser("verify-claims", help="Verify claims against cited sources")
     p_vc.add_argument("--paper", required=True, help="Paper to verify")
-    p_vc.add_argument(
-        "--backend",
-        choices=["vllm", "claude"],
-        default="vllm",
-        help="vllm (local LLM, fast) or claude (Claude CLI, deep)",
-    )
     p_vc.add_argument(
         "--model",
         choices=_TEXT_MODELS,
@@ -499,14 +477,32 @@ def main(argv: list[str] | None = None) -> int:
         p_vllm.print_help()
         return 0
 
-    # Set up file logging from config (stderr sink stays at INFO by default)
-    try:
-        config = load_config(
-            Path(args.config) if getattr(args, "config", None) else None
-        )
-    except Exception as e:
-        logger.debug("Config load failed, using defaults: {}", e)
+    # Set up file logging from config (stderr sink stays at INFO by default).
+    # ``load_config`` already returns ``LintConfig()`` when no config file is
+    # discovered; reaching the exception path means a file WAS found (or
+    # explicitly passed via --config) but failed to parse or validate.
+    # Surface that instead of silently substituting hardcoded defaults — a
+    # broken TOML otherwise produces results computed against the wrong
+    # workspace, paper list, or API keys.
+    #
+    # The ``init`` command is the one exception: its job is to scaffold a
+    # config, so it must run against a missing, broken, or sentinel TOML
+    # without aborting. Use ``LintConfig()`` for logging setup only and let
+    # init proceed to (over)write the file.
+    if args.command == "init":
         config = LintConfig()
+    else:
+        try:
+            config = load_config(
+                Path(args.config) if getattr(args, "config", None) else None
+            )
+        except Exception as e:
+            cfg_arg = getattr(args, "config", None)
+            cfg_hint = f" ({cfg_arg})" if cfg_arg else " (.sciwrite-lint.toml)"
+            raise SystemExit(
+                f"ERROR: failed to load configuration{cfg_hint}: {type(e).__name__}: {e}\n"
+                "  Fix the TOML or remove the file to use built-in defaults."
+            ) from e
     _setup_logging(config)
 
     return args.func(args)
