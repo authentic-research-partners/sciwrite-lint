@@ -2,7 +2,7 @@
 
 sciwrite-lint requires two local services and uses several external APIs. Start both before running the linter.
 
-**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM) and at least 32 GB system RAM. Tested on WSL2 with NVIDIA driver 546.01+; native Linux is likely to work but is untested and may require GPU memory allocation tuning (see [Embedding device](#embedding-device) below). Not tested on macOS.
+**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM) and at least 32 GB system RAM. Tested on WSL2 with NVIDIA driver 546.01+; native Linux uses the same GPU-sequencing code path with no extra configuration (see [Embedding device](#embedding-device) below), though it isn't actively tested. Not tested on macOS.
 
 ## Quick start
 

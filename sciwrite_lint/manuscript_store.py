@@ -450,12 +450,17 @@ def _build_context_latex(tex_path: Path, config: LintConfig) -> ManuscriptContex
         split_paragraphs,
         strip_comments,
         strip_non_prose_environments_preserve_lines,
+        unwrap_hypertarget,
     )
 
     # Read + strip_comments exactly once, then pass through to the
     # section/abstract extractors. They each used to re-read the file
     # and re-strip comments — three round trips for the same data.
-    text = strip_comments(tex_path.read_text(encoding="utf-8"))
+    # unwrap_hypertarget normalises pandoc's two-line ``\hypertarget{id}{%
+    # \section{...}}`` heading envelope to plain LaTeX; without it the
+    # section splitter strands the opening brace in the prior section and
+    # pandoc rejects the unbalanced paragraph below.
+    text = unwrap_hypertarget(strip_comments(tex_path.read_text(encoding="utf-8")))
 
     raw_sections = analyze_sections_with_text(tex_path, text=text)
     abstract_raw = get_abstract_text(tex_path, text=text)

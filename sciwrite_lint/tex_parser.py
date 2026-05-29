@@ -55,6 +55,80 @@ def strip_verbatim(text: str) -> str:
     return text
 
 
+def unwrap_hypertarget(text: str) -> str:
+    r"""Unwrap pandoc ``\hypertarget{id}{content}`` envelopes to ``content``.
+
+    Pandoc renders every markdown heading as a two-line anchor wrapper::
+
+        \hypertarget{the-id}{%
+        \section{Title}\label{the-id}}
+
+    The opening ``\hypertarget{the-id}{`` and its matching ``}`` sit on
+    different lines, straddling the heading. Section splitting keys off the
+    ``\section`` line and assigns the line above it to the *preceding*
+    section, which strands the unbalanced opening brace at the end of that
+    section's body. Balanced-brace consumers downstream (the pandoc prose
+    conversion in ``paragraphs_to_markdown``) then choke on the lone brace.
+
+    The anchor is a hyperlink target with no prose meaning, so we drop the
+    wrapper and keep its content, normalising pandoc output to standard
+    LaTeX. Only the wrapper tokens are removed; newlines inside the content
+    are preserved, so source line numbers are unchanged. Nested wrappers are
+    handled (scanning continues inside each content span).
+    """
+    marker = "\\hypertarget{"
+    n = len(text)
+    delete_spans: list[tuple[int, int]] = []
+    i = 0
+    while True:
+        idx = text.find(marker, i)
+        if idx == -1:
+            break
+        # Skip the first argument {id} via balanced-brace matching.
+        j = idx + len(marker)
+        depth = 1
+        while j < n and depth > 0:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            j += 1
+        # The two-arg form requires the content brace immediately after.
+        if j >= n or text[j] != "{":
+            i = j
+            continue
+        content_start = j + 1
+        depth = 1
+        k = content_start
+        while k < n and depth > 0:
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+            k += 1
+        if depth != 0:
+            break  # unbalanced input — leave the remainder untouched
+        # Remove "\hypertarget{id}{" and the matching content-closing "}".
+        delete_spans.append((idx, content_start))
+        delete_spans.append((k - 1, k))
+        # Resume inside the content so nested wrappers are also unwrapped.
+        i = content_start
+
+    if not delete_spans:
+        return text
+
+    # Nested wrappers append the outer closing brace before the inner
+    # spans, so sort before stitching the kept slices back together.
+    delete_spans.sort()
+    out: list[str] = []
+    prev = 0
+    for start, end in delete_spans:
+        out.append(text[prev:start])
+        prev = end
+    out.append(text[prev:])
+    return "".join(out)
+
+
 def extract_body(text: str) -> str:
     r"""Extract content between \begin{document} and \end{document}."""
     start = text.find("\\begin{document}")

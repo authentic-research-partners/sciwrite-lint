@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use sciwrite-lint in your research, please cite the paper below."
 type: software
 title: sciwrite-lint
-version: 0.5.0
-date-released: "2026-05-24"
+version: 0.5.1
+date-released: "2026-05-29"
 abstract: >
   A linter for scientific manuscripts. Verifies that cited references exist
   and have accurate metadata, downloads cited papers and checks whether they

@@ -92,11 +92,11 @@ Three models — a vision model (Qwen3-VL-2B default, or 8B FP8 via `--vision-ba
 - **14-source full-text cascade** — early exit on first successful download across arXiv, Semantic Scholar, OpenAlex, PubMed Central, Europe PMC, Unpaywall, bioRxiv, NBER, RePEc/IDEAS, HAL, ERIC, NASA ADS, OSF Preprints, CORE
 - **Live monitoring** *(advanced)* — `sciwrite-lint containers monitor` shows service health, VRAM usage, and KV cache utilization in a terminal dashboard
 
-Full pipeline on a 50-reference paper: ~30 minutes initial (dominated by downloads and claim verification), minutes on cached reruns. The pipeline automatically swaps vLLM containers to free GPU for embedding and vision stages (~50× faster than CPU) — same code path on WSL2 and native Linux.
+The pipeline automatically swaps vLLM containers to free GPU for embedding and vision stages (~50× faster than CPU).
 
 ## Install
 
-**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM). Tested on WSL2 with NVIDIA driver 546.01+. Native Linux is likely to work with GPU memory allocation tuning (see [docs/services.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/services.md#embedding-device)). Not tested on macOS.
+**Assumed setup:** A workstation with an NVIDIA GPU (16+ GB VRAM). Tested on WSL2 with NVIDIA driver 546.01+. Native Linux uses the same GPU-sequencing code path with no extra configuration (see [docs/services.md](https://github.com/authentic-research-partners/sciwrite-lint/blob/main/docs/services.md#embedding-device)), though it isn't actively tested. Not tested on macOS.
 
 Requires [uv](https://docs.astral.sh/uv/getting-started/installation/), a container runtime (podman or docker), CUDA drivers, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
@@ -141,6 +141,8 @@ sciwrite-lint containers start         # start GROBID + vLLM (needs GPU for vLLM
 sciwrite-lint containers monitor       # live dashboard: service health, VRAM, KV cache
 ```
 
+`init` detects `.tex` files and their `.bib` references and generates a `.sciwrite-lint.toml` config. Review to confirm the right files were detected.
+
 ### WSL2: disable CUDA Sysmem Fallback (recommended)
 
 By default Windows silently spills GPU overflow into system RAM via PCIe (30–100× slower than VRAM); you'll see this as a sudden throughput collapse during the heaviest pipeline stages with no error in the logs. Tell the NVIDIA driver to fail loudly instead:
@@ -150,8 +152,6 @@ By default Windows silently spills GPU overflow into system RAM via PCIe (30–1
 Driver 546.01+. After this, WSL2 behaves like native Linux on overflow (CUDA OOM error). The pipeline already sequences GPU consumers so OOM should not happen in normal use; the setting just prevents silent slowdowns when something does go wrong. No setting needed on native Linux — `cudaMalloc` is already loud there.
 
 ![Monitor dashboard](https://github.com/authentic-research-partners/sciwrite-lint/raw/main/docs/monitor.png)
-
-`init` detects `.tex` files and their `.bib` references and generates a `.sciwrite-lint.toml` config. Review to confirm the right files were detected.
 
 **Providing references manually — two drop folders.** sciwrite-lint reads two local directories before going to the open-access waterfall, kept separate because the folder itself signals how much to trust the source:
 
@@ -213,6 +213,22 @@ sciwrite-lint check --checks prose-quality paper.tex   # run only the listed che
 sciwrite-lint contributions --paper my_paper    # add contribution axes to SciLint Score
 sciwrite-lint contributions paper.pdf           # standalone file scoring
 ```
+
+**Supported inputs.**
+
+*The manuscript you check:*
+
+| Format | Notes |
+|---|---|
+| `.tex` | LaTeX — hand-written, or pandoc-generated (e.g. from Markdown); pandoc's heading anchors are unwrapped automatically. |
+| `.pdf` | Parsed via GROBID (container required). |
+
+*Cited sources you optionally supply (drop folders — see [Setup](#setup)):*
+
+| Folder | Accepts | Trust level |
+|---|---|---|
+| `local_pdfs/` | `.pdf`, `.md` (your own summaries) | academic |
+| `local_web/` | `.mhtml` / `.mht`, `.md` | web capture |
 
 `check` runs the full pipeline in one command: text checks → figure analysis → LLM consistency → reference verification via APIs → download and parse cited papers → claim verification → consistency checks on cited papers → bibliography verification → aggregate reliability scores → SciLint Score. An initial run on a 50-reference paper takes up to 30 minutes (dominated by downloads and claim verification); subsequent cached runs complete in minutes.
 

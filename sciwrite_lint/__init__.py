@@ -2,7 +2,7 @@
 
 from sciwrite_lint.exceptions import LLMConnectionError, SciWriteLintError
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from sciwrite_lint.oa import (
     DownloadResult,
