@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from sciwrite_lint import __version__
+from sciwrite_lint.api_keys import _API_KEY_SERVICES
 from sciwrite_lint.cli._common import (
     _classify_verify_issue as _classify_verify_issue,
     _load_config as _load_config,
@@ -182,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_config_set_key.add_argument(
         "service",
-        choices=["semantic-scholar", "ncbi", "core"],
+        choices=list(_API_KEY_SERVICES),
         help="Service name",
     )
     p_config_set_key.add_argument("key", help="API key value")
@@ -193,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_config_rm_key.add_argument(
         "service",
-        choices=["semantic-scholar", "ncbi", "core"],
+        choices=list(_API_KEY_SERVICES),
         help="Service to remove key for",
     )
     p_config_rm_key.set_defaults(func=run_config)
