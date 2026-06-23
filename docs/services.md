@@ -208,7 +208,7 @@ Container settings are optional in `.sciwrite-lint.toml`:
 ```toml
 [containers]
 grobid_memory = "8g"               # RAM limit (default: 8g)
-vllm_memory = "4g"                 # RAM limit, GPU VRAM is separate (default: 4g)
+vllm_memory = "16g"                # RAM limit, GPU VRAM is separate (default: 16g)
 # grobid_version = "0.8.2.1-crf"  # override GROBID version
 # vllm_version = "v0.18.0"        # override vLLM version
 ```

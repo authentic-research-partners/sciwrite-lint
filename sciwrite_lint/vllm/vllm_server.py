@@ -42,7 +42,10 @@ MODELS: dict[str, dict] = {
         "kind": "vision",
         "port": 5002,
         "max_model_len": 8192,
-        "memory": "8g",  # vision models need more host RAM for image preprocessing
+        # Host-RAM ceiling inherits ``config.vllm_memory`` (16g default),
+        # which already covers this 8B vision model plus image
+        # preprocessing. A per-profile override below the default would
+        # only *lower* the ceiling and risk an OOM-kill at load.
         # Match text vLLM (0.85) instead of the 0.9 default. At 0.9 on
         # a 20 GB card the engine reserves 18 GB, leaving only ~2 GB
         # headroom for prefill activations + PyTorch caching allocator

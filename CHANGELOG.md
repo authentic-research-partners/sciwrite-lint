@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **vLLM container no longer crash-loops on start.** The default host-RAM ceiling for the vLLM container (`[containers] vllm_memory`) was `4g`, too small to load the default 8B/12B FP8 text models: the engine-core child was OOM-killed mid weight-load (with podman's cgroup-v2 the mmap'd safetensors pages count against the limit), and the container's `unless-stopped` policy silently restarted it in a loop. `sciwrite-lint containers start` reported success while the API on port 5001 never came up. The default is now `16g`, which loads every bundled model with headroom; raise it further via `[containers] vllm_memory` if needed. The `qwen3-vl` profile's `8g` override (now below the default) was removed so vision inherits the same ceiling.
+
 ## [0.5.1] — 2026-05-29
 
 ### Fixed

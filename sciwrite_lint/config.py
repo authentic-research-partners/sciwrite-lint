@@ -488,7 +488,16 @@ class LintConfig(BaseModel):
     # for typical PDFs, more for book-length scans).
     grobid_max_concurrency: int = 4
     vllm_version: str = "v0.18.0"
-    vllm_memory: str = "4g"
+    # Host-RAM cgroup ceiling for the vLLM container (``podman/docker run
+    # --memory``). Must cover the engine-core process's peak host RSS
+    # while it loads weights: with podman cgroup-v2 the memory-mapped
+    # safetensors pages count against the limit, so loading the default
+    # 8B/12B FP8 text models needs well over the model's on-disk size.
+    # The previous 4g default OOM-killed the engine-core child mid-load,
+    # and the container's ``unless-stopped`` policy then crash-looped it.
+    # 16g loads every bundled model (8B/12B text, 8B vision) with
+    # headroom; operators can override via ``[containers] vllm_memory``.
+    vllm_memory: str = "16g"
 
     @property
     def grobid_image(self) -> str:
