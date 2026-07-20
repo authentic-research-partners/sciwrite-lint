@@ -141,6 +141,16 @@ def _find_bib_file(tex_path: Path, text: str) -> Path | None:
     return bib_path if bib_path.exists() else None
 
 
+def parse_bib_file(bib_path: Path, source_paper: str = "") -> list[Citation]:
+    """Parse a standalone ``.bib`` file into Citation objects.
+
+    Public entry for callers that already hold a resolved ``.bib`` path
+    (e.g. a markdown manuscript's sibling bibliography) and only need the
+    bibliography entries — no ``\\cite`` / ``\\bibitem`` discovery.
+    """
+    return _extract_from_bib(bib_path, source_paper)
+
+
 def _extract_from_bib(bib_path: Path, source_paper: str) -> list[Citation]:
     """Parse a .bib file into Citation objects using bibtexparser."""
     text = bib_path.read_text(encoding="utf-8")

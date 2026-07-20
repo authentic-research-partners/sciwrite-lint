@@ -25,14 +25,13 @@ async def build_pdf_context(
     """
     from sciwrite_lint.manuscript_store import (
         ManuscriptContext,
-        set_manuscript_context,
+        install_manuscript_context,
     )
     from sciwrite_lint.pdf.grobid import process_pdf
 
     grobid_result = await process_pdf(pdf_path)
     ctx = ManuscriptContext.from_grobid(pdf_path, grobid_result)
-    set_manuscript_context(pdf_path, ctx)
-    config.manuscript_context = ctx
+    install_manuscript_context(pdf_path, ctx, config)
 
 
 def citations_from_pdf_context(config: LintConfig) -> list[Citation]:
@@ -71,17 +70,26 @@ async def extract_citations_for_paper(
     config: LintConfig,
     bib_path: Path | None = None,
 ) -> list[Citation]:
-    """Extract citations from a paper, handling both .tex and .pdf inputs.
+    """Extract citations from a paper, handling .tex, .pdf, and markdown inputs.
 
-    For .tex files, uses extract_bibitems + check_local_sources.
-    For .pdf files, runs GROBID via build_pdf_context + citations_from_pdf_context.
+    For .tex, uses extract_bibitems. For .pdf, runs GROBID via
+    build_pdf_context + citations_from_pdf_context. For markdown, parses
+    the resolved bibliography (config / YAML ``bibliography:`` / sibling
+    ``.bib``). All paths then attach local sources.
     """
     from sciwrite_lint.references.citations import check_local_sources, extract_bibitems
 
-    if tex_path.suffix.lower() == ".pdf":
+    suffix = tex_path.suffix.lower()
+    if suffix == ".pdf":
         await build_pdf_context(tex_path, config)
         return citations_from_pdf_context(config)
 
-    citations = extract_bibitems(tex_path, "auto", bib_path=bib_path)
+    if suffix == ".md":
+        from sciwrite_lint.markdown_cites import analyze_markdown, parse_markdown_bib
+
+        analysis = analyze_markdown(tex_path.read_text(encoding="utf-8"))
+        citations = parse_markdown_bib(tex_path, analysis, bib_path)
+    else:
+        citations = extract_bibitems(tex_path, "auto", bib_path=bib_path)
     check_local_sources(citations, config.effective_references_dir())
     return citations

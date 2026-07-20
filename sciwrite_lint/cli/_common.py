@@ -16,6 +16,19 @@ from loguru import logger
 
 from sciwrite_lint.config import LintConfig, PaperConfig, load_config
 
+# Manuscript inputs the linter accepts. Anything else is rejected loudly
+# at the CLI boundary rather than mis-parsed (a non-.pdf path would
+# otherwise fall through to the LaTeX parser and silently degrade).
+MANUSCRIPT_SUFFIXES: frozenset[str] = frozenset({".tex", ".pdf", ".md"})
+
+
+def unsupported_manuscript_error(path: Path) -> str:
+    """Error message for a manuscript path whose suffix is unsupported."""
+    return (
+        f"Unsupported manuscript type: {path.suffix or '(no extension)'}. "
+        "Supported formats: .tex, .pdf, .md"
+    )
+
 
 def _load_config(args: argparse.Namespace) -> LintConfig:
     """Load config from --config flag or auto-discovery."""
@@ -29,7 +42,7 @@ def _load_config(args: argparse.Namespace) -> LintConfig:
         logger.error("No .sciwrite-lint.toml found.")
         detected = _detect_papers()
         if detected:
-            logger.error("  Detected .tex files:")
+            logger.error("  Detected manuscript files:")
             for p in detected:
                 bib = f" (bib: {p['bib']})" if p.get("bib") else ""
                 logger.error(f"    {p['file_path']}{bib}")
@@ -60,7 +73,7 @@ def _paper_names(config: LintConfig) -> list[str]:
 def _resolve_input_files(
     args: argparse.Namespace, config: LintConfig
 ) -> list[tuple[str, Path]]:
-    """Resolve which files to check (.tex or .pdf).
+    """Resolve which files to check (.tex, .pdf, or .md).
 
     Priority: positional file > --paper (from config) > all papers in config.
     Returns list of (name, path) pairs.
@@ -80,7 +93,9 @@ def _resolve_input_files(
         return [(pc.name, pc.file_path) for pc in config.papers]
 
     logger.error("No papers registered. Either:")
-    logger.error("  sciwrite-lint check <file.tex|file.pdf> — check a specific file")
+    logger.error(
+        "  sciwrite-lint check <file.tex|file.pdf|file.md> — check a specific file"
+    )
     logger.error(
         "  sciwrite-lint init                      — set up project with [[papers]]"
     )

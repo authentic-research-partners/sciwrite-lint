@@ -2,6 +2,8 @@
 
 User-facing commands:
     python -m evals eval-synthetic [--checks ...]
+    python -m evals eval-synth-corpus [--out DIR] [--llm]
+    python -m evals synth-corpus --out DIR [--format tex,md,pdf]
     python -m evals eval-scilint-score [--axes ...]
     python -m evals eval-calibration [--papers ...]
     python -m evals eval-real-world corpus|fpr|inject|report [...]
@@ -43,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     from evals.cli_eval import (
         run_eval_calibration,
         run_eval_scilint_score,
+        run_eval_synth_corpus,
         run_eval_synthetic,
         run_rw_corpus,
         run_rw_fetch,
@@ -50,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         run_rw_inject,
         run_rw_pipeline,
         run_rw_report,
+        run_synth_corpus,
     )
 
     parser = argparse.ArgumentParser(
@@ -68,6 +72,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_synth.add_argument("--output-dir", help="Output directory (default: results)")
     p_synth.set_defaults(func=run_eval_synthetic)
+
+    # --- eval-synth-corpus ---
+    p_corpus = sub.add_parser(
+        "eval-synth-corpus",
+        help="Render synthetic scenarios to PDF, report GROBID coverage "
+        "(needs pdflatex + GROBID)",
+    )
+    p_corpus.add_argument(
+        "--out",
+        help="Keep the materialized corpus in this directory "
+        "(default: a temporary directory, discarded)",
+    )
+    p_corpus.add_argument(
+        "--llm",
+        action="store_true",
+        help="LLM mode: render tex/md and report LLM-check rule recall "
+        "(needs text vLLM) instead of PDF/GROBID coverage",
+    )
+    p_corpus.set_defaults(func=run_eval_synth_corpus)
+
+    # --- synth-corpus (materialize only) ---
+    p_mat = sub.add_parser(
+        "synth-corpus",
+        help="Materialize the synthetic manuscript corpus to a directory "
+        "(tex/md need no services; pdf needs pdflatex)",
+    )
+    p_mat.add_argument(
+        "--out", required=True, help="Directory to write the corpus into"
+    )
+    p_mat.add_argument(
+        "--format",
+        default="tex,md",
+        help="Comma-separated formats to render: tex,md,pdf (default: tex,md)",
+    )
+    p_mat.set_defaults(func=run_synth_corpus)
 
     # --- eval-scilint-score ---
     p_score = sub.add_parser(

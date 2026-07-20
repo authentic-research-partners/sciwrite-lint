@@ -31,13 +31,23 @@ def _resolve_manuscript_context(
     """Resolve a ManuscriptContext for the current run.
 
     Returns ``(ctx, system_issue_or_None)``. ``ctx`` is ``None`` when
-    the run has nothing to embed (no PDF context preset, no .tex on
-    disk). The system-issue finding is non-``None`` only when LaTeX
-    parsing raised.
+    the run has nothing to embed (no preset context, no .tex on disk).
+    The system-issue finding is non-``None`` only when LaTeX parsing
+    raised.
+
+    PDF and markdown inputs both seed ``config.manuscript_context`` at
+    build time (``build_pdf_context`` / ``build_markdown_context`` →
+    ``install_manuscript_context``); LaTeX is built on demand from the
+    ``.tex`` file here. Markdown must be resolved alongside PDF —
+    otherwise ``persist_manuscript_citations`` finds no context for a
+    ``.md`` manuscript, ``manuscript_citations`` is never populated, no
+    claim query vectors are pre-computed, and every cited source large
+    enough to need retrieval (> ``_SMALL_DOC_THRESHOLD`` sections) falls
+    through to CANNOT_DETERMINE at claim verification.
     """
     from sciwrite_lint.manuscript_store import ManuscriptContext
 
-    if config.is_pdf and config.manuscript_context:
+    if (config.is_pdf or config.is_markdown) and config.manuscript_context:
         return config.manuscript_context, None
     if tex_path and tex_path.suffix.lower() == ".tex":
         try:
@@ -165,6 +175,37 @@ def ensure_claim_query_vectors(
         )
 
 
+def collect_local_md_embed_keys(
+    references_dir: Path,
+    model_name: str,
+) -> list[str]:
+    """Keys whose cited source is a local markdown file needing embedding.
+
+    Covers every local markdown text source the ingest layer produces:
+    OA web summaries (``{key}_web.md``), local web-page drops
+    (``{key}_local_web.md``), and academic ``.md`` summaries
+    (``{key}_local.md``). The ``.md`` extension is the discriminator —
+    PDF references embed via their GROBID ``parsed/{key}.md`` output and are
+    collected separately, so they are intentionally excluded here.
+
+    Keys already carrying current embeddings, or whose file is absent, are
+    skipped — idempotent on re-runs without ``--fresh``.
+    """
+    from sciwrite_lint.references.embedding_store import has_embeddings
+    from sciwrite_lint.references.metadata import load_all_metadata
+
+    keys: list[str] = []
+    for key, meta in load_all_metadata(references_dir).items():
+        local_file = meta.access.get("local_file") or ""
+        if not local_file.endswith(".md"):
+            continue
+        if has_embeddings(key, references_dir, model_name=model_name):
+            continue
+        if (references_dir / local_file).exists():
+            keys.append(key)
+    return keys
+
+
 def _run_embeddings_for_paper(
     parse_results: dict[str, str],
     references_dir: Path,
@@ -200,7 +241,6 @@ def _run_embeddings_for_paper(
     embeddings found" crash later during claim verification.
     """
     from sciwrite_lint.references.embedding_store import has_embeddings
-    from sciwrite_lint.references.metadata import load_all_metadata
     from sciwrite_lint.references.reference_store import _get_embedding_config
     from sciwrite_lint.references.workspace_db import (
         count_manuscript_citations,
@@ -225,18 +265,10 @@ def _run_embeddings_for_paper(
         ):
             parsed_keys.append(key)
 
-    # Collect web-summary keys that need embedding.
-    all_meta = load_all_metadata(references_dir)
-    web_keys = []
-    for key, meta in all_meta.items():
-        local_file = meta.access.get("local_file") or ""
-        if not local_file.endswith("_web.md"):
-            continue
-        if has_embeddings(key, references_dir, model_name=model_name):
-            continue
-        web_path = references_dir / local_file
-        if web_path.exists():
-            web_keys.append(key)
+    # Collect local markdown sources (web captures + academic .md summaries)
+    # that need embedding. Shared with the staged pipeline so both paths
+    # embed the same set.
+    local_md_keys = collect_local_md_embed_keys(references_dir, model_name)
 
     # Manuscript itself: write parsed/_manuscript_{stem}.md and add to
     # the keys list so the subprocess chunks + embeds it the same way it
@@ -247,7 +279,7 @@ def _run_embeddings_for_paper(
     )
     manuscript_keys = [ms_key] if ms_key else []
 
-    all_keys = parsed_keys + web_keys + manuscript_keys
+    all_keys = parsed_keys + local_md_keys + manuscript_keys
 
     if not all_keys and not n_citations:
         return build_finding
@@ -279,12 +311,12 @@ def _run_embeddings_for_paper(
             kind="parsed",
             subprocess_diag=diag,
         )
-    if web_keys:
+    if local_md_keys:
         _verify_embeddings_or_raise(
-            web_keys,
+            local_md_keys,
             references_dir,
             model_name,
-            kind="web summary",
+            kind="local markdown source",
             subprocess_diag=diag,
         )
     if manuscript_keys:

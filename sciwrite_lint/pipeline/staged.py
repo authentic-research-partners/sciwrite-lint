@@ -33,10 +33,10 @@ from sciwrite_lint.references.workspace_db import (
 
 from sciwrite_lint.pipeline.checks import run_llm_checks_batched, run_text_checks
 from sciwrite_lint.pipeline.claims import _stage_bib_verify, _stage_claims
+from sciwrite_lint.pipeline.citation_setup import extract_pipeline_citations
 from sciwrite_lint.pipeline.embeddings import persist_manuscript_citations
 from sciwrite_lint.pipeline.fetch import _stage_fetch
 from sciwrite_lint.pipeline.orchestration import _backup_workspace
-from sciwrite_lint.pipeline.pdf_context import citations_from_pdf_context
 from sciwrite_lint.pipeline.ref_internal import _stage_ref_internal
 from sciwrite_lint.pipeline.runners import (
     _batch_cited_vision,
@@ -189,46 +189,9 @@ async def run_papers_staged(
         # Now do the actual setup work (save source, extract citations)
         ws.save_source(tex_path, bib_path=pc.bib)
 
-        if config.is_pdf:
-            citations = citations_from_pdf_context(config)
-        else:
-            from sciwrite_lint.footnote_urls import ingest_footnote_sources
-            from sciwrite_lint.references.citations import (
-                check_local_sources,
-                extract_bibitems,
-                filter_to_cited,
-            )
-
-            citations = extract_bibitems(tex_path, "auto", bib_path=pc.bib)
-            n_bib = len(citations)
-            aux_path = tex_path.with_suffix(".aux")
-            citations = filter_to_cited(
-                citations,
-                tex_path,
-                aux_path=aux_path if aux_path.exists() else None,
-            )
-            if n_bib > len(citations):
-                logger.info(
-                    "[{}] {}/{} bib entries are cited — "
-                    "skipping verify+fetch for {} uncited",
-                    paper_name,
-                    len(citations),
-                    n_bib,
-                    n_bib - len(citations),
-                )
-            check_local_sources(citations, refs_dir)
-
-            # Footnote-URL sources: each \footnote{\url{URL}} whose URL
-            # appears in a local_web_dir capture's Source: header becomes
-            # a synthetic T1 Citation, pre-registered to short-circuit
-            # verify + fetch.
-            footnote_citations = ingest_footnote_sources(
-                tex_path,
-                config.effective_local_web_dir(paper_name),
-                refs_dir,
-                source_paper=tex_path.stem,
-            )
-            citations.extend(footnote_citations)
+        citations = extract_pipeline_citations(
+            paper_name, tex_path, pc, config, refs_dir
+        )
 
         logger.info("[{}] {} citations extracted", paper_name, len(citations))
         run.citations = len(citations)
@@ -422,8 +385,8 @@ async def run_papers_staged(
         # Stage 4b: BATCH EMBEDDING — one subprocess, all papers
         # ------------------------------------------------------------------
         logger.info("=== Stage 4b: Batch embedding ({} papers) ===", len(ctxs))
+        from sciwrite_lint.pipeline.embeddings import collect_local_md_embed_keys
         from sciwrite_lint.references.embedding_store import has_embeddings
-        from sciwrite_lint.references.metadata import load_all_metadata
         from sciwrite_lint.references.reference_store import _get_embedding_config
 
         model_name, _, _ = _get_embedding_config()
@@ -441,17 +404,9 @@ async def run_papers_staged(
                     if not has_embeddings(key, ctx.refs_dir, model_name=model_name):
                         keys_to_embed.append(key)
 
-            # Web summary keys
-            all_meta = load_all_metadata(ctx.refs_dir)
-            for key, meta in all_meta.items():
-                local_file = meta.access.get("local_file") or ""
-                if not local_file.endswith("_web.md"):
-                    continue
-                if has_embeddings(key, ctx.refs_dir, model_name=model_name):
-                    continue
-                web_path = ctx.refs_dir / local_file
-                if web_path.exists():
-                    keys_to_embed.append(key)
+            # Local markdown sources (web captures + academic .md summaries).
+            # Shared with the inline pipeline so both embed the same set.
+            keys_to_embed.extend(collect_local_md_embed_keys(ctx.refs_dir, model_name))
 
             # Persist manuscript citations so the embedding subprocess can
             # read claim contexts from each paper's workspace.db (instead of
@@ -711,6 +666,14 @@ async def run_papers_staged(
                 logger.error("[{}] Unreliable failed: {}", ctx.name, e)
                 ctx.error = str(e)
                 continue
+
+            # Zero references → the reference/citation/claim stages had
+            # nothing to verify; surface it loudly rather than returning a
+            # clean-looking report.
+            if not ctx.citations:
+                from sciwrite_lint.checks._diagnostics import no_references_finding
+
+                ctx.check_findings.append(no_references_finding())
 
             # Merge all findings for this paper
             ctx.check_findings.extend(ctx.verify_findings)

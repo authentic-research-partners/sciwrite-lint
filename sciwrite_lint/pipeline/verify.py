@@ -124,7 +124,22 @@ async def _stage_verify(
     Each phase only processes citations still unresolved after prior phases.
     Results are validated by ``_id_result_matches`` (composite title/author/year
     score ≥ 0.40) to reject API results that don't match the bib entry.
+
+    Skipped entirely (no external API calls) when the run has no enabled
+    ``reference-db`` check — its findings would be discarded, and a
+    local-only run (e.g. ``--checks claim-support``) must not touch the
+    reference-database APIs. This keeps execution consistent with the
+    preflight OpenAlex probe, which is scoped the same way.
     """
+    from sciwrite_lint.checks.registry import run_uses_reference_db
+
+    if not run_uses_reference_db(config):
+        logger.info(
+            "No reference-database check enabled — skipping reference "
+            "verification (no external API calls)"
+        )
+        return []
+
     from sciwrite_lint.api import (
         _id_result_matches,
         batch_openalex,

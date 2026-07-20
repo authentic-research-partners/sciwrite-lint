@@ -55,6 +55,29 @@ SyntheticCase(
 
 For realistic cases, use `build_realistic_paper()` from `evals/synthetic_templates.py` — it generates a full CS paper where you override individual sections to inject errors.
 
+## Synthetic corpus (cross-format)
+
+A small set of self-contained manuscripts, each demonstrating one issue the linter detects — a dangling citation, an unreferenced figure, a dangling cross-reference, a prose error, a percentage set that doesn't add up, a footnote URL, an uncited bibliography entry, numeric `[1]` citations, a multi-file bibliography — plus clean controls. Every scenario can be rendered to LaTeX, Markdown, and PDF from a single abstract spec, so the *same* content can be checked through each front-end (the LaTeX parser, pandoc, and GROBID). Nothing is committed; the corpus is generated on demand.
+
+Materialize it to inspect or lint yourself (no services needed for `tex`/`md`; `pdf` needs `pdflatex`):
+
+```bash
+python -m evals synth-corpus --out corpus                  # tex + md
+python -m evals synth-corpus --out corpus --format tex,md,pdf
+sciwrite-lint check corpus/dangling_cite/dangling_cite.md  # lint one
+```
+
+It writes a `MANIFEST.md` listing every scenario and the checks it is built to trigger.
+
+Two coverage evals run the checks on the rendered corpus and report what fires per format:
+
+```bash
+python -m evals eval-synth-corpus            # deterministic checks via PDF round-trip (needs pdflatex + GROBID)
+python -m evals eval-synth-corpus --llm      # LLM-backed checks on tex/md (needs text vLLM)
+```
+
+PDF coverage is reported at the rule level: rendering to PDF loses the source's symbolic citation keys and figure labels, so a cite to a missing entry (which renders as `[?]`) cannot be recovered — that is reported as a known gap rather than a regression. LLM coverage is recall-level, since LLM-backed checks are non-deterministic; each format's output is checked for the expected issue, so the same prose should surface the same checks whether authored as LaTeX or Markdown.
+
 ## Real-world eval
 
 Downloads real papers from arXiv (LaTeX) and bioRxiv (PDF), exercises the full stack against messy real data and live APIs. This is how integration bugs are found — synthetic eval and unit tests cannot catch them.

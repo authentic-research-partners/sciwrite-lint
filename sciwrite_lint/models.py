@@ -25,6 +25,13 @@ class CheckMeta(BaseModel):
     severity: Literal["error", "warning", "info"]
     category: Literal["manuscript", "reference-db", "local-llm"]
     description: str
+    # Whether the check can run on a markdown manuscript. Prose/structure
+    # checks consume the source-agnostic ManuscriptContext interface and
+    # default to True. Checks that parse LaTeX citation/cross-reference/
+    # figure syntax (or need a populated bibliography) set this False;
+    # the text-check runner skips them for markdown input and surfaces a
+    # single ``source-unsupported`` system issue so the gap is explicit.
+    supports_markdown: bool = True
 
 
 class CheckResult(BaseModel):

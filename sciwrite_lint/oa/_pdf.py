@@ -66,6 +66,7 @@ async def download_pdf(
     year: int | None = None,
     entry_type: str = "article",
     email: str,
+    require_title_match: bool = True,
     config: FetchConfig | None = None,
 ) -> DownloadResult:
     """Acquire an OA PDF for the given identifiers and write to ``out_path``.
@@ -87,6 +88,20 @@ async def download_pdf(
         named authors.
     :param email: Required for Unpaywall and as the ``mailto:`` hint in the
         polite User-Agent on title-search requests.
+    :param require_title_match: When ``True`` (default), every fetched PDF
+        is run through
+        :func:`sciwrite_lint.fulltext._validation.validate_pdf_match` — the
+        multi-signal content gate (header-title similarity, first-page
+        surname / DOI / year, template-record rejection). When ``False``,
+        that gate is skipped and any well-formed PDF (``%PDF`` magic plus a
+        non-trivial byte size) is accepted from the first source that yields
+        one. Pass ``False`` when the identifier already comes from a trusted
+        match (e.g. a resolved search hit), so re-validating the title is
+        redundant. The content gate is the only consumer of GROBID in this
+        path; with ``require_title_match=False`` no GROBID is needed and
+        :attr:`DownloadResult.title_check_score` is left ``None``. The
+        pre-download ranking of title-search candidates is unaffected — it
+        runs locally regardless.
     :param config: Optional :class:`FetchConfig`. Supplies timeouts,
         user-agent, rate-limit intervals, and optional ``nasa_ads_key``.
         When ``nasa_ads_key`` is None, NASA ADS is skipped silently. Other
@@ -120,6 +135,10 @@ async def download_pdf(
         year=year,
         entry_type=entry_type or "article",
     )
+    # The content-match gate is opt-out. When disabled we pass no evidence to
+    # the download helpers, so they accept any well-formed PDF without invoking
+    # GROBID. `evidence` is still built and used for local candidate ranking.
+    download_evidence = evidence if require_title_match else None
     failed_sources: list[str] = []
 
     async def _try_direct(url: str, source: str) -> AcquisitionResult:
@@ -130,7 +149,7 @@ async def download_pdf(
             out_path.parent,
             source,
             timeout=cfg.timeout,
-            evidence=evidence,
+            evidence=download_evidence,
         )
 
     async def _try_smart(url: str, source: str) -> AcquisitionResult:
@@ -141,15 +160,20 @@ async def download_pdf(
             url,
             out_path.stem,
             out_path.parent,
-            evidence=evidence,
+            evidence=download_evidence,
             user_agent=cfg.user_agent,
         )
         if dl.get("found"):
+            # ``match_score`` is only meaningful when the validator ran; when
+            # the gate was skipped (download_evidence is None) there is no
+            # title comparison to report.
+            score = dl.get("match_score") if download_evidence is not None else None
             return AcquisitionResult(
                 found=True,
                 source=source,
                 local_path=out_path.name,
                 url=url,
+                title_sim=float(score) if isinstance(score, (int, float)) else None,
             )
         return AcquisitionResult(
             found=False,
@@ -400,5 +424,6 @@ def _ok(
         source=result.source or None,
         out_path=out_path,
         url_used=result.url,
+        title_check_score=result.title_sim,
         failed_sources=failed_sources,
     )

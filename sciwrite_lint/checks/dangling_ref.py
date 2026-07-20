@@ -2,6 +2,8 @@ r"""Check: dangling-ref — cross-reference has no matching target.
 
 For LaTeX: \ref{X} has no matching \label{X}.
 For PDF: rendered "??" patterns in section text (broken references).
+For markdown: pandoc-crossref ``@fig:`` / ``@sec:`` / ``@tbl:`` reference
+with no matching labelled element.
 """
 
 from __future__ import annotations
@@ -102,6 +104,32 @@ def _check_pdf(ctx: object) -> list[Finding]:
     return findings
 
 
+def _check_markdown(md_path: Path) -> list[Finding]:
+    """Flag pandoc-crossref references with no matching labelled element.
+
+    ``@fig:x`` / ``@sec:x`` / ``@tbl:x`` whose target is not defined by any
+    block id in the document is dangling.
+    """
+    from sciwrite_lint.markdown_cites import analyze_markdown
+
+    analysis = analyze_markdown(md_path.read_text(encoding="utf-8"))
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    for xref in analysis.crossrefs:
+        if xref.target not in analysis.labels and xref.target not in seen:
+            seen.add(xref.target)
+            findings.append(
+                Finding(
+                    level="error",
+                    rule_id="dangling-ref",
+                    message=f"Cross-reference '@{xref.target}' has no matching label",
+                    file=md_path.name,
+                    context=xref.target,
+                )
+            )
+    return findings
+
+
 @check(
     id="dangling-ref",
     category="manuscript",
@@ -109,7 +137,9 @@ def _check_pdf(ctx: object) -> list[Finding]:
     description="Cross-reference has no matching target.",
 )
 def check_dangling_ref(tex_path: Path, config: LintConfig) -> list[Finding]:
-    """Check dangling references. Supports both LaTeX and PDF input."""
+    """Check dangling references. Supports LaTeX, PDF, and markdown input."""
+    if config.is_markdown:
+        return _check_markdown(tex_path)
     if config.is_pdf:
         return _check_pdf(config.manuscript_context)
 

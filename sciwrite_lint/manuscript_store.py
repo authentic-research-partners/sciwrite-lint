@@ -230,6 +230,10 @@ class ManuscriptContext(BaseModel):
     bibliography_raw: str = ""  # raw LaTeX (empty for PDF)
     inline_citations: list[InlineCitation] = Field(default_factory=list)
     parsed_references: list[ParsedReference] = Field(default_factory=list)
+    # Figure numbers defined in the manuscript, used by unreferenced-figure.
+    # PDF populates this from GROBID figure ``<label>`` values (LaTeX and
+    # markdown have their own label sources and leave it empty).
+    figure_labels: list[str] = Field(default_factory=list)
     embeddings_available: bool = False
     build_warnings: list[str] = Field(default_factory=list)
 
@@ -299,6 +303,20 @@ _cache: dict[str, ManuscriptContext] = {}
 def set_manuscript_context(path: Path, ctx: ManuscriptContext) -> None:
     """Pre-set a ManuscriptContext in the cache (used for PDF input)."""
     _cache[str(path.resolve())] = ctx
+
+
+def install_manuscript_context(
+    path: Path, ctx: ManuscriptContext, config: LintConfig
+) -> None:
+    """Seed a prebuilt context into the cache and attach it to config.
+
+    The shared tail of the PDF and markdown context builders. Seeding the
+    cache makes ``get_or_create_manuscript_context`` return this context
+    (a hit) instead of building one from LaTeX; attaching it to config
+    lets checks detect the source type via ``is_pdf`` / ``is_markdown``.
+    """
+    set_manuscript_context(path, ctx)
+    config.manuscript_context = ctx
 
 
 def get_or_create_manuscript_context(
@@ -652,15 +670,44 @@ def _build_context_grobid(pdf_path: Path, grobid_result: Any) -> ManuscriptConte
         abstract_raw=result.abstract,
         inline_citations=inline_citations,
         parsed_references=parsed_references,
+        figure_labels=_extract_tei_figure_labels(result.raw_tei),
     )
 
 
-def _build_context_markdown(md_path: Path, ref_key: str) -> ManuscriptContext:
-    """Build ManuscriptContext from stored GROBID markdown.
+def _extract_tei_figure_labels(raw_tei: str) -> list[str]:
+    """Return the numbers of figures GROBID detected with a ``<label>``.
+
+    Only real figures carry a ``<label>`` (e.g. ``<label>1</label>``) and a
+    ``<head>Figure 1.</head>``; GROBID's false positives (body fragments
+    mis-classified as figures) have neither, so requiring a label filters
+    them out. Tables (``<figure type="table">``) are excluded — this is the
+    figure check. Returns numbers like ``["1", "2", ...]``.
+    """
+    if not raw_tei:
+        return []
+    labels: list[str] = []
+    for fig in re.findall(r"<figure\b.*?</figure>", raw_tei, re.DOTALL):
+        if 'type="table"' in fig:
+            continue
+        match = re.search(r"<label>\s*([^<]+?)\s*</label>", fig)
+        if match:
+            labels.append(match.group(1).strip())
+    return labels
+
+
+def _build_context_markdown(md_path: Path, ref_key: str = "") -> ManuscriptContext:
+    """Build ManuscriptContext from markdown.
 
     Splits by markdown headings (``# Title`` / ``## Title``), separates
     abstract and bibliography sections, builds ManuscriptSection objects.
     Text is already clean (no LaTeX markup).
+
+    Serves two callers: cited papers at depth 1 (GROBID-produced
+    markdown, passed with a ``ref_key``) and the top-level manuscript
+    (an authored ``.md``, ``ref_key`` left empty). Both populate the
+    prose/structure interface — sections, abstract, paragraphs.
+    Inline-citation and bibliography extraction are not performed here;
+    citation/reference checks read those from elsewhere.
     """
     text = md_path.read_text(encoding="utf-8")
 

@@ -156,6 +156,13 @@ def main(argv: list[str] | None = None) -> int:
         "init", help="Initialize project: config + references directory"
     )
     p_init.add_argument(
+        "file",
+        nargs="?",
+        help="Manuscript to register (.tex/.pdf/.md). Omit to auto-detect "
+        "(a single .tex / .md+.bib); name one explicitly when there are "
+        "several or for a PDF.",
+    )
+    p_init.add_argument(
         "--force", action="store_true", help="Overwrite existing config"
     )
     p_init.set_defaults(func=run_init)
@@ -175,6 +182,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_config_email.add_argument("email", help="Your email address")
     p_config_email.add_argument("--config", help="Path to .sciwrite-lint.toml")
+    p_config_email.add_argument(
+        "--global",
+        dest="set_global",
+        action="store_true",
+        help="Store as the machine-wide default (~/.sciwrite-lint/) instead of "
+        "this project's .sciwrite-lint.toml",
+    )
     p_config_email.set_defaults(func=run_config)
 
     p_config_set_key = config_sub.add_parser(

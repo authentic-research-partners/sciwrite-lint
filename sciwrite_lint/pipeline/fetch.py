@@ -76,52 +76,46 @@ def _is_fresh_negative(meta_access: dict, ttl_days: int) -> bool:
     return age_seconds < ttl_days * 86400
 
 
-async def _stage_fetch(
+def ingest_local_drop_sources(
     citations: list[Citation],
     config: LintConfig,
     references_dir: Path,
-    embed_inline: bool = True,
-) -> int:
-    """Download PDFs for citations missing local files. Returns count fetched.
+) -> dict[str, Any]:
+    """Match and (re-)ingest drop-folder local sources for *citations*.
 
-    Args:
-        embed_inline: If True (default), eagerly embed parsed PDFs in-process.
-            Set to False in batch-staged mode to avoid loading the embedding
-            model's CUDA context in the parent process — the batch embedding
-            subprocess handles all embeddings instead.
+    Runs for EVERY citation (regardless of tier) so a refreshed source on
+    an already-T1 ref is picked up: ``local_file_src_hash`` in meta.access
+    is compared against the current source SHA-256, and only when they
+    differ (or no prior hash exists) do we re-copy / re-convert and
+    recompute the tier. Unchanged sources cost a single hash read.
+
+    A citation with no metadata row yet gets one created when it has a
+    matching local source, so this runs correctly both inside the fetch
+    stage (metadata already exists from verify) and as the standalone
+    claim-verification bootstrap (fresh workspace, no metadata, no
+    network). Returns the metadata map keyed by citekey so callers can
+    continue with the same objects (e.g. the fetch stage's download
+    selection).
     """
-    from sciwrite_lint.fulltext import acquire_fulltext
     from sciwrite_lint.local_sources import ingest_local_sources
+    from sciwrite_lint.models import CitationMetadata
     from sciwrite_lint.references.metadata import (
         compute_tier,
         load_metadata,
         save_metadata,
     )
-    from sciwrite_lint.references.reference_store import parse_and_embed
-    from sciwrite_lint.usage import tracked
 
-    # Load metadata once for every citation so the drop-folder ingest
-    # pass below and the need_fetch filter below share the same objects.
     meta_by_key: dict[str, Any] = {}
     for c in citations:
         meta = load_metadata(c.key, references_dir)
-        if meta:
-            meta_by_key[c.key] = meta
+        meta_by_key[c.key] = meta if meta is not None else CitationMetadata(key=c.key)
 
-    # --- Hash-aware drop-folder ingest ---------------------------------
-    # Runs for EVERY citation (regardless of tier) so a refreshed source
-    # on an already-T1 ref is picked up: ``local_file_src_hash`` in
-    # meta.access is compared against the current source SHA-256, and
-    # only when they differ (or no prior hash exists) do we re-copy /
-    # re-convert and recompute the tier. Unchanged sources cost a single
-    # hash read and exit.
     keys_titles_hashes: dict[str, tuple[str, str]] = {
         c.key: (
             c.title or meta_by_key[c.key].canonical.get("title", ""),
             meta_by_key[c.key].access.get("local_file_src_hash", ""),
         )
         for c in citations
-        if c.key in meta_by_key
     }
     outcomes = ingest_local_sources(
         keys_titles_hashes,
@@ -138,14 +132,46 @@ async def _stage_fetch(
         logger.info(
             f"{key}: ingested local {outcome.kind} source [{meta.access['tier']}]"
         )
+    return meta_by_key
+
+
+async def _stage_fetch(
+    citations: list[Citation],
+    config: LintConfig,
+    references_dir: Path,
+    embed_inline: bool = True,
+) -> int:
+    """Download PDFs for citations missing local files. Returns count fetched.
+
+    Args:
+        embed_inline: If True (default), eagerly embed parsed PDFs in-process.
+            Set to False in batch-staged mode to avoid loading the embedding
+            model's CUDA context in the parent process — the batch embedding
+            subprocess handles all embeddings instead.
+    """
+    from sciwrite_lint.fulltext import acquire_fulltext
+    from sciwrite_lint.references.metadata import compute_tier, save_metadata
+    from sciwrite_lint.references.reference_store import parse_and_embed
+    from sciwrite_lint.usage import tracked
+
+    # Hash-aware drop-folder ingest for every citation, shared with the
+    # standalone claim-verification bootstrap. Returns the metadata map
+    # the need_fetch filter below continues with.
+    ingest_local_drop_sources(citations, config, references_dir)
 
     # --- need_fetch filter (unchanged policy, but sees updated meta) ---
+    # Reload real metadata post-ingest: a citation with neither a stored
+    # metadata row nor a matched local source reloads as None and is
+    # skipped, exactly as before the ingest was factored out. The ingest
+    # already saved local_file/tier for every matched source.
+    from sciwrite_lint.references.metadata import load_metadata
+
     need_fetch = []
     ttl_days = config.fetch_retry_ttl_days
     skipped_cached = 0
 
     for c in citations:
-        meta = meta_by_key.get(c.key)
+        meta = load_metadata(c.key, references_dir)
         if not meta:
             continue
         tier = meta.access.get("tier", "")

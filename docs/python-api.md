@@ -11,7 +11,7 @@ from sciwrite_lint import (
 )
 ```
 
-No local services (GROBID, vLLM) are required for any of these — they're pure network operations. `download_pdf` optionally runs a GROBID title-match check on downloaded PDFs if GROBID is available; without GROBID, validation falls back to PDF magic-byte + size checks only.
+These are network operations — no vLLM is needed. By default `download_pdf` validates each fetched PDF against the bibliographic details you supply (title / authors / DOI / year); that match check uses the GROBID container, so GROBID must be running whenever you pass those details. Supplying only an identifier — or passing `require_title_match=False` (see below) — skips the match check, and the download then needs no local services: it accepts any well-formed PDF (`%PDF` magic bytes + a sane size). `fetch_web` and `search_by_title` never need local services.
 
 ## download_pdf — identifiers/title → PDF on disk
 
@@ -38,7 +38,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Tries these sources in priority order, returning on the first validated PDF:
+Tries these sources in priority order, returning on the first accepted PDF (validated against the bib evidence unless `require_title_match=False`):
 
 1. arXiv (requires `arxiv_id`)
 2. Semantic Scholar openAccessPdf (requires `s2_pdf_url`)
@@ -71,11 +71,14 @@ async def download_pdf(
     year: int | None = None,
     entry_type: str = "article",
     email: str,             # required (Unpaywall policy)
+    require_title_match: bool = True,
     config: FetchConfig | None = None,
 ) -> DownloadResult
 ```
 
 `title`, `authors`, `year`, and `entry_type` are used both to drive title-search sources (NBER, IDEAS, HAL, ERIC, NASA ADS, OSF) and to feed the multi-signal match validator that runs before any bytes are cached. The validator combines GROBID header title similarity, first-page surname / DOI / year signals, and template-pattern rejection for ERIC / CORE landing pages. When only an identifier is supplied (no title, no authors, no DOI, no year), the positive-signal gate is skipped and the caller gets whatever the identifier path produces — the template hard rejects still fire.
+
+Pass `require_title_match=False` to skip the match validator entirely — no GROBID needed. Any well-formed PDF (`%PDF` magic bytes + a non-trivial size) from the first source that returns one is accepted, and `title_check_score` is left `None`. Use it when the identifier already comes from a trusted match (e.g. a resolved search hit), so re-validating the title would be redundant. The pre-download ranking of title-search candidates is unaffected — it runs locally regardless.
 
 ### `DownloadResult`
 
@@ -85,7 +88,7 @@ async def download_pdf(
 | `source` | `str \| None` | which source produced the PDF (`"arxiv"`, `"pmc"`, `"unpaywall"`, …) |
 | `out_path` | `Path \| None` | the path the PDF was written to |
 | `url_used` | `str \| None` | the URL that actually served the bytes |
-| `title_check_score` | `float \| None` | GROBID title-similarity score (computed by the multi-signal match validator); `0.0` when the validator accepted on a non-title signal such as DOI match |
+| `title_check_score` | `float \| None` | title-similarity score from the match validator (GROBID header title vs. the supplied title); low or `0.0` when accepted on a non-title signal such as a DOI match; `None` when no title comparison ran — the validator was skipped (`require_title_match=False`) or only an identifier was supplied |
 | `failed_sources` | `list[str]` | one string per source that was tried and didn't produce a PDF |
 | `is_oa` | `bool` | whether Unpaywall or OpenAlex confirmed OA status |
 | `oa_url` | `str \| None` | suggested URL if a manual download is the only path |

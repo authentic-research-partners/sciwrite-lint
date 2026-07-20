@@ -34,6 +34,14 @@ MODELS: dict[str, dict] = {
         "served_name": "gemma3-12b-fp8",
         "reasoning_parser": "",  # no thinking support
         "kind": "text",
+        # gemma-3 attention (logit soft-capping) is incompatible with an
+        # fp8 KV cache on this vLLM build — EngineCore crash-loops during
+        # init (weights load, then crash at CUDA-graph capture) and the
+        # API never comes up. Pin the KV cache to auto and disable CUDA
+        # graph capture; this is the confirmed-working combination on Ada.
+        # Qwen3 keeps the fp8 default and CUDA graphs unchanged.
+        "kv_cache_dtype": "auto",
+        "enforce_eager": True,
     },
     "qwen3-vl": {
         "hf_model": "Qwen/Qwen3-VL-8B-Instruct-FP8",
@@ -79,6 +87,10 @@ _DEFAULT_GPU_MEM = 0.9
 _DEFAULT_MAX_MODEL_LEN = 40_960
 _DEFAULT_PORT = 5001
 _DEFAULT_VISION_PORT = 5002
+# fp8 KV cache halves KV-pool memory pressure and is the right default on
+# Ada (native FP8). Profiles whose attention is incompatible with an fp8 KV
+# cache override this per-profile via ``kv_cache_dtype`` (see ``gemma3``).
+_DEFAULT_KV_CACHE_DTYPE = "fp8"
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +521,8 @@ def start_container(
     max_model_len = profile.get("max_model_len", _DEFAULT_MAX_MODEL_LEN)
     gpu_mem = profile.get("gpu_memory_utilization", _DEFAULT_GPU_MEM)
     container_memory = profile.get("memory", config.vllm_memory)
+    kv_cache_dtype = profile.get("kv_cache_dtype", _DEFAULT_KV_CACHE_DTYPE)
+    enforce_eager = profile.get("enforce_eager", False)
 
     cmd = [
         runtime,
@@ -540,7 +554,7 @@ def start_container(
         "--max-model-len",
         str(max_model_len),
         "--kv-cache-dtype",
-        "fp8",
+        kv_cache_dtype,
         "--enable-chunked-prefill",
         # Per-step compute budget for prefill chunks + decode tokens
         # combined. 8192 because:
@@ -571,6 +585,12 @@ def start_container(
         cmd.extend(["--max-num-seqs", str(config.vision_server_max_seqs)])
     else:
         cmd.extend(["--max-num-seqs", str(config.llm_server_max_seqs)])
+
+    # Disable CUDA graph capture for profiles that crash during capture
+    # (e.g. gemma-3 on this vLLM build). Off by default — CUDA graphs are
+    # a meaningful decode-latency win when the model supports them.
+    if enforce_eager:
+        cmd.append("--enforce-eager")
 
     # Server-side reasoning parser for thinking models (Qwen3)
     if profile.get("reasoning_parser"):

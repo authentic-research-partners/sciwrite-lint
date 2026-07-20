@@ -19,7 +19,7 @@ def extract_claims_from_context(
     ctx: Any,  # ManuscriptContext
     file_path: Path,
 ) -> list[dict[str, Any]]:
-    """Extract claim dicts from a ManuscriptContext (PDF or .tex)."""
+    """Extract claim dicts from a ManuscriptContext (.tex, PDF, or markdown)."""
     if ctx.source_type == "latex":
         from sciwrite_lint.eval_claims import extract_claim_contexts
 
@@ -27,7 +27,7 @@ def extract_claims_from_context(
             {"key": cc.key, "context": cc.context, "line": cc.line}
             for cc in extract_claim_contexts(file_path)
         ]
-    # PDF: convert InlineCitation objects to claim dicts
+    # PDF and markdown: convert InlineCitation objects to claim dicts
     return [
         {
             "key": ic.key,
@@ -54,6 +54,7 @@ async def score_standalone_async(
     """
     from sciwrite_lint.manuscript_store import ManuscriptContext
     from sciwrite_lint.pipeline import (
+        build_markdown_context,
         build_pdf_context,
         run_llm_checks_batched,
         run_text_checks,
@@ -65,8 +66,14 @@ async def score_standalone_async(
     if suffix == ".pdf":
         await build_pdf_context(file_path, config)
         ctx = config.manuscript_context
+    elif suffix == ".md":
+        build_markdown_context(file_path, config)
+        ctx = config.manuscript_context
     else:
         ctx = ManuscriptContext.from_latex(file_path, config)
+        # Clear any source-type context from a prior paper in a batch loop
+        # so config.is_pdf / is_markdown reflect this LaTeX paper.
+        config.manuscript_context = None
     findings = run_text_checks(file_path, config)
     findings.extend(await run_llm_checks_batched(file_path, config))
 
@@ -281,14 +288,18 @@ def _print_issue_summary(
 def run_contributions_file(
     file_path: Path, config: LintConfig, args: argparse.Namespace
 ) -> int:
-    """Score a standalone file (PDF or .tex) without prior verify-claims."""
+    """Score a standalone file (.pdf, .tex, or .md) without prior verify-claims."""
     if not file_path.exists():
         logger.error(f"Error: {file_path} not found")
         return 2
 
-    suffix = file_path.suffix.lower()
-    if suffix not in (".pdf", ".tex"):
-        logger.error(f"Unsupported file type: {suffix}. Use .pdf or .tex")
+    from sciwrite_lint.cli._common import (
+        MANUSCRIPT_SUFFIXES,
+        unsupported_manuscript_error,
+    )
+
+    if file_path.suffix.lower() not in MANUSCRIPT_SUFFIXES:
+        logger.error(unsupported_manuscript_error(file_path))
         return 2
 
     output_dir = Path(args.output_dir) if args.output_dir else file_path.parent

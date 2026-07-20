@@ -161,12 +161,12 @@ def _build_full_paper_queries(
     Returns queries for all full-paper checks (mechanical + figure).
     """
     from sciwrite_lint.checks.full_paper_consistency import (
-        _CHECK_DEFS,
         _ISSUE_SCHEMA,
         _REFERENCES_HEADINGS,
         _RESERVED_TOKENS,
         _estimate_tokens,
         _get_max_model_len,
+        selected_check_defs,
     )
 
     # Build paper body from the cited paper's ManuscriptContext
@@ -209,10 +209,12 @@ def _build_full_paper_queries(
 
     queries: list[tuple[str, str, dict, str]] = []
     has_figures = figure_section != "Not available."
-    for _check_id, _desc, question, _thinking, needs_figs in _CHECK_DEFS:
-        # Skip figure checks when no figure descriptions available
-        if needs_figs and not has_figures:
-            continue
+    # ``selected_check_defs`` applies the figure-availability filter and the
+    # enabled-check gate together — the same selection ``_process_full_paper_results``
+    # uses, so built queries and decoded results stay index-aligned.
+    for _check_id, _desc, question, _thinking, _needs_figs in selected_check_defs(
+        config, has_figures=has_figures
+    ):
         queries.append((system, question, _ISSUE_SCHEMA, "FullPaperIssue"))
     return queries
 
@@ -282,20 +284,21 @@ def _process_full_paper_results(
     results: list[dict[str, Any] | None],
     ref_key: str,
     md_name: str,
+    config: LintConfig,
     has_figures: bool = False,
 ) -> list[Finding]:
     """Convert full-paper consistency LLM results to findings."""
-    from sciwrite_lint.checks.full_paper_consistency import _CHECK_DEFS
+    from sciwrite_lint.checks.full_paper_consistency import selected_check_defs
 
-    # Only iterate over checks that were actually queried
-    queried = [
-        (cid, desc, q, th)
-        for cid, desc, q, th, needs_figs in _CHECK_DEFS
-        if not needs_figs or has_figures
-    ]
+    # Mirror the selection ``_build_full_paper_queries`` made (figure
+    # availability + enabled-check gate) so each decoded result is zipped
+    # against the check that produced it.
+    queried = selected_check_defs(config, has_figures=has_figures)
 
     findings: list[Finding] = []
-    for (_check_id, _desc, _question, _thinking), result in zip(queried, results):
+    for (_check_id, _desc, _question, _thinking, _needs_figs), result in zip(
+        queried, results
+    ):
         # ``None`` => LLM gave up after the retry ladder; emit a
         # diagnostic finding tied to this specific check so the gap is
         # visible in the JSON report.
@@ -656,6 +659,23 @@ def _describe_cited_figures_vl(
 # ---------------------------------------------------------------------------
 
 
+def _stage_check_ids() -> list[str]:
+    """Every check ID this stage can emit.
+
+    The two pairwise checks plus all full-paper consistency checks. Used to
+    short-circuit the whole stage when every one of them is disabled, so
+    ``--checks``/``disabled_rules`` can actually turn the (expensive) LLM
+    work off rather than only suppressing the findings afterwards.
+    """
+    from sciwrite_lint.checks.full_paper_consistency import _CHECK_DEFS
+
+    return [
+        "cross-section-consistency",
+        "structure-promises",
+        *(d[0] for d in _CHECK_DEFS),
+    ]
+
+
 async def run_ref_internal_checks(
     references_dir: Path,
     config: LintConfig,
@@ -694,6 +714,18 @@ async def run_ref_internal_checks(
 
     md_files = sorted(parsed_dir.glob("*.md"))
     if not md_files:
+        return {}
+
+    # Honor --checks / disabled_rules: if every check this stage owns is
+    # disabled, skip it entirely — no per-ref context building, no LLM work.
+    # Contribution scoring is gated separately (the ``contribution`` flag)
+    # and still runs when requested.
+    if not contribution and not any(
+        config.is_check_enabled(cid) for cid in _stage_check_ids()
+    ):
+        logger.debug(
+            "Ref internal checks: all consistency checks disabled — skipping stage"
+        )
         return {}
 
     # Filter to requested keys
@@ -760,19 +792,22 @@ async def run_ref_internal_checks(
 
             ref_contexts[ref_key] = ctx
 
-            # Cross-section-consistency queries
-            csc_queries = _build_consistency_queries(ctx)
-            if csc_queries:
-                query_map.append(
-                    (ref_key, "cross-section-consistency", len(csc_queries))
-                )
-                all_queries.extend(csc_queries)
+            # Cross-section-consistency queries (skip if the check is disabled
+            # via --checks / disabled_rules — same gate the registry uses).
+            if config.is_check_enabled("cross-section-consistency"):
+                csc_queries = _build_consistency_queries(ctx)
+                if csc_queries:
+                    query_map.append(
+                        (ref_key, "cross-section-consistency", len(csc_queries))
+                    )
+                    all_queries.extend(csc_queries)
 
             # Structure-promises queries
-            sp_queries = _build_promises_queries(ctx)
-            if sp_queries:
-                query_map.append((ref_key, "structure-promises", len(sp_queries)))
-                all_queries.extend(sp_queries)
+            if config.is_check_enabled("structure-promises"):
+                sp_queries = _build_promises_queries(ctx)
+                if sp_queries:
+                    query_map.append((ref_key, "structure-promises", len(sp_queries)))
+                    all_queries.extend(sp_queries)
 
             # Full-paper consistency queries (separate batch — needs thinking=medium)
             fig_desc = ref_figure_descs.get(ref_key, "") if ref_figure_descs else ""
@@ -786,7 +821,11 @@ async def run_ref_internal_checks(
             # Store section count for result
             query_map.append((ref_key, "_sections", len(ctx.sections)))
 
-        if not all_queries:
+        if not all_queries and not contribution:
+            # No consistency queries built (checks disabled, or every ref too
+            # small/large). Skip the LLM batches. When contribution scoring is
+            # requested we fall through — it runs on ``ref_contexts`` below
+            # regardless of whether any consistency check fired.
             logger.debug("Ref internal checks: no LLM queries to run")
             return results
 
@@ -934,7 +973,7 @@ async def run_ref_internal_checks(
             per_ref_checks.setdefault(ref_key, [])
             ref_has_figs = bool(ref_figure_descs and ref_figure_descs.get(ref_key))
             findings = _process_full_paper_results(
-                fp_batch, ref_key, f"{ref_key}.md", has_figures=ref_has_figs
+                fp_batch, ref_key, f"{ref_key}.md", config, has_figures=ref_has_figs
             )
             per_ref_findings[ref_key].extend(findings)
             per_ref_checks[ref_key].append("full-paper-consistency")

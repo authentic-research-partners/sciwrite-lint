@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from sciwrite_lint.models import CheckResult, Citation, CitationMetadata, Finding
+
+if TYPE_CHECKING:
+    from sciwrite_lint.config import LintConfig
 
 
 def classify_t2_refs(
@@ -254,9 +258,11 @@ def run_status(args: argparse.Namespace) -> int:
 
 
 def run_ref_health(args: argparse.Namespace) -> int:
-    """Fast deterministic reference health check (no API calls).
+    """Fast deterministic reference health check (no external API calls).
 
-    Parses the .tex and .bib, reports:
+    Parses a ``.tex`` (``\\cite`` + ``.bib``), markdown (pandoc ``[@key]``
+    + sibling ``.bib``), or ``.pdf`` (GROBID — a local parser, so still no
+    network) manuscript, reports:
     - cite/bib mismatches (cited but missing from bib, in bib but never cited)
     - ID coverage (which refs have DOI, ISBN, arXiv, PMID, etc.)
     - entry type breakdown
@@ -271,17 +277,18 @@ def run_ref_health(args: argparse.Namespace) -> int:
     tex_file = getattr(args, "file", None)
     paper_name = getattr(args, "paper", None)
     if not tex_file and not paper_name:
-        logger.error("Provide a .tex file or --paper NAME")
+        logger.error("Provide a .tex, .md, or .pdf file, or --paper NAME")
         return 2
 
+    from sciwrite_lint.cli._common import _load_config, _resolve_paper
+
+    # Always available — the .pdf branch needs it for GROBID context.
+    config = _load_config(args)
     if tex_file:
         tex_path = Path(tex_file).resolve()
         bib_path = None
         name = tex_path.stem
     else:
-        from sciwrite_lint.cli._common import _load_config, _resolve_paper
-
-        config = _load_config(args)
         assert paper_name is not None  # guarded above
         pc = _resolve_paper(config, paper_name)
         if not pc:
@@ -294,17 +301,66 @@ def run_ref_health(args: argparse.Namespace) -> int:
         logger.error(f"{tex_path} not found")
         return 1
 
-    if tex_path.suffix != ".tex":
-        logger.error(f"ref-health requires a .tex file, got {tex_path.suffix}")
-        return 1
+    suffix = tex_path.suffix.lower()
+    # Cited keys come from find_orphans (LaTeX) or pandoc (markdown); None
+    # signals "use find_orphans" below. Set by the markdown and PDF
+    # branches, which read cited keys from the parsed context.
+    cited_keys_override: set[str] | None = None
+    if suffix == ".md":
+        from sciwrite_lint.markdown_cites import analyze_markdown, parse_markdown_bib
 
-    citations = extract_bibitems(tex_path, bib_path=bib_path)
+        analysis = analyze_markdown(tex_path.read_text(encoding="utf-8"))
+        citations = parse_markdown_bib(tex_path, analysis, bib_path)
+        if not citations:
+            logger.error(
+                f"ref-health: markdown manuscript {tex_path.name} has no "
+                f"bibliography (.bib) to check citations against "
+                f"(config, YAML bibliography:, sibling {tex_path.stem}.bib)"
+            )
+            return 1
+        cited_keys_override = {c.key for c in analysis.citations}
+    elif suffix == ".pdf":
+        # PDF references come from GROBID — a local parser, not an external
+        # API, so ref-health stays network-free. The container must be up
+        # (the same requirement every PDF operation has).
+        from sciwrite_lint.pdf.grobid import is_grobid_running
+        from sciwrite_lint.pipeline import build_pdf_context, citations_from_pdf_context
+
+        async def _pdf_references() -> list[Citation] | None:
+            if not await is_grobid_running():
+                return None
+            await build_pdf_context(tex_path, config)
+            return citations_from_pdf_context(config)
+
+        result = asyncio.run(_pdf_references())
+        if result is None:
+            logger.error(
+                "ref-health on a PDF needs GROBID (local parser, no external "
+                "APIs). Start it with: sciwrite-lint containers start"
+            )
+            return 1
+        citations = result
+        cited_keys_override = {
+            ic.key for ic in config.manuscript_context.inline_citations
+        }
+    elif suffix == ".tex":
+        citations = extract_bibitems(tex_path, bib_path=bib_path)
+    else:
+        logger.error(
+            f"ref-health requires a .tex, .md, or .pdf file, got {tex_path.suffix}"
+        )
+        return 1
 
     if not citations:
         print(f"\n  {name}: no references found in {tex_path.name}")
         return 0
 
-    cited_no_bib, bib_no_cite = find_orphans(citations, tex_path)
+    if cited_keys_override is not None:
+        bib_keys = {c.key for c in citations}
+        cited_no_bib = cited_keys_override - bib_keys
+        bib_no_cite = bib_keys - cited_keys_override
+    else:
+        cited_no_bib, bib_no_cite = find_orphans(citations, tex_path)
 
     # --- ID coverage ---
     id_fields = ["doi", "arxiv_id", "pmid", "pmc_id", "isbn", "lccn", "url"]
@@ -432,6 +488,46 @@ def run_ref_health(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _prepare_local_sources_for_claims(
+    pc: "Any", config: "LintConfig", refs_dir: Path
+) -> None:
+    """Ingest + embed locally-archived cited sources for standalone runs.
+
+    The ``check`` pipeline prepares cited sources in its fetch + parse +
+    embed stages; ``verify-claims`` skips them, so without this it can't
+    see drop-folder snapshots ("0 have local source"). This runs the
+    local-only subset of that preparation — no network downloads:
+
+    1. Build the manuscript context (markdown / PDF) and extract its cited
+       references, so ``config.is_markdown`` / ``is_pdf`` is set for the
+       verification call that follows.
+    2. Ingest matching academic / web drop-folder sources into the
+       workspace (creating metadata rows on a fresh workspace).
+    3. Parse any local PDFs (GROBID) and embed every local source plus the
+       claim query vectors, so multi-section sources have a retrieval index
+       when verification runs.
+    """
+    from sciwrite_lint.pipeline import build_markdown_context, build_pdf_context
+    from sciwrite_lint.pipeline.citation_setup import extract_pipeline_citations
+    from sciwrite_lint.pipeline.embeddings import _run_embeddings_for_paper
+    from sciwrite_lint.pipeline.fetch import ingest_local_drop_sources
+    from sciwrite_lint.references.reference_store import parse_all_missing
+
+    suffix = pc.file_path.suffix.lower()
+    if suffix == ".pdf":
+        await build_pdf_context(pc.file_path, config)
+    elif suffix == ".md":
+        build_markdown_context(pc.file_path, config)
+
+    citations = extract_pipeline_citations(pc.name, pc.file_path, pc, config, refs_dir)
+    if not citations:
+        return
+
+    ingest_local_drop_sources(citations, config, refs_dir)
+    parse_results = await parse_all_missing(refs_dir)
+    _run_embeddings_for_paper(parse_results, refs_dir, config, tex_path=pc.file_path)
+
+
 def run_verify_claims(args: argparse.Namespace) -> int:
     """Verify claims against cited sources using local vLLM."""
     from sciwrite_lint.cli._common import _load_config, _resolve_paper
@@ -445,6 +541,12 @@ def run_verify_claims(args: argparse.Namespace) -> int:
     ws.ensure_dirs()
     refs_dir = ws.root
     config.current_paper = pc.name
+
+    # Prepare locally-archived sources (ingest + embed) so standalone
+    # verification works against drop-folder snapshots without a prior
+    # `check` run. Local-only — no network downloads.
+    asyncio.run(_prepare_local_sources_for_claims(pc, config, refs_dir))
+
     from sciwrite_lint.eval_claims import run_claim_verification
 
     results = asyncio.run(

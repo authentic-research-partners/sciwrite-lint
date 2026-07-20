@@ -39,6 +39,44 @@ _DEFAULT_WE_VERBS = [
 ]
 
 
+# User-level config directory — the same place API keys are stored.
+# Identity values like the polite email keep a single machine-wide default
+# here so it applies across every project without being baked into a
+# tracked ``.sciwrite-lint.toml``. A project's ``[api] polite_email`` still
+# overrides it.
+_USER_CONFIG_DIR = Path.home() / ".sciwrite-lint"
+
+
+def _read_user_polite_email() -> str:
+    """Return the machine-wide polite email, or "" when unset.
+
+    Reads ``~/.sciwrite-lint/polite_email`` — the same directory API keys
+    resolve from. A project's TOML value takes precedence over this.
+    """
+    path = _USER_CONFIG_DIR / "polite_email"
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def source_type_for_path(path: Path) -> str:
+    """Map a manuscript path to its workspace source type.
+
+    Returns ``"pdf"``, ``"markdown"``, or ``"tex"``. Recorded in the
+    ``source.json`` manifest and compared across runs to detect a source
+    switch (which requires ``--fresh``). The runtime
+    ``ManuscriptContext.source_type`` uses ``"latex"`` for the same input;
+    the manifest's own vocabulary writes LaTeX as ``"tex"``, so the two
+    are spelled differently on purpose.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix == ".md":
+        return "markdown"
+    return "tex"
+
+
 class PaperWorkspace(BaseModel):
     """Per-paper directory structure for references and parsed files.
 
@@ -94,7 +132,7 @@ class PaperWorkspace(BaseModel):
             return True, "corrupt_manifest"
 
         old_type = manifest.get("source_type", "")
-        new_type = "pdf" if tex_path.suffix.lower() == ".pdf" else "tex"
+        new_type = source_type_for_path(tex_path)
         if old_type and old_type != new_type:
             return False, f"source_type_changed:{old_type}→{new_type}"
 
@@ -111,7 +149,7 @@ class PaperWorkspace(BaseModel):
         import json
         import shutil
 
-        source_type = "pdf" if tex_path.suffix.lower() == ".pdf" else "tex"
+        source_type = source_type_for_path(tex_path)
 
         # Copy source file
         shutil.copy2(tex_path, self.source / tex_path.name)
@@ -468,6 +506,17 @@ class LintConfig(BaseModel):
         ctx = self.manuscript_context
         return ctx is not None and getattr(ctx, "source_type", None) == "pdf"
 
+    @property
+    def is_markdown(self) -> bool:
+        """True when the current manuscript is markdown.
+
+        Set by ``build_markdown_context()``. Checks that parse LaTeX
+        citation/cross-reference/figure syntax key off this to dispatch
+        or to declare themselves unavailable for the source.
+        """
+        ctx = self.manuscript_context
+        return ctx is not None and getattr(ctx, "source_type", None) == "markdown"
+
     # Container config
     grobid_version: str = "0.8.2.1-crf"
     # GROBID JVM heap + parser working memory. Bumped from 8g → 12g
@@ -588,6 +637,9 @@ def load_config(path: Path | None = None) -> LintConfig:
     If path is None, searches for .sciwrite-lint.toml via find_config().
     """
     config = LintConfig()
+    # Machine-wide default; a project's [api] polite_email (loaded below)
+    # overrides it. Applies even when there's no project TOML.
+    config.polite_email = _read_user_polite_email()
 
     toml_path = path or find_config()
     if toml_path is None:
@@ -818,8 +870,8 @@ def generate_default_toml(papers: list[dict[str, str]] | None = None) -> str:
                 "",
                 "# [[papers]]",
                 '# name = "my-paper"',
-                '# file_path = "paper.tex"          # path to .tex or .pdf file',
-                '# bib = "references.bib"          # optional, auto-detected from \\bibliography{}',
+                '# file_path = "paper.tex"          # path to .tex, .pdf, or .md file',
+                '# bib = "references.bib"          # optional; .tex auto-detects from \\bibliography{}, .md from sibling {name}.bib',
                 '# prohibited_terms = ["CompanyName"]  # terms that must not appear in body',
                 "",
             ]
@@ -869,11 +921,34 @@ def generate_default_toml(papers: list[dict[str, str]] | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def init_project(force: bool = False) -> tuple[bool, str]:
+def _resolve_init_papers(
+    explicit_file: Path | None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Decide which papers to scaffold. Returns ``(papers, ambiguous)``.
+
+    - An explicitly named file → register exactly that one.
+    - Otherwise auto-detect: a single candidate is registered; two or more
+      is ambiguous (which is *the* manuscript?), so none are registered and
+      the candidates are returned in ``ambiguous`` for the caller to report.
+    """
+    if explicit_file is not None:
+        return [_paper_entry(explicit_file)], []
+    detected = _detect_papers()
+    if len(detected) > 1:
+        return [], detected
+    return detected, []
+
+
+def init_project(
+    force: bool = False, explicit_file: Path | None = None
+) -> tuple[bool, str]:
     """Initialize a sciwrite-lint project in the current directory.
 
     Creates .sciwrite-lint.toml and references/ directory structure.
-    Never overwrites existing files or directories.
+    Never overwrites existing files or directories. ``explicit_file``
+    registers a specific manuscript (any supported type, including PDF);
+    without it, a lone auto-detected manuscript is registered and multiple
+    candidates are left for the user to choose.
 
     Returns (success, message).
     """
@@ -883,20 +958,15 @@ def init_project(force: bool = False) -> tuple[bool, str]:
 
     created: list[str] = []
     skipped: list[str] = []
+    ambiguous: list[dict[str, str]] = []
 
     # Config file
-    if toml_path.exists():
-        if force:
-            # Scan for .tex files to populate papers
-            papers = _detect_papers()
-            toml_path.write_text(generate_default_toml(papers or None))
-            created.append(str(toml_path) + " (overwritten)")
-        else:
-            skipped.append(str(toml_path) + " (already exists)")
+    if toml_path.exists() and not force:
+        skipped.append(str(toml_path) + " (already exists)")
     else:
-        papers = _detect_papers()
+        papers, ambiguous = _resolve_init_papers(explicit_file)
         toml_path.write_text(generate_default_toml(papers or None))
-        created.append(str(toml_path))
+        created.append(str(toml_path) + (" (overwritten)" if force else ""))
 
     # References root directory (per-paper subdirs created on first pipeline run)
     if refs_dir.exists():
@@ -931,6 +1001,16 @@ def init_project(force: bool = False) -> tuple[bool, str]:
             "Skipped (not overwritten):\n" + "\n".join(f"  {s}" for s in skipped)
         )
 
+    if ambiguous:
+        names = ", ".join(p["file_path"] for p in ambiguous)
+        parts.append(
+            f"\nMultiple manuscripts detected — none auto-registered: {names}\n"
+            "  Register the one you want:\n"
+            "    sciwrite-lint init --force <file>   (e.g. the .tex/.pdf/.md "
+            "you're checking)\n"
+            "  or add a [[papers]] entry to .sciwrite-lint.toml by hand."
+        )
+
     if not created and skipped:
         parts.append("\nProject already initialized. Use --force to overwrite config.")
 
@@ -955,32 +1035,70 @@ def init_project(force: bool = False) -> tuple[bool, str]:
     return bool(created), "\n".join(parts)
 
 
-def _detect_papers() -> list[dict[str, str]]:
-    """Scan current directory for .tex files and build paper entries."""
-    papers = []
-    for tex in sorted(Path(".").glob("**/*.tex")):
-        # Skip common non-paper files
-        if any(part.startswith(".") for part in tex.parts):
-            continue
-        if "references" in tex.parts or "archive" in tex.parts:
-            continue
+def _paper_entry(path: Path) -> dict[str, str]:
+    r"""Build a ``[[papers]]`` entry for a manuscript path, detecting its bib.
 
-        name = tex.stem
-        entry: dict[str, str] = {"name": name, "file_path": str(tex)}
+    ``.tex`` reads the bib from ``\bibliography{}``; ``.md`` uses a sibling
+    ``{stem}.bib``; ``.pdf`` has its bibliography embedded (parsed by
+    GROBID) so no bib is recorded. Used both by auto-detection and by an
+    explicitly named file.
+    """
+    import re
 
-        # Check for matching .bib file
-        tex_text = tex.read_text(encoding="utf-8", errors="ignore")
-        import re
-
-        bib_match = re.search(r"\\bibliography\{([^}]+)\}", tex_text)
-        if bib_match:
-            bib_name = bib_match.group(1)
+    entry: dict[str, str] = {"name": path.stem, "file_path": str(path)}
+    suffix = path.suffix.lower()
+    if suffix == ".tex":
+        match = re.search(
+            r"\\bibliography\{([^}]+)\}",
+            path.read_text(encoding="utf-8", errors="ignore"),
+        )
+        if match:
+            bib_name = match.group(1)
             if not bib_name.endswith(".bib"):
                 bib_name += ".bib"
-            bib_path = tex.parent / bib_name
+            bib_path = path.parent / bib_name
             if bib_path.exists():
                 entry["bib"] = str(bib_path)
+    elif suffix == ".md":
+        bib_path = path.with_suffix(".bib")
+        if bib_path.exists():
+            entry["bib"] = str(bib_path)
+    return entry
 
-        papers.append(entry)
+
+def _detect_papers() -> list[dict[str, str]]:
+    """Scan current directory for .tex and markdown manuscripts.
+
+    LaTeX ``.tex`` files are always candidates (an unambiguous manuscript
+    format). Markdown ``.md`` files are candidates only when a sibling
+    ``{stem}.bib`` exists — the pandoc / JOSS convention — so ordinary
+    markdown (``README.md``, docs, notes) is not mistaken for a paper. On a
+    name collision the ``.tex`` wins (it is the richer source). PDFs are
+    never auto-detected (no signal separates a manuscript from the many
+    reference/figure PDFs a project holds) — name one explicitly instead.
+    """
+    papers: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+
+    def _skip(path: Path) -> bool:
+        return (
+            any(part.startswith(".") for part in path.parts)
+            or "references" in path.parts
+            or "archive" in path.parts
+        )
+
+    for tex in sorted(Path(".").glob("**/*.tex")):
+        if _skip(tex):
+            continue
+        papers.append(_paper_entry(tex))
+        seen_names.add(tex.stem)
+
+    # Markdown manuscripts: require a sibling {stem}.bib so plain markdown
+    # files (README, docs) are not scaffolded as papers.
+    for md in sorted(Path(".").glob("**/*.md")):
+        if _skip(md) or md.stem in seen_names or not md.with_suffix(".bib").exists():
+            continue
+        papers.append(_paper_entry(md))
+        seen_names.add(md.stem)
 
     return papers

@@ -38,7 +38,7 @@ Two orthogonal axes describe a Finding:
    issue". Same level vocabulary, different semantics — the panel /
    JSON-field disambiguates.
 
-The three diagnostic rule_ids:
+The diagnostic rule_ids:
 
 - ``llm-unavailable``  — ``llm_query`` exhausted its retry ladder
   (medium → low → off) and returned ``None``. One per skipped check
@@ -59,6 +59,17 @@ The three diagnostic rule_ids:
   during ``build_queries`` or ``process_results`` / a text check's
   body raised mid-run. One per failing check. Emitted by the LLM
   batch runner and the text-check runner.
+- ``source-unsupported`` — one or more checks declare
+  ``supports_markdown=False`` (they parse LaTeX citation/cross-reference/
+  figure syntax) and the manuscript is markdown. The text-check runner
+  skips those checks and emits one summary finding listing them, so the
+  coverage gap is explicit rather than a silent zero-result.
+- ``no-references`` — citation extraction found zero references in the
+  manuscript, so the citation / reference / claim stages had nothing to
+  verify. Emitted once per run by the pipeline setup. A genuinely
+  citation-free note is harmless, but a zero usually means the
+  bibliography was not detected — surfacing it stops a clean-looking
+  report from hiding that the reference checks never ran.
 
 Adding a new system rule_id:
 
@@ -92,6 +103,8 @@ SYSTEM_RULE_IDS: frozenset[str] = frozenset(
         "vision-incomplete",
         "internal-error",
         "parse-failed",
+        "source-unsupported",
+        "no-references",
     }
 )
 
@@ -234,4 +247,57 @@ def internal_error_finding(check_id: str, error: BaseException) -> Finding:
         rule_id="internal-error",
         message=f"{check_id}: check raised an unexpected exception; check did not run",
         context=f"{type(error).__name__}: {error!s}"[:200],
+    )
+
+
+def source_unsupported_finding(
+    source_type: str, skipped_check_ids: list[str]
+) -> Finding:
+    """Build a finding for checks skipped because the source type lacks the structure they need.
+
+    Emitted once per run by the text-check runner when the manuscript is
+    markdown and one or more registered checks declare
+    ``supports_markdown=False`` (they parse LaTeX citation/cross-reference/
+    figure syntax or need a populated bibliography). Listing the skipped
+    checks makes the coverage gap explicit — a markdown manuscript still
+    gets prose and structure checks, but these did not run.
+
+    Parameters
+    ----------
+    source_type:
+        The manuscript source type (e.g. ``"markdown"``).
+    skipped_check_ids:
+        Registered check IDs that were skipped for this source.
+    """
+    checks = ", ".join(sorted(skipped_check_ids))
+    return Finding(
+        level="warning",
+        rule_id="source-unsupported",
+        message=(
+            f"{len(skipped_check_ids)} check(s) need citation/reference structure "
+            f"not extracted from {source_type} manuscripts and did not run: {checks}. "
+            "Prose and structure checks ran normally."
+        ),
+    )
+
+
+def no_references_finding() -> Finding:
+    """Build a finding for a run that extracted zero references.
+
+    Emitted once by the pipeline setup when citation extraction yields an
+    empty list. The reference, citation, and claim stages then have
+    nothing to verify — surfacing this keeps a clean-looking report from
+    hiding that those checks never ran (usually a bibliography that was
+    not detected, not a genuinely citation-free manuscript).
+    """
+    return Finding(
+        level="warning",
+        rule_id="no-references",
+        message=(
+            "No references found in the manuscript — citation, reference, and "
+            "claim checks had nothing to verify. If the manuscript cites sources, "
+            "check that its bibliography is detected (LaTeX \\bibliography{} / "
+            ".bib, or for markdown the YAML bibliography: field or a sibling "
+            "{name}.bib)."
+        ),
     )

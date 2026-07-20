@@ -219,3 +219,7 @@ class AcquisitionResult(BaseModel):
     is_oa: bool = False
     oa_url: str | None = None
     status: Literal["found", "exhausted", "transient"] = "transient"
+    # Title-similarity score the match validator computed for the accepted
+    # PDF. ``None`` when the validator was skipped (no evidence supplied) or
+    # accepted without comparing titles (e.g. a DOI-only bib).
+    title_sim: float | None = None

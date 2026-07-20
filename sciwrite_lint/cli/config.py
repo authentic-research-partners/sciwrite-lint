@@ -77,11 +77,21 @@ def _show(args: argparse.Namespace) -> int:
 
 
 def _set_email(args: argparse.Namespace) -> int:
-    """Set polite email in .sciwrite-lint.toml."""
+    """Set polite email — machine-wide (--global) or in this project's TOML."""
     email = args.email.strip()
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         logger.error("Invalid email address: {}", email)
         return 1
+
+    if getattr(args, "set_global", False):
+        from sciwrite_lint.config import _USER_CONFIG_DIR
+
+        _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        (_USER_CONFIG_DIR / "polite_email").write_text(email + "\n", encoding="utf-8")
+        print(f"Set machine-wide polite email to: {email}")
+        print(f"  → stored in {_USER_CONFIG_DIR / 'polite_email'}")
+        print("  → applies to every project (a project's [api] polite_email overrides)")
+        return 0
 
     from sciwrite_lint.config import find_config
 

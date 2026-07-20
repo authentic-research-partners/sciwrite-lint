@@ -12,21 +12,39 @@ from typing import Any
 
 from loguru import logger
 
-from sciwrite_lint.checks._diagnostics import internal_error_finding
+from sciwrite_lint.checks._diagnostics import (
+    internal_error_finding,
+    source_unsupported_finding,
+)
 from sciwrite_lint.config import LintConfig
 from sciwrite_lint.exceptions import LLMConnectionError
 from sciwrite_lint.models import Finding
 
 
 def run_text_checks(tex_path: Path, config: LintConfig) -> list[Finding]:
-    """Run all manuscript-engine checks (CPU-bound, no I/O). Returns findings."""
+    """Run all manuscript-engine checks (CPU-bound, no I/O). Returns findings.
+
+    For a markdown manuscript, checks that declare
+    ``supports_markdown=False`` (they parse LaTeX citation/cross-reference/
+    figure syntax) are skipped and collected into a single
+    ``source-unsupported`` system issue so the coverage gap is explicit.
+    """
     from sciwrite_lint.checks.registry import ensure_checks_loaded, get_checks
 
     ensure_checks_loaded()
     findings: list[Finding] = []
+    skipped_for_markdown: list[str] = []
 
     for meta, fn in get_checks(config=config):
         if meta.category in ("reference-db", "local-llm"):
+            continue
+        # The supports_markdown gate is enforced here because every check
+        # that opts out is category="manuscript" (the only category this
+        # runner handles) — they parse LaTeX syntax deterministically.
+        # tests/test_markdown_manuscript.py guards that invariant so a
+        # future local-llm opt-out can't slip the gate unnoticed.
+        if config.is_markdown and not meta.supports_markdown:
+            skipped_for_markdown.append(meta.id)
             continue
         try:
             check_findings = fn(tex_path, config)
@@ -38,6 +56,9 @@ def run_text_checks(tex_path: Path, config: LintConfig) -> list[Finding]:
         except Exception as e:
             logger.warning(f"Check {meta.id} skipped: {e}")
             findings.append(internal_error_finding(meta.id, e))
+
+    if skipped_for_markdown:
+        findings.append(source_unsupported_finding("markdown", skipped_for_markdown))
 
     return findings
 

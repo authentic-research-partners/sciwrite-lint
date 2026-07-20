@@ -570,6 +570,29 @@ If FIGURE DESCRIPTIONS says "Not available.", return {{"issues": []}}.\
 ]
 
 
+def selected_check_defs(
+    config: "LintConfig", *, has_figures: bool
+) -> list[tuple[str, str, str, str, bool]]:
+    """Full-paper check defs that should actually run.
+
+    Single source of truth for two filters applied together:
+
+    1. Figure availability — figure checks are pointless without figure
+       descriptions.
+    2. The enabled-check gate (``config.is_check_enabled`` — honors both
+       ``--checks`` and ``[lint] disabled_rules``).
+
+    Query-building and result-processing both call this so they select the
+    same checks in the same order. If they diverge, batched LLM results get
+    zipped against the wrong ``check_id``.
+    """
+    return [
+        d
+        for d in _CHECK_DEFS
+        if (has_figures or not d[4]) and config.is_check_enabled(d[0])
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Factory: build_queries / process_results for each check
 # ---------------------------------------------------------------------------

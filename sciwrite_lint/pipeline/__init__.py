@@ -45,6 +45,7 @@ from sciwrite_lint.pipeline.staged import (
     _PaperCtx,
     run_papers_staged,
 )
+from sciwrite_lint.pipeline.markdown_context import build_markdown_context
 from sciwrite_lint.pipeline.parse import _stage_parse
 from sciwrite_lint.pipeline.pdf_context import (
     build_pdf_context,
@@ -96,8 +97,9 @@ __all__ = [
     "run_full_check",
     "run_papers_staged",
     "StagedPaperResult",
-    # Public stage helpers (LaTeX/PDF handling)
+    # Public stage helpers (LaTeX/PDF/markdown handling)
     "build_pdf_context",
+    "build_markdown_context",
     "citations_from_pdf_context",
     "extract_citations_for_paper",
     # Public stage entry points

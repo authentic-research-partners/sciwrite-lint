@@ -141,7 +141,7 @@ sciwrite-lint containers start         # start GROBID + vLLM (needs GPU for vLLM
 sciwrite-lint containers monitor       # live dashboard: service health, VRAM, KV cache
 ```
 
-`init` detects `.tex` files and their `.bib` references and generates a `.sciwrite-lint.toml` config. Review to confirm the right files were detected.
+`init` generates a `.sciwrite-lint.toml` config. With no argument it auto-detects the manuscript — a `.tex` file (bibliography read from `\bibliography{}`) or a markdown file with a sibling `{name}.bib` (so ordinary `.md` files aren't mistaken for papers); if it finds **several**, it lists them and asks you to pick one. Name a manuscript explicitly — including a **PDF** — with `sciwrite-lint init <file>`. Review to confirm the right file was registered.
 
 ### WSL2: disable CUDA Sysmem Fallback (recommended)
 
@@ -209,6 +209,7 @@ sciwrite-lint check                             # all papers (batch-staged when 
 sciwrite-lint check --concurrency 4             # batch parallelism (default 2, validated up to 4)
 sciwrite-lint check paper.tex                   # text + LLM rules on a .tex file
 sciwrite-lint check paper.pdf                   # check a PDF (GROBID required)
+sciwrite-lint check paper.md                    # markdown manuscript (prose, structure, [@key] citations, @fig:/@sec: cross-refs)
 sciwrite-lint check --checks prose-quality paper.tex   # run only the listed checks (comma-separated)
 sciwrite-lint contributions --paper my_paper    # add contribution axes to SciLint Score
 sciwrite-lint contributions paper.pdf           # standalone file scoring
@@ -220,8 +221,32 @@ sciwrite-lint contributions paper.pdf           # standalone file scoring
 
 | Format | Notes |
 |---|---|
-| `.tex` | LaTeX — hand-written, or pandoc-generated (e.g. from Markdown); pandoc's heading anchors are unwrapped automatically. |
-| `.pdf` | Parsed via GROBID (container required). |
+| `.tex` | LaTeX — hand-written, or pandoc-generated (e.g. from Markdown); pandoc's heading anchors are unwrapped automatically. Full pipeline. |
+| `.pdf` | Parsed via GROBID (container required). Full pipeline. |
+| `.md` | Markdown (pandoc). Prose and structure checks run; pandoc `[@key]` citations are checked against a sibling `{name}.bib` and verified against external databases in the full pipeline; pandoc-crossref `@fig:`/`@sec:`/`@tbl:` references and `{#fig:…}` figures are checked for broken/unreferenced targets. Sections split by heading. |
+
+*What runs on each format:*
+
+| Capability | `.tex` | `.pdf` | `.md` |
+|---|:---:|:---:|:---:|
+| Prose & structure checks | ✓ | ✓ | ✓ |
+| Citation ↔ bibliography (`dangling-cite`) | ✓ | ✓ | ✓ |
+| Cross-references (`dangling-ref`) | ✓ | ✓ <sup>1</sup> | ✓ |
+| Unreferenced figures | ✓ | ✓ <sup>2</sup> | ✓ |
+| Reference verification (external APIs) | ✓ | ✓ | ✓ |
+| Claim support / citation purpose | ✓ | ✓ | ✓ |
+| Footnote-URL web sources | ✓ | — <sup>3</sup> | ✓ |
+| `ref-health` (no external APIs) | ✓ | ✓ <sup>4</sup> | ✓ |
+| `init` auto-detection | ✓ | — <sup>5</sup> | ✓ <sup>6</sup> |
+
+<sup>1</sup> PDF detects broken references rendered as `??`; `.tex`/`.md` match each reference to its label.
+<sup>2</sup> A PDF has no `\label`s, so figures are matched by the number GROBID reads from each figure's caption against the "Figure N" mentions in the prose (needs GROBID). Only cleanly-labelled figures are checked, so it stays conservative.
+<sup>3</sup> Footnote-URL web sources are matched for LaTeX and markdown; not yet for PDF.
+<sup>4</sup> A PDF's references come from GROBID (a local parser — still no external/network APIs), so PDF `ref-health` needs the GROBID container running.
+<sup>5</sup> *Auto-scan* skips PDFs — no signal distinguishes a manuscript PDF from a project's reference/figure PDFs, the way a `.tex` or a `.md` with a sibling `.bib` is recognizable. Register one explicitly with `sciwrite-lint init paper.pdf` (the explicit form takes any type). When auto-scan finds several `.tex`/`.md`, it asks you to name one rather than registering all.
+<sup>6</sup> Auto-detected when a sibling `{name}.bib` is present.
+
+Markdown citation support targets pandoc `[@key]` citations with a bibliography. Numeric `[1]` citations are not supported by design — they carry no stable key (renumbering on every edit) and their reference list is free text rather than structured entries; a document using them is reported, not partially parsed.
 
 *Cited sources you optionally supply (drop folders — see [Setup](#setup)):*
 

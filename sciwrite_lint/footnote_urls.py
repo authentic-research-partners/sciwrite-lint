@@ -80,9 +80,17 @@ first-class claim with a known source.
 
 Scope
 -----
-This module operates on the LaTeX source only. PDF input (GROBID) is
-out of scope for this iteration — the ``<note place="foot">`` path in
-TEI works differently and is a separate change.
+Handles LaTeX (``\footnote{\url{}}`` via :func:`extract_footnote_urls`)
+and markdown (``[^id]`` / ``^[…]`` footnotes carrying a ``<url>`` /
+``[text](url)`` link, via :func:`extract_footnote_urls_markdown`);
+:func:`ingest_footnote_sources` dispatches on the file suffix and shares
+the matching + synthesis. PDF input (GROBID) is out of scope — the TEI
+``<note place="foot">`` path works differently.
+
+The ``Claim wire-up`` above (footnote host sentence → ``ClaimContext``)
+is implemented for both: LaTeX via :func:`extract_claim_contexts`,
+markdown via :func:`extract_footnote_claims_markdown` (wired into the
+claims stage in ``eval_claims``).
 """
 
 from __future__ import annotations
@@ -394,6 +402,128 @@ def extract_footnote_urls(tex_path: Path) -> list[tuple[int, str]]:
     return results
 
 
+def _note_link_urls(node: object) -> list[str]:
+    r"""Collect ``Link`` targets that appear inside ``Note`` nodes under *node*.
+
+    The markdown analogue of "URLs inside a footnote" — pandoc renders both
+    ``[^id]`` reference footnotes and ``^[inline]`` footnotes as ``Note``
+    nodes, and ``<url>`` autolinks / ``[text](url)`` links inside them become
+    ``Link`` nodes (the markdown counterpart of LaTeX ``\url{}``).
+    """
+    urls: list[str] = []
+
+    def _links(n: object) -> None:
+        if isinstance(n, dict):
+            if n.get("t") == "Link":
+                c = n.get("c")
+                if (
+                    isinstance(c, list)
+                    and len(c) > 2
+                    and isinstance(c[2], list)
+                    and c[2]
+                ):
+                    urls.append(c[2][0])
+            for v in n.values():
+                _links(v)
+        elif isinstance(n, list):
+            for v in n:
+                _links(v)
+
+    def _notes(n: object) -> None:
+        if isinstance(n, dict):
+            if n.get("t") == "Note":
+                _links(n.get("c"))
+            else:
+                for v in n.values():
+                    _notes(v)
+        elif isinstance(n, list):
+            for v in n:
+                _notes(v)
+
+    _notes(node)
+    return urls
+
+
+def extract_footnote_urls_markdown(md_path: Path) -> list[tuple[int, str]]:
+    r"""Return ``(line, normalized_url)`` for every URL inside a markdown footnote.
+
+    The markdown analogue of :func:`extract_footnote_urls`. ``line`` is ``0``
+    (markdown footnote line numbers aren't tracked; the field is used only for
+    the caller's log dedup). Returns the same shape as the LaTeX extractor so
+    ``ingest_footnote_sources`` treats both sources uniformly.
+    """
+    import json
+
+    import pypandoc
+
+    try:
+        text = md_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.debug(f"Footnote extract: cannot read {md_path}: {exc}")
+        return []
+
+    ast = json.loads(pypandoc.convert_text(text, to="json", format="markdown"))
+    results: list[tuple[int, str]] = []
+    for raw_url in _note_link_urls(ast):
+        norm = normalize_url(raw_url)
+        if norm:
+            results.append((0, norm))
+    return results
+
+
+def extract_footnote_claims_markdown(md_text: str) -> list[tuple[str, str]]:
+    r"""Return ``(synthetic_key, host_context)`` for each markdown footnote URL.
+
+    The markdown analogue of the LaTeX footnote-claim wire-up: a footnote
+    that carries a URL backs a claim made in the sentence that *bears* the
+    footnote marker, not in the footnote body. For each block holding a
+    ``Note`` with a URL, the host context is the block's prose with the
+    footnote body excluded (``_inline_text`` renders ``Note`` as empty), and
+    the key is :func:`synthesize_footnote_key` of the normalized URL — the
+    same key :func:`ingest_footnote_sources` assigns the synthesized
+    citation, so the claim binds to its source.
+    """
+    import json
+
+    import pypandoc
+
+    from sciwrite_lint.markdown_cites import _inline_text
+
+    ast = json.loads(pypandoc.convert_text(md_text, to="json", format="markdown"))
+    results: list[tuple[str, str]] = []
+
+    def _walk(blocks: object) -> None:
+        if not isinstance(blocks, list):
+            return
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            t = block.get("t")
+            c = block.get("c")
+            if t in ("Para", "Plain"):
+                urls = _note_link_urls(c)
+                if not urls:
+                    continue
+                host = _inline_text(c).strip()
+                for raw_url in urls:
+                    norm = normalize_url(raw_url)
+                    if norm and host:
+                        results.append((synthesize_footnote_key(norm), host))
+            elif t == "BlockQuote":
+                _walk(c)
+            elif t == "Div" and isinstance(c, list) and len(c) > 1:
+                _walk(c[1])
+            elif t == "BulletList" and isinstance(c, list):
+                for item in c:
+                    _walk(item)
+            elif t == "OrderedList" and isinstance(c, list) and len(c) > 1:
+                for item in c[1]:
+                    _walk(item)
+
+    _walk(ast.get("blocks", []))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Key synthesis + title recovery
 # ---------------------------------------------------------------------------
@@ -442,8 +572,11 @@ def ingest_footnote_sources(
     r"""Extract footnote URLs, match each to an archived ``.md``, and
     synthesize :class:`Citation` objects ready for the claim pipeline.
 
-    For every ``\footnote{\url{URL}}`` whose normalized URL is declared
-    in a ``local_web_dir`` capture's ``Source:`` header, this function:
+    Handles LaTeX ``\footnote{\url{URL}}`` and markdown footnotes
+    (``[^id]`` / ``^[…]`` with a ``<url>`` or ``[text](url)`` link) — the
+    source type is taken from ``tex_path``'s suffix. For every such URL
+    whose normalized form is declared in a ``local_web_dir`` capture's
+    ``Source:`` header, this function:
 
     1. synthesizes a stable key via :func:`synthesize_footnote_key`,
     2. copies the capture into the paper workspace as
@@ -477,7 +610,11 @@ def ingest_footnote_sources(
     if not url_map:
         return []
 
-    footnote_hits = extract_footnote_urls(tex_path)
+    footnote_hits = (
+        extract_footnote_urls_markdown(tex_path)
+        if tex_path.suffix.lower() == ".md"
+        else extract_footnote_urls(tex_path)
+    )
     if not footnote_hits:
         return []
 

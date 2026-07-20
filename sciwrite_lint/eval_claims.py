@@ -978,41 +978,141 @@ async def _verify_units_at_level(
     return _aggregate_section_results(results, units)
 
 
-def _embeddings_unavailable_result(claim: ClaimContext, n_sections: int) -> dict:
-    """Standard CANNOT_DETERMINE response when embeddings are missing for
-    a reference — no level of the ladder can run without them."""
-    logger.warning(
-        "No embeddings for {} ({} sections) — cannot filter, "
-        "returning CANNOT_DETERMINE. Rebuild with: "
-        "sciwrite-lint parse --key {}",
-        claim.key,
-        n_sections,
-        claim.key,
-    )
+def _cannot_determine_result(explanation: str) -> dict:
+    """Build the ladder's CANNOT_DETERMINE verdict envelope.
+
+    The three retrieval-failure helpers below differ only in the
+    human-readable ``explanation`` and the WARNING they log; the verdict
+    shape is identical, so it lives in one place to keep the three from
+    drifting apart.
+    """
     return {
         "verdict": "CANNOT_DETERMINE",
-        "explanation": f"No embeddings for {claim.key} — "
-        "cannot select relevant sections for verification",
+        "explanation": explanation,
         "sections_checked": 0,
     }
+
+
+def _embeddings_unavailable_result(claim: ClaimContext, n_sections: int) -> dict:
+    """CANNOT_DETERMINE response when no chunk embeddings exist for a
+    reference — no level of the ladder can run without them.
+
+    Reserved for the genuine no-embeddings case (``has_embeddings`` is
+    False). When chunks *are* indexed but retrieval still finds nothing,
+    use :func:`_no_retrieval_hits_result` instead — the two are not the
+    same failure and must not share a message.
+    """
+    logger.warning(
+        "No chunk embeddings for {} ({} sections) — cannot retrieve "
+        "relevant passages, returning CANNOT_DETERMINE. Embeddings are "
+        "built by the parse/embed stage of `sciwrite-lint check`, which "
+        "embeds PDFs, web captures, and .md summaries alike; re-run it, "
+        "adding --fresh to force a rebuild.",
+        claim.key,
+        n_sections,
+    )
+    return _cannot_determine_result(
+        f"No embeddings for {claim.key} — "
+        "cannot select relevant sections for verification"
+    )
+
+
+def _embedding_model_mismatch_result(
+    claim: ClaimContext,
+    n_sections: int,
+    stored_model: str,
+    current_model: str,
+) -> dict:
+    """CANNOT_DETERMINE when a reference's chunks were indexed under a
+    different embedding model than the one now configured.
+
+    The chunks exist, but their vectors live in a different embedding
+    space than the current query vector, so a KNN comparison would be
+    meaningless. Retrieval correctly refuses rather than returning
+    nonsense nearest-neighbours. Re-embedding under the current model
+    (``--fresh``) realigns the two spaces. This makes the store-model ==
+    query-model invariant visible at the point it is violated instead of
+    silently collapsing into a generic 'no embeddings' message.
+    """
+    logger.warning(
+        "Embedding model mismatch for {} ({} sections): chunks were indexed "
+        "under {!r} but the current configuration uses {!r}. Query and chunk "
+        "vectors are in different spaces, so retrieval cannot run. Re-run "
+        "`sciwrite-lint check --fresh` to re-embed under the current model. "
+        "Returning CANNOT_DETERMINE.",
+        claim.key,
+        n_sections,
+        stored_model,
+        current_model,
+    )
+    return _cannot_determine_result(
+        f"Embedding model mismatch for {claim.key} — chunks indexed under "
+        f"{stored_model}, current model is {current_model}; re-embed with "
+        "--fresh to realign the vector spaces"
+    )
+
+
+def _resolve_no_units_result(
+    claim: ClaimContext,
+    references_dir: Path,
+    n_sections: int,
+) -> dict:
+    """Pick the accurate CANNOT_DETERMINE message when the ladder's
+    level-fetcher returned None at every level.
+
+    Distinguishes the three causes that all surface as None so the log
+    names the real fault (see the call site in ``verify_claim_vllm``):
+    missing query vector (chunks present under the current model),
+    embedding-model mismatch (chunks present under a different model), or
+    no chunk embeddings at all.
+    """
+    from sciwrite_lint.references.embedding_store import (
+        get_stored_model,
+        has_embeddings,
+    )
+    from sciwrite_lint.references.reference_store import _get_embedding_config
+
+    current_model, _, _ = _get_embedding_config()
+    if has_embeddings(claim.key, references_dir, model_name=current_model):
+        # Chunks are indexed under the current model — retrieval emptiness
+        # is a missing claim query vector, not an embedding problem.
+        return _no_retrieval_hits_result(claim, n_sections)
+
+    stored_model = get_stored_model(references_dir)
+    if stored_model and stored_model != current_model:
+        return _embedding_model_mismatch_result(
+            claim, n_sections, stored_model, current_model
+        )
+    return _embeddings_unavailable_result(claim, n_sections)
 
 
 def _no_retrieval_hits_result(claim: ClaimContext, n_sections: int) -> dict:
-    """CANNOT_DETERMINE response when the embedder ran but every ladder
-    level returned zero candidates — pathological retrieval state, not the
-    same as 'no embeddings'."""
+    """CANNOT_DETERMINE response when chunk embeddings exist but retrieval
+    returned zero candidates at every ladder level.
+
+    Distinct from 'no embeddings': the reference's chunks are indexed, but
+    no usable query was available to rank them. The usual cause is a
+    missing pre-computed *claim query vector* — the query-vector
+    pre-compute step (parse/embed stage) did not run or failed for this
+    manuscript — or the embedding model changed since the chunks were
+    indexed. Either way the index is intact; re-running the parse/embed
+    stage repopulates the query vectors.
+    """
     logger.warning(
-        "Retrieval returned no hits for {} at any granularity ({} sections); "
-        "treating as CANNOT_DETERMINE",
+        "Chunk embeddings exist for {} ({} sections) but retrieval returned "
+        "no candidates at any granularity — the claim's pre-computed query "
+        "vector is missing or the embedding model changed since indexing. "
+        "Re-run `sciwrite-lint check` so the parse/embed stage pre-computes "
+        "claim query vectors (--fresh forces a full rebuild). Returning "
+        "CANNOT_DETERMINE.",
         claim.key,
         n_sections,
     )
-    return {
-        "verdict": "CANNOT_DETERMINE",
-        "explanation": f"No retrieval hits for {claim.key} at any granularity "
-        "— ladder could not select any candidate units to verify",
-        "sections_checked": 0,
-    }
+    return _cannot_determine_result(
+        f"Retrieval returned no candidates for {claim.key} — chunk "
+        "embeddings are present but the claim query vector is unavailable, "
+        "so the ladder could not rank any sections"
+    )
 
 
 async def verify_claim_vllm(
@@ -1109,9 +1209,20 @@ async def verify_claim_vllm(
                     level_name, claim, sections, references_dir, top_n
                 )
                 if units is None:
-                    # Embeddings missing — same level-fetcher returns
-                    # None at every level, so bail out once.
-                    return _embeddings_unavailable_result(claim, len(sections))
+                    # Retrieval produced no candidates. Three distinct causes
+                    # all surface as None — disambiguate so the diagnostic is
+                    # accurate (the fetcher returns None at every level, so
+                    # bail out once):
+                    #   1. chunks are indexed under the current model, but the
+                    #      claim's pre-computed query vector is missing
+                    #      (query-vector pre-compute didn't run / failed);
+                    #   2. chunks exist but were indexed under a *different*
+                    #      embedding model — query and chunk vectors live in
+                    #      different spaces, so retrieval refuses;
+                    #   3. no chunk embeddings exist for this ref at all.
+                    return _resolve_no_units_result(
+                        claim, references_dir, len(sections)
+                    )
                 if not units:
                     continue  # nothing to verify at this level, escalate
 
@@ -1451,6 +1562,18 @@ async def run_claim_verification(
 
         await build_pdf_context(tex_path, config)
         citations = citations_from_pdf_context(config)
+    elif config.is_markdown or tex_path.suffix.lower() == ".md":
+        # Markdown: bibliography from the sibling .bib; the cite contexts
+        # come from the pandoc-parsed ManuscriptContext (built below if a
+        # prior build_markdown_context call hasn't seeded it).
+        from sciwrite_lint.pipeline import build_markdown_context
+        from sciwrite_lint.references.citations import parse_bib_file
+
+        if not config.is_markdown:
+            build_markdown_context(tex_path, config)
+        md_bib = bib_path or tex_path.with_suffix(".bib")
+        citations = parse_bib_file(md_bib, tex_path.stem) if md_bib.exists() else []
+        check_local_sources(citations, references_dir)
     else:
         citations = extract_bibitems(tex_path, bib_format, bib_path=bib_path)
         check_local_sources(citations, references_dir)
@@ -1466,8 +1589,10 @@ async def run_claim_verification(
         elif c.local_path:
             local_files[c.key] = c.local_path
 
-    if config.is_pdf:
-        # Build ClaimContext from ManuscriptContext inline citations
+    if config.is_pdf or config.is_markdown:
+        # PDF and markdown both populate inline_citations (with cite
+        # context) on the ManuscriptContext — build ClaimContext directly
+        # from them instead of re-parsing a LaTeX body.
         claims = [
             ClaimContext(
                 key=ic.key,
@@ -1477,6 +1602,24 @@ async def run_claim_verification(
             )
             for ic in config.manuscript_context.inline_citations
         ]
+        if config.is_markdown:
+            # Markdown footnote URLs back a claim in the host sentence, the
+            # same as LaTeX \footnote{\url{}}. Key on the synthetic footnote
+            # key so the claim binds to the source ingest_footnote_sources
+            # synthesized. Filtered to those with a local source below.
+            from sciwrite_lint.footnote_urls import extract_footnote_claims_markdown
+
+            claims.extend(
+                ClaimContext(
+                    key=key,
+                    context=host,
+                    line=0,
+                    source_file=str(tex_path),
+                )
+                for key, host in extract_footnote_claims_markdown(
+                    tex_path.read_text(encoding="utf-8")
+                )
+            )
     else:
         # For .tex, use the cached / freshly-built ManuscriptContext so
         # extract_claim_contexts can read pre-populated cite contexts

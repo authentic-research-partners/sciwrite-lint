@@ -48,7 +48,17 @@ async def _stage_bib_verify(
 
     Results are cached in workspace.db (bib_checks table), invalidated
     when a reference's parsed markdown changes (hash mismatch).
+
+    Skipped (no external API calls) when the run has no enabled
+    ``reference-db`` check — depth-2 bibliography verification only feeds
+    reference-database findings, so a local-only run (e.g.
+    ``--checks claim-support``) must not make these calls.
     """
+    from sciwrite_lint.checks.registry import run_uses_reference_db
+
+    if not run_uses_reference_db(config):
+        return []
+
     from sciwrite_lint.references.workspace_db import (
         get_db,
         load_bib_checks as load_bib_checks_db,

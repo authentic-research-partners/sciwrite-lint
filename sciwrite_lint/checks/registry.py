@@ -74,6 +74,7 @@ def check(
     category: str,
     description: str,
     severity: str = "warning",
+    supports_markdown: bool = True,
 ) -> Callable:
     """Decorator to register a check function."""
 
@@ -83,6 +84,7 @@ def check(
             severity=severity,  # type: ignore[arg-type]
             category=category,  # type: ignore[arg-type]
             description=description,
+            supports_markdown=supports_markdown,
         )
         _CHECKS[id] = (meta, fn)
         fn.check_meta = meta  # type: ignore[attr-defined]
@@ -129,6 +131,26 @@ def list_checks() -> list[CheckMeta]:
     _load_pipeline_stage_checks()
     registry = [meta for meta, _fn in sorted(_CHECKS.values(), key=lambda x: x[0].id)]
     return sorted(registry + PIPELINE_STAGE_CHECKS, key=lambda m: m.id)
+
+
+def run_uses_reference_db(config: "LintConfig") -> bool:
+    """True when at least one enabled check is in the ``reference-db`` category.
+
+    ``reference-db`` checks (reference existence, accuracy, retraction,
+    reliability) query bibliographic APIs — chiefly OpenAlex. This is the
+    single source of truth for "does this run touch the reference-database
+    APIs at all": the preflight OpenAlex probe, the reference-verification
+    stage, and the depth-2 bibliography stage all key off it, so a run that
+    selects only local checks (e.g. ``--checks claim-support``) is neither
+    gated on OpenAlex nor makes any reference-DB network call. The
+    ``--checks`` allow-list and ``[rules] disable`` both land in
+    ``config.disabled_rules``, so ``is_check_enabled`` reflects the current
+    selection.
+    """
+    return any(
+        meta.category == "reference-db" and config.is_check_enabled(meta.id)
+        for meta in list_checks()
+    )
 
 
 def clear_registry() -> None:

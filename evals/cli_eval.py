@@ -23,6 +23,143 @@ def run_eval_synthetic(args: argparse.Namespace) -> int:
     return 1 if total_fn > 0 else 0
 
 
+def run_eval_synth_corpus(args: argparse.Namespace) -> int:
+    """Render synthetic scenarios and report cross-format check coverage.
+
+    Default: PDF mode — render each scenario via ``pdflatex`` and report the
+    deterministic rules that survive a GROBID round-trip (rule-level, since
+    PDF loses symbols). ``--llm``: render the LLM scenarios to tex/md and
+    report which LLM-engine rules fired (recall-level, since LLM output is
+    non-deterministic). ``--out DIR`` keeps the materialized corpus.
+    """
+    import tempfile
+
+    out_dir = Path(args.out) if getattr(args, "out", None) else None
+    runner = _run_synth_llm if getattr(args, "llm", False) else _run_synth_pdf
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Materializing synthetic corpus under {out_dir}")
+        return runner(out_dir)
+    with tempfile.TemporaryDirectory() as tmp:
+        return runner(Path(tmp))
+
+
+def _run_synth_pdf(dest: Path) -> int:
+    """PDF coverage: render to PDF, lint via GROBID, flag regressions."""
+    import shutil
+
+    from sciwrite_lint.pdf.grobid import is_grobid_running
+
+    from evals.synthetic_corpus import pdf_coverage_report
+
+    if shutil.which("pdflatex") is None:
+        logger.error(
+            "synth-corpus needs pdflatex to render PDFs. Install a LaTeX "
+            "distribution (e.g. `apt install texlive-latex-base "
+            "texlive-latex-extra`)."
+        )
+        return 1
+    if not asyncio.run(is_grobid_running()):
+        logger.error(
+            "synth-corpus needs GROBID to parse the rendered PDFs. Start it "
+            "with: sciwrite-lint containers start"
+        )
+        return 1
+
+    report = pdf_coverage_report(dest)
+    print("\nPDF rule-level coverage (GROBID round-trip):\n")
+    regressions = 0
+    for cov in report:
+        line = f"  {cov.name:22} detected={cov.detected_rules or '[]'}"
+        if cov.regressions:
+            line += f"  REGRESSION (missed {cov.regressions})"
+            regressions += len(cov.regressions)
+        if cov.known_gaps:
+            line += f"  known-gap (PDF-lossy: {cov.known_gaps})"
+        if cov.unexpected:
+            line += f"  unexpected={cov.unexpected}"
+        print(line)
+    print()
+
+    if regressions:
+        logger.error(f"{regressions} PDF coverage regression(s)")
+        return 1
+    logger.info("PDF coverage: no regressions")
+    return 0
+
+
+def _run_synth_llm(dest: Path) -> int:
+    """LLM coverage: render to tex/md, run LLM checks, report rule recall."""
+    from sciwrite_lint.config import LintConfig
+    from sciwrite_lint.vllm.vllm_server import _check_api_health
+
+    from evals.synthetic_corpus import llm_coverage_report
+
+    if asyncio.run(_check_api_health(LintConfig().llm_endpoint)) is None:
+        logger.error(
+            "synth-corpus --llm needs the text vLLM. Start it with: "
+            "sciwrite-lint containers start"
+        )
+        return 1
+
+    from evals.synthetic_corpus import LLM_RULES_UNDER_TEST
+
+    report = asyncio.run(llm_coverage_report(dest))
+    scope = ", ".join(sorted(LLM_RULES_UNDER_TEST))
+    print(f"\nLLM-check rule recall (same prose, each format; scope: {scope}):\n")
+    expected_total = hit_total = 0
+    for cov in report:
+        expected_total += len(cov.expected_rules)
+        hit_total += len(cov.hit)
+        line = f"  {cov.name:18} {cov.fmt:3} detected={cov.detected_rules or '[]'}"
+        if cov.missed:
+            line += f"  MISSED={cov.missed}"
+        if cov.unexpected:
+            line += f"  unexpected={cov.unexpected}"
+        print(line)
+    print()
+
+    if expected_total == 0:
+        logger.info("LLM coverage: no expected rules to assert")
+        return 0
+    recall = hit_total / expected_total
+    logger.info(f"LLM coverage recall: {hit_total}/{expected_total} ({recall:.0%})")
+    # A single miss is within LLM non-determinism; total recall of zero means
+    # the LLM checks are not firing at all (e.g. vLLM died mid-run).
+    if hit_total == 0:
+        logger.error("LLM coverage: no expected rule fired — checks not running")
+        return 1
+    return 0
+
+
+def run_synth_corpus(args: argparse.Namespace) -> int:
+    """Materialize the synthetic manuscript corpus to a directory.
+
+    No services for ``tex``/``md`` (pure file writes); ``pdf`` needs
+    ``pdflatex``. Writes a ``MANIFEST.md`` describing each scenario and the
+    checks it is built to trigger, so the corpus is self-documenting.
+    """
+    from evals.synthetic_corpus import materialize_corpus, render_manifest
+
+    formats = tuple(f.strip() for f in args.format.split(",") if f.strip())
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        entries = materialize_corpus(out, formats)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return 1
+
+    manifest = render_manifest(entries)
+    (out / "MANIFEST.md").write_text(manifest, encoding="utf-8")
+    print(manifest)
+    logger.info(
+        f"Wrote {len(entries)} scenarios ({', '.join(formats)}) to {out} "
+        "— see MANIFEST.md"
+    )
+    return 0
+
+
 def run_eval_scilint_score(args: argparse.Namespace) -> int:
     """Run SciLint Score taxonomy and contribution axes evaluation."""
     from evals.scilint_score_eval import (

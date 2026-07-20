@@ -48,12 +48,13 @@ def _check_latex(tex_path: Path, config: LintConfig) -> list[Finding]:
     return findings
 
 
-def _check_pdf(ctx: object) -> list[Finding]:
+def _check_context(ctx: object) -> list[Finding]:
     """Check that inline citations link to a reference in the bibliography.
 
-    Uses ManuscriptContext's inline_citations (from GROBID TEI <ref> tags)
-    and parsed_references. Citations with keys not in the reference list
-    are dangling.
+    Serves any ManuscriptContext that populates ``inline_citations`` and
+    ``parsed_references`` — PDF (GROBID TEI <ref> tags) and markdown
+    (pandoc ``[@key]`` + sibling ``.bib``) both do. Citations whose key is
+    not in the reference list are dangling.
     """
     from sciwrite_lint.manuscript_store import ManuscriptContext
 
@@ -86,8 +87,13 @@ def _check_pdf(ctx: object) -> list[Finding]:
     description="Citation has no matching bibliography entry.",
 )
 def check_dangling_cite(tex_path: Path, config: LintConfig) -> list[Finding]:
-    """Check dangling citations. Supports both LaTeX and PDF input."""
-    if config.is_pdf:
-        return _check_pdf(config.manuscript_context)
+    """Check dangling citations. Supports LaTeX, PDF, and markdown input.
+
+    PDF and markdown both populate ``inline_citations`` +
+    ``parsed_references`` on the context, so the same key-membership
+    check (``_check_context``) serves both; LaTeX is parsed from source.
+    """
+    if config.is_pdf or config.is_markdown:
+        return _check_context(config.manuscript_context)
 
     return _check_latex(tex_path, config)

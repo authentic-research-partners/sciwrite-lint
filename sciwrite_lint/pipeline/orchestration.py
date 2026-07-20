@@ -27,10 +27,10 @@ from sciwrite_lint.references.workspace_db import (
 )
 
 from sciwrite_lint.pipeline.checks import run_llm_checks_batched, run_text_checks
+from sciwrite_lint.pipeline.citation_setup import extract_pipeline_citations
 from sciwrite_lint.pipeline.claims import _stage_bib_verify, _stage_claims
 from sciwrite_lint.pipeline.fetch import _stage_fetch
 from sciwrite_lint.pipeline.parse import _stage_parse
-from sciwrite_lint.pipeline.pdf_context import citations_from_pdf_context
 from sciwrite_lint.pipeline.ref_internal import _stage_ref_internal
 from sciwrite_lint.pipeline.swap import (
     _cited_needs_inference,
@@ -80,17 +80,57 @@ async def preflight(config: LintConfig) -> list[str]:
             "Start with: sciwrite-lint containers start"
         )
 
+    # OpenAlex is only consulted by ``reference-db`` checks (reference
+    # existence, accuracy, retraction, reliability). A run that selects
+    # only local checks — e.g. ``--checks claim-support`` — verifies
+    # against local sources and the local vLLM and never touches the
+    # reference-database APIs (the verify + bib-verify stages short-circuit
+    # on the same predicate), so probing OpenAlex would gate it on an API
+    # it does not use. Skip the probe unless a reference-db check is enabled.
+    from sciwrite_lint.checks.registry import run_uses_reference_db
+
+    if run_uses_reference_db(config):
+        errors.extend(await _check_openalex_reachable(config))
+
+    return errors
+
+
+async def _check_openalex_reachable(config: LintConfig) -> list[str]:
+    """Probe OpenAlex for the ``reference-db`` checks that depend on it.
+
+    Distinguishes rate-limiting (HTTP 429/503 — reachable but throttled)
+    from genuine unreachability, since the two call for different operator
+    action. Identifies via the polite-pool ``mailto`` when a contact email
+    is configured, which OpenAlex rewards with a higher shared rate limit.
+    Returns a list of prerequisite errors (empty when OpenAlex answers).
+    """
+    from sciwrite_lint.api import _openalex_params
+
+    params = _openalex_params(config.polite_email, per_page="1")
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
-                "https://api.openalex.org/works?per_page=1", timeout=10.0
+                "https://api.openalex.org/works", params=params, timeout=10.0
             )
-            if resp.status_code != 200:
-                errors.append("Network: OpenAlex API unreachable")
     except httpx.HTTPError:
-        errors.append("Network: cannot reach api.openalex.org")
+        return ["Network: cannot reach api.openalex.org"]
 
-    return errors
+    if resp.status_code in (429, 503):
+        hint = (
+            ""
+            if config.polite_email
+            else " Set a contact email "
+            "(`sciwrite-lint config set-email you@example.com`) to use the "
+            "polite pool."
+        )
+        return [
+            f"Network: OpenAlex rate-limited (HTTP {resp.status_code}).{hint} "
+            "Retry later, or select only local checks "
+            "(e.g. `--checks claim-support`), which need no network."
+        ]
+    if resp.status_code != 200:
+        return [f"Network: OpenAlex API unreachable (HTTP {resp.status_code})"]
+    return []
 
 
 def _format_usage_summary(run: Any) -> str:
@@ -210,41 +250,7 @@ async def run_full_check(
     # Now do the actual setup work (save source, extract citations)
     ws.save_source(tex_path, bib_path=pc.bib)
 
-    if config.is_pdf:
-        citations = citations_from_pdf_context(config)
-    else:
-        from sciwrite_lint.footnote_urls import ingest_footnote_sources
-        from sciwrite_lint.references.citations import (
-            check_local_sources,
-            extract_bibitems,
-            filter_to_cited,
-        )
-
-        citations = extract_bibitems(tex_path, "auto", bib_path=pc.bib)
-        n_bib = len(citations)
-        aux_path = tex_path.with_suffix(".aux")
-        citations = filter_to_cited(
-            citations, tex_path, aux_path=aux_path if aux_path.exists() else None
-        )
-        if n_bib > len(citations):
-            logger.info(
-                f"{len(citations)}/{n_bib} bib entries are cited — "
-                f"skipping verify+fetch for {n_bib - len(citations)} uncited"
-            )
-        check_local_sources(citations, refs_dir)
-
-        # Synthesize citations for \footnote{\url{URL}} claims whose URLs
-        # are archived as .md captures in local_web_dir (Source: header).
-        # These flow through the same verify/fetch/parse/claims pipeline
-        # as cited refs — pre-registered with api_match="manual" + T1 so
-        # verify skips (nothing to check) and fetch skips (local already).
-        footnote_citations = ingest_footnote_sources(
-            tex_path,
-            config.effective_local_web_dir(paper_name),
-            refs_dir,
-            source_paper=tex_path.stem,
-        )
-        citations.extend(footnote_citations)
+    citations = extract_pipeline_citations(paper_name, tex_path, pc, config, refs_dir)
 
     logger.info(f"{len(citations)} citations extracted")
     run.citations = len(citations)
@@ -252,6 +258,14 @@ async def run_full_check(
 
     t0 = time.monotonic()
     all_findings: list[Finding] = []
+
+    # Zero references means the reference/citation/claim stages have
+    # nothing to verify — surface it loudly so a clean-looking report
+    # doesn't hide that those checks never ran.
+    if not citations:
+        from sciwrite_lint.checks._diagnostics import no_references_finding
+
+        all_findings.append(no_references_finding())
 
     try:
         # Stage 0.5: Vision — describe figures for full-paper consistency checks.

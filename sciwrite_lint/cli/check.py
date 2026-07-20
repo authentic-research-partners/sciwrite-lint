@@ -102,7 +102,15 @@ def run_check(args: argparse.Namespace) -> int:
 
     # Explicit file — no paper config, run text + LLM rules only
     if hasattr(args, "file") and args.file:
+        from sciwrite_lint.cli._common import (
+            MANUSCRIPT_SUFFIXES,
+            unsupported_manuscript_error,
+        )
+
         p = Path(args.file)
+        if p.suffix.lower() not in MANUSCRIPT_SUFFIXES:
+            logger.error(unsupported_manuscript_error(p))
+            return 2
         if p.suffix.lower() == ".pdf":
             return run_check_pdf(p, config, fmt)
         return run_check_quick(args, config, fmt)
@@ -124,11 +132,20 @@ def run_check(args: argparse.Namespace) -> int:
 
     # Filter out missing files up front so the run/batch path sees only
     # papers that actually exist.
+    from sciwrite_lint.cli._common import (
+        MANUSCRIPT_SUFFIXES,
+        unsupported_manuscript_error,
+    )
+
     runnable: list[tuple[str, Path, Any]] = []
     all_ok = True
     for name, tex_path, pc in paper_configs:
         if not tex_path.exists():
             logger.error(f"Error: {tex_path} not found")
+            all_ok = False
+            continue
+        if tex_path.suffix.lower() not in MANUSCRIPT_SUFFIXES:
+            logger.error(f"{name}: {unsupported_manuscript_error(tex_path)}")
             all_ok = False
             continue
         runnable.append((name, tex_path, pc))
@@ -155,11 +172,18 @@ def run_check(args: argparse.Namespace) -> int:
     print(f"Checking {name} ({tex_path.name})")
     print(f"{'=' * 60}")
 
-    # PDF files: build ManuscriptContext via GROBID, then run full pipeline
-    if tex_path.suffix.lower() == ".pdf":
+    # Non-LaTeX inputs build their ManuscriptContext up front so the full
+    # pipeline (citation extraction, prose/LLM checks) sees the right
+    # source: PDF via GROBID, markdown via pandoc.
+    suffix = tex_path.suffix.lower()
+    if suffix == ".pdf":
         from sciwrite_lint.pipeline import build_pdf_context
 
         asyncio.run(build_pdf_context(tex_path, config))
+    elif suffix == ".md":
+        from sciwrite_lint.pipeline import build_markdown_context
+
+        build_markdown_context(tex_path, config)
 
     try:
         findings = asyncio.run(run_full_check(name, tex_path, pc, config, fresh=fresh))
@@ -184,7 +208,11 @@ def _run_check_batch(
     all_ok: bool,
 ) -> int:
     """Run multiple papers via the batch-staged pipeline."""
-    from sciwrite_lint.pipeline import build_pdf_context, run_papers_staged
+    from sciwrite_lint.pipeline import (
+        build_markdown_context,
+        build_pdf_context,
+        run_papers_staged,
+    )
 
     print(f"\n{'=' * 60}")
     print(
@@ -193,14 +221,19 @@ def _run_check_batch(
     )
     print(f"{'=' * 60}")
 
-    # PDFs need ManuscriptContext built upfront (GROBID parse) before staged
-    # pipeline runs — same pattern as eval_real_world/runner.py.
-    async def _build_pdf_contexts() -> None:
+    # Non-LaTeX inputs need their ManuscriptContext built upfront (PDF via
+    # GROBID, markdown via pandoc) before the staged pipeline runs — same
+    # pattern as eval_real_world/runner.py. Each build seeds the per-path
+    # context cache the staged stages read from.
+    async def _build_contexts() -> None:
         for _name, tex_path, _pc in runnable:
-            if tex_path.suffix.lower() == ".pdf":
+            suffix = tex_path.suffix.lower()
+            if suffix == ".pdf":
                 await build_pdf_context(tex_path, config)
+            elif suffix == ".md":
+                build_markdown_context(tex_path, config)
 
-    asyncio.run(_build_pdf_contexts())
+    asyncio.run(_build_contexts())
 
     # run_papers_staged expects (name, tex_path, paper_config, lint_config) tuples
     staged_input = [(name, tex_path, pc, config) for name, tex_path, pc in runnable]
@@ -464,6 +497,7 @@ def run_check_quick(
 ) -> int:
     """Quick mode: text + LLM rules only, no verify/fetch/parse/claims."""
     from sciwrite_lint.pipeline import (
+        build_markdown_context,
         run_llm_checks_batched as pipeline_llm_batched,
         run_text_checks,
     )
@@ -478,6 +512,16 @@ def run_check_quick(
             logger.error(f"Error: {tex_path} not found")
             all_ok = False
             continue
+
+        # Reset per paper so a prior markdown manuscript does not leave
+        # ``config.is_markdown`` True for a following .tex in the same run.
+        config.manuscript_context = None
+        # Markdown manuscripts: parse into a ManuscriptContext and seed
+        # the cache so context-consuming checks receive the markdown parse
+        # (cache hit) instead of re-parsing the .md as LaTeX. Without this
+        # the file falls through to the LaTeX path and mis-parses.
+        if tex_path.suffix.lower() == ".md":
+            build_markdown_context(tex_path, config)
 
         findings = run_text_checks(tex_path, config)
         try:

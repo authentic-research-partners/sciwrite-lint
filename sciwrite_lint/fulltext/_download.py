@@ -25,6 +25,17 @@ from sciwrite_lint.fulltext._validation import (
 from sciwrite_lint.rate_limiter import retry_on_transient
 
 
+def _title_score(vr: ValidationResult) -> float | None:
+    """The validator's title-similarity score, for surfacing on the result.
+
+    ``None`` when no title comparison was performed — the validator was
+    skipped (no evidence), auto-accepted an identifier-only bib, or accepted
+    on a non-title signal without recording a ``title_sim``.
+    """
+    raw = vr.signals.get("title_sim")
+    return float(raw) if isinstance(raw, (int, float)) else None
+
+
 async def _download_pdf(
     url: str,
     dest: Path,
@@ -49,6 +60,7 @@ async def _download_pdf(
                 found=True,
                 source=source,
                 local_path=str(dest.relative_to(references_dir)),
+                title_sim=_title_score(cached_result),
             )
         logger.warning(
             "Cached PDF {} failed validation — removing ({})",
@@ -90,6 +102,7 @@ async def _download_pdf(
                     found=True,
                     source=source,
                     local_path=str(dest.relative_to(references_dir)),
+                    title_sim=_title_score(fresh_result),
                 )
     except ResponseTooLarge as e:
         logger.debug("PDF too large, skipping {}: {}", url, e)

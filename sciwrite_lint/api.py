@@ -41,6 +41,20 @@ _openlibrary_limiter = MonotonicRateLimiter(5, 1.0)  # ~5 req/s (be polite)
 _loc_limiter = MonotonicRateLimiter(5, 1.0)  # ~5 req/s (be polite)
 
 
+def _openalex_params(polite_email: str, **params: Any) -> dict[str, Any]:
+    """OpenAlex query params with the polite-pool ``mailto`` merged in.
+
+    Single source of truth for every OpenAlex call site: requests carrying
+    a ``mailto`` are routed into OpenAlex's polite pool, which has a higher
+    and more stable shared rate limit than the anonymous common pool. This
+    keeps reference verification off the common pool, where sustained use
+    draws HTTP 429s. No-op when no contact email is configured.
+    """
+    if polite_email:
+        params["mailto"] = polite_email
+    return params
+
+
 class CitationAPI:
     """Verify citations against CrossRef, OpenAlex, Semantic Scholar, Open Library, and Library of Congress."""
 
@@ -129,6 +143,15 @@ class CitationAPI:
     # OpenAlex
     # ------------------------------------------------------------------
 
+    def _oa_params(self, **params: Any) -> dict[str, Any]:
+        """OpenAlex query params for this client's configured contact email.
+
+        Thin instance-scoped wrapper over :func:`_openalex_params` so the
+        four ``_openalex_lookup`` call sites don't each repeat
+        ``self._config.polite_email``.
+        """
+        return _openalex_params(self._config.polite_email, **params)
+
     async def _openalex_lookup(self, citation: Citation) -> dict[str, Any] | None:
         try:
             # Try DOI lookup
@@ -137,7 +160,7 @@ class CitationAPI:
                 resp = await rate_limited_get(
                     _openalex_limiter,
                     f"https://api.openalex.org/works/doi:{clean_doi}",
-                    params={"select": _OA_FIELDS},
+                    params=self._oa_params(select=_OA_FIELDS),
                     label="OpenAlex DOI",
                     client=self._client,
                     service="openalex",
@@ -155,7 +178,7 @@ class CitationAPI:
                 resp = await rate_limited_get(
                     _openalex_limiter,
                     f"https://api.openalex.org/works/doi:{arxiv_doi}",
-                    params={"select": _OA_FIELDS},
+                    params=self._oa_params(select=_OA_FIELDS),
                     label="OpenAlex arXiv DOI",
                     client=self._client,
                     service="openalex",
@@ -173,10 +196,10 @@ class CitationAPI:
                 resp = await rate_limited_get(
                     _openalex_limiter,
                     "https://api.openalex.org/works",
-                    params={
-                        "filter": f"ids.pmid:https://pubmed.ncbi.nlm.nih.gov/{citation.pmid}",
-                        "select": _OA_FIELDS,
-                    },
+                    params=self._oa_params(
+                        filter=f"ids.pmid:https://pubmed.ncbi.nlm.nih.gov/{citation.pmid}",
+                        select=_OA_FIELDS,
+                    ),
                     label="OpenAlex PMID",
                     client=self._client,
                     service="openalex",
@@ -192,11 +215,11 @@ class CitationAPI:
             resp = await rate_limited_get(
                 _openalex_limiter,
                 "https://api.openalex.org/works",
-                params={
-                    "filter": f"title.search:{query}",
-                    "per_page": 10,
-                    "select": _OA_FIELDS,
-                },
+                params=self._oa_params(
+                    filter=f"title.search:{query}",
+                    per_page=10,
+                    select=_OA_FIELDS,
+                ),
                 label="OpenAlex search",
                 client=self._client,
                 service="openalex",
@@ -481,13 +504,12 @@ async def batch_openalex(
     doi_filter = "|".join(f"https://doi.org/{doi}" for _, doi in all_dois)
     doi_by_key = {doi.lower(): key for key, doi in all_dois}
 
-    params: dict[str, str | int] = {
-        "filter": f"doi:{doi_filter}",
-        "per_page": 200,
-        "select": _OA_FIELDS,
-    }
-    if config.polite_email:
-        params["mailto"] = config.polite_email
+    params = _openalex_params(
+        config.polite_email,
+        filter=f"doi:{doi_filter}",
+        per_page=200,
+        select=_OA_FIELDS,
+    )
 
     # Secondary index by arXiv ID: OpenAlex may return a different
     # canonical DOI than the query DOI (e.g. arXiv DOI → publisher DOI).

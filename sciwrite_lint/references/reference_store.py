@@ -986,10 +986,10 @@ def retrieve_relevant_sections(
     # KNN search via sqlite-vec
     hits = retrieve_similar(claim_text, key, references_dir, top_k=top_k * 3)
     if not hits:
-        logger.debug(
-            "retrieve_similar returned no hits for {} (model mismatch or no chunks?)",
-            key,
-        )
+        # retrieve_similar already logged the precise reason (missing
+        # query vector / embedding-model change). Don't re-speculate — the
+        # caller disambiguates no-embeddings vs. no-hits via has_embeddings.
+        logger.debug("retrieve_similar returned no hits for {}", key)
         return None
 
     # Apply relative scoring cutoff
