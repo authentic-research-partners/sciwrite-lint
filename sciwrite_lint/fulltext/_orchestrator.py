@@ -49,6 +49,12 @@ async def acquire_fulltext(
     from sciwrite_lint.oa import FetchConfig, download_pdf
 
     cfg = config or LintConfig()
+    if not cfg.polite_email:
+        # cli/fetch.py does not pass `config`, so a bare LintConfig() has
+        # no email; fall back to the machine-wide ~/.sciwrite-lint/
+        # polite_email (same dir API keys are read from), per the docstring.
+        from sciwrite_lint.config import _read_user_polite_email
+        cfg.polite_email = _read_user_polite_email()
     out_path = references_dir / f"{key}.pdf"
 
     fetch_cfg = FetchConfig(
