@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sciwrite-lint"
-version = "0.6.0"
+version = "0.6.1"
 description = "A linter for scientific manuscripts — reference verification, consistency checking, and structural validation."
 requires-python = ">=3.13,<3.14"
 license = "MIT"
@@ -42,8 +42,8 @@ dependencies = [
     "sqlite-vec>=0.1.6",
     "torch>=2.5",
     "transformers>=4.50",
-    "Pillow>=12.2",
-    "pypdf>=6.10.2",
+    "Pillow>=12.3",
+    "pypdf>=6.14.2",
     "pypdfium2>=5.0",
     "pdf2image>=1.17",
     "lxml>=6.1",

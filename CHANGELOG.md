@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1] — 2026-07-25
+
+### Security
+- **Minimum `Pillow` and `pypdf` versions raised.** `Pillow>=12.3` (from `>=12.2`) and `pypdf>=6.14.2` (from `>=6.10.2`). Both read untrusted input — `pypdf` parses fetched PDFs, `Pillow` parses figure images — and the newer releases carry upstream parsing fixes.
+
+### Documentation
+- **`docs/local-sources.md` now states the correct scope for footnote-URL matching.** The page still described it as LaTeX-only; 0.6.0 added markdown. Corrected to LaTeX and markdown; PDF remains unsupported.
+
 ## [0.6.0] — 2026-07-20
 
 ### Added

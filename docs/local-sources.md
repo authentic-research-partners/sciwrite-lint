@@ -38,7 +38,7 @@ Form A wins when both forms apply to the same file.
 
 ## Footnote-URL sources: the `Source:` header convention
 
-Papers often cite informational web pages inline via `\footnote{\url{https://...}}` rather than through a formal `.bib` entry — organisation pages, program descriptions, press releases, FAQ pages. sciwrite-lint verifies these claims against archived captures in `local_web_dir`, but because there is no citekey to match, each archived `.md` file must declare the URL it documents in a header.
+Papers often cite informational web pages inline as a footnote URL rather than through a formal `.bib` entry — organisation pages, program descriptions, press releases, FAQ pages. In LaTeX that is `\footnote{\url{https://...}}`; in markdown it is a `[^id]` or inline `^[…]` footnote carrying a `<https://...>` or `[text](https://...)` link. sciwrite-lint verifies these claims against archived captures in `local_web_dir`, but because there is no citekey to match, each archived `.md` file must declare the URL it documents in a header.
 
 **The convention.** Within the first 20 lines of any `.md` in `local_web_dir`, include a line of the form:
 
@@ -66,7 +66,7 @@ Fetched:     2026-04-20
 …body content…
 ```
 
-That's it. Given the header, sciwrite-lint matches every `\footnote{\url{URL}}` in your `.tex` to the `.md` file whose header declares the same URL — and the claim in that footnote's sentence becomes verifiable.
+That's it. Given the header, sciwrite-lint matches every footnote URL in your manuscript — `.tex` or `.md` — to the `.md` file whose header declares the same URL, and the claim in that footnote's sentence becomes verifiable.
 
 **URL matching is normalised.** The RFC-correct base normalisation runs via `rfc3986` (the same URI library httpx uses), so scheme + host case, percent-encoding, and path dot-segments are handled to spec. On top of that sciwrite-lint applies:
 
@@ -133,4 +133,4 @@ At ingest, sciwrite-lint converts the `.mhtml` to `.md`, writes a `Source:` head
 
 ## Current scope
 
-Footnote-URL matching is LaTeX-only. For PDF input (GROBID), the footnote → URL → sentence chain is recoverable from the TEI structure but uses a different code path; that's a later change.
+Footnote-URL matching covers LaTeX (`\footnote{\url{}}`) and markdown (`[^id]` / `^[…]` footnotes carrying a `<url>` or `[text](url)` link). It does not yet cover PDF input: with GROBID the footnote → URL → sentence chain is recoverable from the TEI structure but uses a different code path; that's a later change.
