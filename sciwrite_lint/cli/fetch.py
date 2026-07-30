@@ -107,6 +107,7 @@ def fetch_for_citations(
             result = await acquire_fulltext(
                 c.key,
                 refs_dir,
+                config=config,
                 doi=doi,
                 arxiv_id=arxiv_id,
                 oa_url=oa_url,
@@ -247,6 +248,7 @@ def fetch_single(
         result = await acquire_fulltext(
             key,
             refs_dir,
+            config=config,
             doi=doi,
             arxiv_id=arxiv_id,
             oa_url=oa_url,
